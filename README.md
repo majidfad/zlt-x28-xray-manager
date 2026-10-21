@@ -22,7 +22,7 @@ current sing-box release. UI is a minimal first pass — see
 
 ```sh
 # On the router:
-curl -L -o install.sh https://raw.githubusercontent.com/<you>/<repo>/main/scripts/install.sh
+curl -L -o install.sh https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main/scripts/install.sh
 sh install.sh
 ```
 

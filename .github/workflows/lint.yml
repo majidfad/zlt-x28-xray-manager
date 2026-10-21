@@ -24,3 +24,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y luarocks && sudo luarocks install luacheck
       - name: Run luacheck
         run: luacheck files/usr/lib/lua --no-max-line-length --globals luci nixio XHR module package luci.http io os table || true
+
+  embedded-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify install.sh embedded files match files/
+        run: sh scripts/check-embedded-sync.sh
