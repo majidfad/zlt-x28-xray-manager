@@ -1,0 +1,295 @@
+#!/bin/sh
+# =======================================================
+# sb-manager - Sing-Box Enterprise VPN Manager
+# Core control daemon for ZLT-X28 Sing-Box VPN Manager
+# =======================================================
+DIR_SB="/etc/singbox"
+ACTIVE_NODE_POINTER="$DIR_SB/active_node"
+MODE_POINTER="$DIR_SB/routing_mode"
+BASE_CONFIG="$DIR_SB/base_config.json"
+CONFIG_FILE="$DIR_SB/config.json"
+LOG_FILE="/var/log/singbox.log"
+PID_FILE="/var/run/singbox.pid"
+WATCHDOG_FLAG="$DIR_SB/watchdog.flag"
+MAINT_FLAG="$DIR_SB/maint.flag"
+WATCHDOG_PID="/var/run/sb_watchdog.pid"
+WATCHDOG_STATUS_FILE="/tmp/sb_wd_status"
+BYPASS_LIST="$DIR_SB/bypass.list"
+SB_BIN="/data/singbox_core/sing-box"
+
+is_sb_running() {
+    if ps 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
+    if ps w 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
+    return 1
+}
+
+get_active_node_path() { echo "$DIR_SB/node_$(cat "$ACTIVE_NODE_POINTER" 2>/dev/null).json"; }
+get_mode() { cat "$MODE_POINTER" 2>/dev/null || echo "tunnel"; }
+
+# Decode percent-encoded URI components (full range, not a hardcoded subset).
+# Using awk because BusyBox ash has no printf '%b' / no native URL decode.
+urldecode() {
+    _in="$1"
+    # Replace '+' with space first (query string convention), then decode %XX.
+    _in=$(echo "$_in" | sed 's/+/ /g')
+    printf '%s' "$_in" | awk '
+    {
+        s = $0
+        out = ""
+        n = length(s)
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (c == "%" && i + 2 <= n) {
+                hex = substr(s, i + 1, 2)
+                if (hex ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) {
+                    dec = index("0123456789ABCDEF", toupper(substr(hex,1,1))) - 1
+                    dec = dec * 16 + index("0123456789ABCDEF", toupper(substr(hex,2,1))) - 1
+                    out = out sprintf("%c", dec)
+                    i += 2
+                    continue
+                }
+            }
+            out = out c
+        }
+        printf "%s", out
+    }'
+}
+
+# Escape a value for safe embedding inside a JSON string literal.
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+parse_link_to_json() {
+    FILE="$1"
+    link=$(cat "$FILE" | tr -d '\r\n ')
+    if echo "$link" | grep -q "^vless://"; then
+        link="${link#*://}"; link="${link%%#*}"
+        uuid_addrport="${link%%\?*}"; query="${link#*\?}"; [ "$query" = "$link" ] && query=""
+        uuid="${uuid_addrport%%@*}"; addrport="${uuid_addrport#*@}"
+        # Support IPv6 literal addresses in [::1]:port form as well as host:port.
+        case "$addrport" in
+            \[*\]:*)
+                address="${addrport%%]:*}"; address="${address#\[}"
+                port="${addrport##*]:}"
+                ;;
+            *)
+                address="${addrport%%:*}"; port="${addrport#*:}"
+                ;;
+        esac
+        [ -z "$port" ] && port=443; port=$(echo "$port" | tr -dc '0-9'); [ -z "$port" ] && port=443
+
+        security="none"; type="tcp"; flow=""; host=""; sni=""; fp="chrome"; pbk=""; sid=""
+        old_ifs="$IFS"; IFS="&"
+        for param in $query; do
+            key="${param%%=*}"; val="${param#*=}"
+            val=$(urldecode "$val")
+            case "$key" in
+                security) security="$val" ;;
+                type) type="$val" ;;
+                flow) flow="$val" ;;
+                host) host="$val" ;;
+                sni) sni="$val" ;;
+                fp) fp="$val" ;;
+                pbk) pbk="$val" ;;
+                sid) sid="$val" ;;
+            esac
+        done
+        IFS="$old_ifs"
+        [ -z "$sni" ] && sni="$host"
+
+        uuid=$(json_escape "$uuid")
+        address=$(json_escape "$address")
+        sni=$(json_escape "$sni")
+        fp=$(json_escape "$fp")
+        pbk=$(json_escape "$pbk")
+        sid=$(json_escape "$sid")
+        flow=$(json_escape "$flow")
+
+        echo "    {"
+        echo "      \"type\": \"vless\","
+        echo "      \"tag\": \"proxy\","
+        echo "      \"server\": \"$address\","
+        echo "      \"server_port\": $port,"
+        echo "      \"uuid\": \"$uuid\","
+        if [ -n "$flow" ]; then echo "      \"flow\": \"$flow\","; fi
+
+        if [ "$security" = "reality" ]; then
+            echo "      \"tls\": {"
+            echo "        \"enabled\": true,"
+            echo "        \"server_name\": \"$sni\","
+            echo "        \"reality\": {"
+            echo "          \"enabled\": true,"
+            echo "          \"public_key\": \"$pbk\","
+            echo "          \"short_id\": \"$sid\""
+            echo "        },"
+            echo "        \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" }"
+            echo "      },"
+        elif [ "$security" = "tls" ]; then
+            echo "      \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" } },"
+        fi
+        echo "      \"tcp_fast_open\": true"
+        echo "    }"
+    fi
+}
+
+build_final_config() {
+    ACTIVE_NODE=$(get_active_node_path)
+    if [ ! -f "$ACTIVE_NODE" ]; then
+        echo '    {"type":"block","tag":"proxy"}' > /tmp/sb_node_tmp.json
+    else
+        sed 's/\r//g' "$ACTIVE_NODE" > /tmp/sb_node_tmp.json
+    fi
+
+    awk '
+    /__NODE_PLACEHOLDER__/ {
+        while ((getline line < "/tmp/sb_node_tmp.json") > 0) {
+            print line
+        }
+        print ","
+        next
+    }
+    {print}
+    ' "$BASE_CONFIG" > "$CONFIG_FILE"
+    rm -f /tmp/sb_node_tmp.json
+
+    # Validate the generated config is well-formed JSON before handing it to sing-box.
+    # Falls back to sing-box's own "check" command when available, which catches both
+    # JSON syntax errors and invalid field values (e.g. malformed reality keys).
+    if [ -x "$SB_BIN" ]; then
+        if ! "$SB_BIN" check -c "$CONFIG_FILE" >/tmp/sb_check.log 2>&1; then
+            echo "[System] Generated config failed validation:" >> "$LOG_FILE"
+            cat /tmp/sb_check.log >> "$LOG_FILE"
+            rm -f /tmp/sb_check.log
+            return 1
+        fi
+        rm -f /tmp/sb_check.log
+    fi
+    return 0
+}
+
+get_server_ip() { ACTIVE_NODE=$(get_active_node_path); if [ -f "$ACTIVE_NODE" ]; then awk -F'"' '/"server":/ {print $4; exit}' "$ACTIVE_NODE"; fi; }
+
+clean_iptables() {
+    iptables -t mangle -D PREROUTING -j SB_TRANS 2>/dev/null
+    iptables -t nat -D PREROUTING -p tcp -j SB_TRANS 2>/dev/null
+    iptables -t mangle -F SB_TRANS 2>/dev/null
+    iptables -t mangle -X SB_TRANS 2>/dev/null
+    iptables -t nat -F SB_TRANS 2>/dev/null
+    iptables -t nat -X SB_TRANS 2>/dev/null
+    ip rule del fwmark 1 table 100 2>/dev/null
+    ip route del local default dev lo table 100 2>/dev/null
+}
+
+stop_sb() {
+    [ -f "$WATCHDOG_PID" ] && kill -9 "$(cat "$WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
+    rm -f "$WATCHDOG_PID" "$WATCHDOG_STATUS_FILE"
+    [ -f "$PID_FILE" ] && kill -9 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+    killall -9 sing-box 2>/dev/null
+    clean_iptables
+    echo "[System] Sing-Box fully terminated." >> "$LOG_FILE"
+}
+
+start_sb() {
+    [ ! -x "$SB_BIN" ] && { echo "[System] sing-box binary not found/executable at $SB_BIN" >> "$LOG_FILE"; return 1; }
+    if ! build_final_config; then
+        echo "[System] Aborting start: config build/validation failed." >> "$LOG_FILE"
+        return 1
+    fi
+    SERVER_IP=$(get_server_ip)
+
+    stop_sb >/dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=10000 >/dev/null 2>&1
+    ulimit -n 65535 >/dev/null 2>&1
+
+    CURRENT_MODE=$(get_mode)
+    if [ "$CURRENT_MODE" = "tunnel" ]; then
+        iptables -t mangle -N SB_TRANS
+        iptables -t nat -N SB_TRANS
+
+        ip rule add fwmark 1 table 100 2>/dev/null
+        ip route add local default dev lo table 100 2>/dev/null
+
+        # Bypass Local Ranges
+        iptables -t mangle -A SB_TRANS -d 0.0.0.0/8 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 127.0.0.0/8 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 169.254.0.0/16 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 172.16.0.0/12 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 192.168.0.0/16 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 224.0.0.0/4 -j RETURN
+        iptables -t mangle -A SB_TRANS -d 240.0.0.0/4 -j RETURN
+        [ -n "$SERVER_IP" ] && iptables -t mangle -A SB_TRANS -d "$SERVER_IP" -j RETURN 2>/dev/null
+
+        iptables -t nat -A SB_TRANS -d 0.0.0.0/8 -j RETURN
+        iptables -t nat -A SB_TRANS -d 127.0.0.0/8 -j RETURN
+        iptables -t nat -A SB_TRANS -d 169.254.0.0/16 -j RETURN
+        iptables -t nat -A SB_TRANS -d 172.16.0.0/12 -j RETURN
+        iptables -t nat -A SB_TRANS -d 192.168.0.0/16 -j RETURN
+        iptables -t nat -A SB_TRANS -d 224.0.0.0/4 -j RETURN
+        iptables -t nat -A SB_TRANS -d 240.0.0.0/4 -j RETURN
+        [ -n "$SERVER_IP" ] && iptables -t nat -A SB_TRANS -d "$SERVER_IP" -j RETURN 2>/dev/null
+
+        iptables -t mangle -A SB_TRANS -p udp --dport 53 -j TPROXY --on-port 1053 --tproxy-mark 1
+        iptables -t mangle -A SB_TRANS -p udp -j TPROXY --on-port 1081 --tproxy-mark 1
+        iptables -t nat -A SB_TRANS -p tcp --dport 53 -j REDIRECT --to-ports 1053
+        iptables -t nat -A SB_TRANS -p tcp -j REDIRECT --to-ports 1081
+
+        iptables -t mangle -A PREROUTING -j SB_TRANS
+        iptables -t nat -A PREROUTING -p tcp -j SB_TRANS
+        echo "[System] Sing-Box Routing Active." >> "$LOG_FILE"
+    fi
+
+    start-stop-daemon -S -b -m -p "$PID_FILE" -x /bin/sh -- -c "export GOMEMLIMIT=150MiB GOGC=100; exec $SB_BIN run -c '$CONFIG_FILE' >> '$LOG_FILE' 2>&1"
+    start_watchdog
+}
+
+maint_run() {
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    if is_sb_running; then stop_sb; sleep 2; start_sb; fi
+}
+
+daemon_watchdog() {
+    echo $$ > "$WATCHDOG_PID"
+    while true; do
+        sleep 15
+        if is_sb_running; then echo "green" > "$WATCHDOG_STATUS_FILE"
+        else echo "offline" > "$WATCHDOG_STATUS_FILE"; exit 0; fi
+    done
+}
+
+start_watchdog() {
+    [ -f "$WATCHDOG_PID" ] && kill -9 "$(cat "$WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
+    if [ "$(cat "$WATCHDOG_FLAG" 2>/dev/null)" = "1" ]; then /usr/bin/sb-manager daemon_watchdog & fi
+}
+
+case "$1" in
+    start) start_sb; exit 0 ;;
+    stop) stop_sb; exit 0 ;;
+    restart) stop_sb; sleep 1; start_sb; exit 0 ;;
+    status) if is_sb_running; then echo "Running"; else echo "Stopped"; fi; exit 0 ;;
+    active) cat "$ACTIVE_NODE_POINTER" 2>/dev/null; exit 0 ;;
+    switch) echo "$2" > "$ACTIVE_NODE_POINTER"; exit 0 ;;
+    addnode) parse_link_to_json "$3" > "$DIR_SB/node_$2.json"; exit 0 ;;
+    delnode) rm -f "$DIR_SB/node_$2.json"; exit 0 ;;
+    listnodes)
+        for f in "$DIR_SB"/node_*.json; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            base="${base#node_}"
+            base="${base%.json}"
+            echo "$base"
+        done
+        exit 0
+        ;;
+    mode_toggle) echo "$2" > "$MODE_POINTER"; exit 0 ;;
+    mode_status) get_mode; exit 0 ;;
+    maint_run) maint_run; exit 0 ;;
+    watchdog_toggle) echo "$2" > "$WATCHDOG_FLAG"; exit 0 ;;
+    watchdog_status) cat "$WATCHDOG_FLAG" 2>/dev/null || echo "0"; exit 0 ;;
+    led_status) cat "$WATCHDOG_STATUS_FILE" 2>/dev/null || echo "offline"; exit 0 ;;
+    daemon_watchdog) daemon_watchdog; exit 0 ;;
+    *)
+        echo "Usage: sb-manager {start|stop|restart|status|active|switch <id>|addnode <id> <linkfile>|delnode <id>|listnodes|mode_toggle <tunnel|proxy>|mode_status|watchdog_toggle <0|1>|watchdog_status|led_status}"
+        exit 1
+        ;;
+esac

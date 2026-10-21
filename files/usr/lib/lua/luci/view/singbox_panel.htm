@@ -1,0 +1,181 @@
+<%+header%>
+
+<div class="cbi-map">
+	<h2 name="content">Sing-Box VPN Manager</h2>
+
+	<div class="cbi-section">
+		<div class="cbi-section-node">
+			<table class="table">
+				<tr>
+					<td class="td" style="width:40%"><strong>Status</strong></td>
+					<td class="td"><span id="sb_status">Loading...</span></td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Active Node</strong></td>
+					<td class="td"><span id="sb_active_node">-</span></td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Routing Mode</strong></td>
+					<td class="td">
+						<select id="sb_mode_select">
+							<option value="tunnel">Full Tunnel (transparent proxy)</option>
+							<option value="proxy">Proxy Only (SOCKS/HTTP on :1080)</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Watchdog</strong></td>
+					<td class="td">
+						<input type="checkbox" id="sb_watchdog_toggle" /> Auto-restart if sing-box crashes
+					</td>
+				</tr>
+			</table>
+
+			<div class="cbi-page-actions">
+				<button class="cbi-button cbi-button-apply" id="sb_btn_start">Start</button>
+				<button class="cbi-button cbi-button-reset" id="sb_btn_stop">Stop</button>
+				<button class="cbi-button cbi-button-action" id="sb_btn_restart">Restart</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>Nodes</h3>
+		<div class="cbi-section-node">
+			<table class="table" id="sb_node_table">
+				<tr><th class="th">ID</th><th class="th">Actions</th></tr>
+			</table>
+			<div class="cbi-page-actions">
+				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
+				<textarea id="sb_new_node_link" placeholder="vless://..." rows="2" style="width:60%"></textarea>
+				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>Log (last 8 KB)</h3>
+		<pre id="sb_log" style="max-height:300px; overflow:auto; background:#111; color:#ccc; padding:8px;"></pre>
+	</div>
+</div>
+
+<script type="text/javascript">
+	var sb_url = "<%=luci.dispatcher.build_url("admin", "services", "singbox")%>";
+	var sb_known_nodes = [];
+
+	function sb_api(action, params, cb) {
+		var qs = "";
+		if (params) {
+			for (var k in params) {
+				qs += (qs ? "&" : "") + encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
+			}
+		}
+		XHR.get(sb_url + "/" + action + (qs ? "?" + qs : ""), null, function(x, data) {
+			cb(data);
+		});
+	}
+
+	function sb_refresh_status() {
+		sb_api("status", null, function(data) {
+			if (!data) return;
+			document.getElementById("sb_status").textContent = data.running || "Unknown";
+			document.getElementById("sb_active_node").textContent = data.active_node || "none";
+			document.getElementById("sb_mode_select").value = data.mode || "tunnel";
+			document.getElementById("sb_watchdog_toggle").checked = (data.watchdog === "1");
+		});
+	}
+
+	function sb_refresh_log() {
+		XHR.get(sb_url + "/log", null, function(x, data) {
+			var el = document.getElementById("sb_log");
+			el.textContent = data || "";
+			el.scrollTop = el.scrollHeight;
+		});
+	}
+
+	function sb_render_nodes() {
+		var table = document.getElementById("sb_node_table");
+		while (table.rows.length > 1) table.deleteRow(1);
+		sb_known_nodes.forEach(function(id) {
+			var row = table.insertRow(-1);
+			var idCell = row.insertCell(0);
+			var actCell = row.insertCell(1);
+			idCell.textContent = id;
+
+			var switchBtn = document.createElement("button");
+			switchBtn.className = "cbi-button cbi-button-apply";
+			switchBtn.textContent = "Activate";
+			switchBtn.onclick = function() {
+				sb_api("switch", { id: id }, function() { sb_refresh_status(); });
+			};
+
+			var delBtn = document.createElement("button");
+			delBtn.className = "cbi-button cbi-button-remove";
+			delBtn.textContent = "Delete";
+			delBtn.onclick = function() {
+				if (!confirm("Delete node " + id + "?")) return;
+				sb_api("delnode", { id: id }, function() {
+					sb_known_nodes = sb_known_nodes.filter(function(n) { return n !== id; });
+					sb_render_nodes();
+				});
+			};
+
+			actCell.appendChild(switchBtn);
+			actCell.appendChild(delBtn);
+		});
+	}
+
+	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_status); };
+	document.getElementById("sb_btn_stop").onclick = function() { sb_api("stop", null, sb_refresh_status); };
+	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_status); };
+
+	document.getElementById("sb_mode_select").onchange = function(e) {
+		sb_api("mode", { mode: e.target.value }, function() {
+			if (confirm("Mode changed. Restart sing-box now to apply?")) {
+				sb_api("restart", null, sb_refresh_status);
+			}
+		});
+	};
+
+	document.getElementById("sb_watchdog_toggle").onchange = function(e) {
+		sb_api("watchdog", { state: e.target.checked ? "1" : "0" }, sb_refresh_status);
+	};
+
+	document.getElementById("sb_btn_addnode").onclick = function() {
+		var id = document.getElementById("sb_new_node_id").value.trim();
+		var link = document.getElementById("sb_new_node_link").value.trim();
+		if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+			alert("Node id must be alphanumeric (letters, digits, -, _ only).");
+			return;
+		}
+		if (!link) {
+			alert("Paste a vless:// link first.");
+			return;
+		}
+		sb_api("addnode", { id: id, link: link }, function(data) {
+			if (data && data.ok) {
+				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
+				sb_render_nodes();
+				document.getElementById("sb_new_node_id").value = "";
+				document.getElementById("sb_new_node_link").value = "";
+			} else {
+				alert("Failed to add node: " + (data && data.error ? data.error : "unknown error"));
+			}
+		});
+	};
+
+	function sb_load_nodes() {
+		sb_api("listnodes", null, function(data) {
+			sb_known_nodes = (data && data.nodes) || [];
+			sb_render_nodes();
+		});
+	}
+
+	sb_refresh_status();
+	sb_load_nodes();
+	sb_refresh_log();
+	setInterval(sb_refresh_status, 5000);
+	setInterval(sb_refresh_log, 8000);
+</script>
+
+<%+footer%>
