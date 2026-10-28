@@ -88,8 +88,18 @@ function action_addnode()
     local id = luci.http.formvalue("id")
     local link = luci.http.formvalue("link")
     luci.http.prepare_content("application/json")
-    if not valid_id(id) or not link or link == "" then
-        luci.http.write_json({ ok = false, error = "invalid node id or empty link" })
+    if not valid_id(id) then
+        luci.http.write_json({ ok = false, error = "invalid node id" })
+        return
+    end
+    if not link or link == "" then
+        luci.http.write_json({ ok = false, error = "empty link (use POST; GET truncates long vless URLs)" })
+        return
+    end
+    -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+    link = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
+    if not link:match("^vless://") then
+        luci.http.write_json({ ok = false, error = "link must start with vless://" })
         return
     end
     local tmp = "/tmp/sb_link_" .. id .. ".txt"

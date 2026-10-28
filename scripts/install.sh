@@ -665,8 +665,18 @@ function action_addnode()
     local id = luci.http.formvalue("id")
     local link = luci.http.formvalue("link")
     luci.http.prepare_content("application/json")
-    if not valid_id(id) or not link or link == "" then
-        luci.http.write_json({ ok = false, error = "invalid node id or empty link" })
+    if not valid_id(id) then
+        luci.http.write_json({ ok = false, error = "invalid node id" })
+        return
+    end
+    if not link or link == "" then
+        luci.http.write_json({ ok = false, error = "empty link (use POST; GET truncates long vless URLs)" })
+        return
+    end
+    -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+    link = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
+    if not link:match("^vless://") then
+        luci.http.write_json({ ok = false, error = "link must start with vless://" })
         return
     end
     local tmp = "/tmp/sb_link_" .. id .. ".txt"
@@ -816,18 +826,39 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 
 <script type="text/javascript">
 	var sb_url = "<%=luci.dispatcher.build_url("admin", "services", "singbox")%>";
+	var sb_token = "<%=luci.dispatcher.context.authtoken%>";
 	var sb_known_nodes = [];
 
-	function sb_api(action, params, cb) {
-		var qs = "";
-		if (params) {
+	function sb_api(action, params, cb, usePost) {
+		params = params || {};
+		var handle = function(x, data) {
+			if (!data && x) {
+				var raw = x.responseText || "";
+				if (raw) {
+					try { data = JSON.parse(raw); } catch (e) {}
+				}
+				if (!data) {
+					data = {
+						ok: false,
+						error: "HTTP " + (x.status || 0) +
+							(raw ? (": " + raw.replace(/\s+/g, " ").substring(0, 180)) : " (empty/no JSON)")
+					};
+				}
+			}
+			cb(data || { ok: false, error: "no response from router" });
+		};
+		if (usePost) {
+			var body = {};
+			for (var k in params) body[k] = params[k];
+			if (sb_token) body.token = sb_token;
+			XHR.post(sb_url + "/" + action, body, handle);
+		} else {
+			var qs = "";
 			for (var k in params) {
 				qs += (qs ? "&" : "") + encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
 			}
+			XHR.get(sb_url + "/" + action + (qs ? "?" + qs : ""), null, handle);
 		}
-		XHR.get(sb_url + "/" + action + (qs ? "?" + qs : ""), null, function(x, data) {
-			cb(data);
-		});
 	}
 
 	function sb_refresh_status() {
@@ -917,18 +948,18 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			alert("Paste a vless:// link first.");
 			return;
 		}
+		// POST: vless links are too long/fragile for GET query strings (caused "unknown error").
 		sb_api("addnode", { id: id, link: link }, function(data) {
 			if (data && data.ok) {
 				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
 				sb_render_nodes();
 				document.getElementById("sb_new_node_id").value = "";
 				document.getElementById("sb_new_node_link").value = "";
-				// Node is activated server-side; start/restart so status leaves "Stopped".
 				sb_api("restart", null, sb_refresh_after_start);
 			} else {
-				alert("Failed to add node: " + (data && data.error ? data.error : "unknown error"));
+				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
 			}
-		});
+		}, true);
 	};
 
 	function sb_load_nodes() {
