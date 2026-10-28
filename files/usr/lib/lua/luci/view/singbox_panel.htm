@@ -86,11 +86,19 @@
 	}
 
 	function sb_refresh_log() {
-		XHR.get(sb_url + "/log", null, function(x, data) {
+		sb_api("log", null, function(data) {
 			var el = document.getElementById("sb_log");
-			el.textContent = data || "";
+			el.textContent = (data && data.log) ? data.log : "";
 			el.scrollTop = el.scrollHeight;
 		});
+	}
+
+	function sb_refresh_after_start() {
+		// start/restart run in background; give sing-box a moment before polling.
+		setTimeout(function() {
+			sb_refresh_status();
+			sb_refresh_log();
+		}, 1500);
 	}
 
 	function sb_render_nodes() {
@@ -106,7 +114,9 @@
 			switchBtn.className = "cbi-button cbi-button-apply";
 			switchBtn.textContent = "Activate";
 			switchBtn.onclick = function() {
-				sb_api("switch", { id: id }, function() { sb_refresh_status(); });
+				sb_api("switch", { id: id }, function() {
+					sb_api("restart", null, sb_refresh_after_start);
+				});
 			};
 
 			var delBtn = document.createElement("button");
@@ -125,9 +135,9 @@
 		});
 	}
 
-	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_status); };
+	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_after_start); };
 	document.getElementById("sb_btn_stop").onclick = function() { sb_api("stop", null, sb_refresh_status); };
-	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_status); };
+	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_after_start); };
 
 	document.getElementById("sb_mode_select").onchange = function(e) {
 		sb_api("mode", { mode: e.target.value }, function() {
@@ -158,6 +168,8 @@
 				sb_render_nodes();
 				document.getElementById("sb_new_node_id").value = "";
 				document.getElementById("sb_new_node_link").value = "";
+				// Node is activated server-side; start/restart so status leaves "Stopped".
+				sb_api("restart", null, sb_refresh_after_start);
 			} else {
 				alert("Failed to add node: " + (data && data.error ? data.error : "unknown error"));
 			}

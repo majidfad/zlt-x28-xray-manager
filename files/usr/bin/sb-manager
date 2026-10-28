@@ -18,8 +18,16 @@ BYPASS_LIST="$DIR_SB/bypass.list"
 SB_BIN="/data/singbox_core/sing-box"
 
 is_sb_running() {
-    if ps 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
-    if ps w 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
+    # Prefer PID file (survives BusyBox ps cmdline truncation).
+    if [ -f "$PID_FILE" ]; then
+        _pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    # Fall back to process list; match binary name only (args often truncated).
+    if ps 2>/dev/null | grep "[s]ing-box" >/dev/null 2>&1; then return 0; fi
+    if ps w 2>/dev/null | grep "[s]ing-box" >/dev/null 2>&1; then return 0; fi
     return 1
 }
 
@@ -79,7 +87,7 @@ parse_link_to_json() {
         esac
         [ -z "$port" ] && port=443; port=$(echo "$port" | tr -dc '0-9'); [ -z "$port" ] && port=443
 
-        security="none"; type="tcp"; flow=""; host=""; sni=""; fp="chrome"; pbk=""; sid=""
+        security="none"; type="tcp"; flow=""; host=""; sni=""; fp="chrome"; pbk=""; sid=""; path=""; serviceName=""
         old_ifs="$IFS"; IFS="&"
         for param in $query; do
             key="${param%%=*}"; val="${param#*=}"
@@ -93,6 +101,8 @@ parse_link_to_json() {
                 fp) fp="$val" ;;
                 pbk) pbk="$val" ;;
                 sid) sid="$val" ;;
+                path) path="$val" ;;
+                serviceName) serviceName="$val" ;;
             esac
         done
         IFS="$old_ifs"
@@ -105,6 +115,9 @@ parse_link_to_json() {
         pbk=$(json_escape "$pbk")
         sid=$(json_escape "$sid")
         flow=$(json_escape "$flow")
+        path_esc=$(json_escape "$path")
+        host_esc=$(json_escape "$host")
+        serviceName_esc=$(json_escape "$serviceName")
 
         echo "    {"
         echo "      \"type\": \"vless\","
@@ -128,6 +141,28 @@ parse_link_to_json() {
         elif [ "$security" = "tls" ]; then
             echo "      \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" } },"
         fi
+
+        # Emit transport when the share link is not plain TCP (was previously ignored).
+        case "$type" in
+            ws)
+                [ -z "$path_esc" ] && path_esc="/"
+                echo "      \"transport\": {"
+                echo "        \"type\": \"ws\","
+                echo "        \"path\": \"$path_esc\""
+                if [ -n "$host_esc" ]; then
+                    echo "        ,\"headers\": { \"Host\": \"$host_esc\" }"
+                fi
+                echo "      },"
+                ;;
+            grpc)
+                echo "      \"transport\": { \"type\": \"grpc\", \"service_name\": \"$serviceName_esc\" },"
+                ;;
+            http|h2)
+                [ -z "$path_esc" ] && path_esc="/"
+                echo "      \"transport\": { \"type\": \"http\", \"path\": [\"$path_esc\"] },"
+                ;;
+        esac
+
         echo "      \"tcp_fast_open\": true"
         echo "    }"
     fi
@@ -269,7 +304,19 @@ case "$1" in
     status) if is_sb_running; then echo "Running"; else echo "Stopped"; fi; exit 0 ;;
     active) cat "$ACTIVE_NODE_POINTER" 2>/dev/null; exit 0 ;;
     switch) echo "$2" > "$ACTIVE_NODE_POINTER"; exit 0 ;;
-    addnode) parse_link_to_json "$3" > "$DIR_SB/node_$2.json"; exit 0 ;;
+    addnode)
+        if [ -z "$2" ] || [ -z "$3" ] || [ ! -f "$3" ]; then
+            echo "Usage: sb-manager addnode <id> <linkfile>" >&2
+            exit 1
+        fi
+        parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
+        if [ ! -s "$DIR_SB/node_$2.json" ]; then
+            rm -f "$DIR_SB/node_$2.json"
+            echo "Failed to parse link (expected a vless:// URL)" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
     delnode) rm -f "$DIR_SB/node_$2.json"; exit 0 ;;
     listnodes)
         for f in "$DIR_SB"/node_*.json; do

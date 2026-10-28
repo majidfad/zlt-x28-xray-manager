@@ -130,8 +130,16 @@ BYPASS_LIST="$DIR_SB/bypass.list"
 SB_BIN="/data/singbox_core/sing-box"
 
 is_sb_running() {
-    if ps 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
-    if ps w 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1; then return 0; fi
+    # Prefer PID file (survives BusyBox ps cmdline truncation).
+    if [ -f "$PID_FILE" ]; then
+        _pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    # Fall back to process list; match binary name only (args often truncated).
+    if ps 2>/dev/null | grep "[s]ing-box" >/dev/null 2>&1; then return 0; fi
+    if ps w 2>/dev/null | grep "[s]ing-box" >/dev/null 2>&1; then return 0; fi
     return 1
 }
 
@@ -191,7 +199,7 @@ parse_link_to_json() {
         esac
         [ -z "$port" ] && port=443; port=$(echo "$port" | tr -dc '0-9'); [ -z "$port" ] && port=443
 
-        security="none"; type="tcp"; flow=""; host=""; sni=""; fp="chrome"; pbk=""; sid=""
+        security="none"; type="tcp"; flow=""; host=""; sni=""; fp="chrome"; pbk=""; sid=""; path=""; serviceName=""
         old_ifs="$IFS"; IFS="&"
         for param in $query; do
             key="${param%%=*}"; val="${param#*=}"
@@ -205,6 +213,8 @@ parse_link_to_json() {
                 fp) fp="$val" ;;
                 pbk) pbk="$val" ;;
                 sid) sid="$val" ;;
+                path) path="$val" ;;
+                serviceName) serviceName="$val" ;;
             esac
         done
         IFS="$old_ifs"
@@ -217,6 +227,9 @@ parse_link_to_json() {
         pbk=$(json_escape "$pbk")
         sid=$(json_escape "$sid")
         flow=$(json_escape "$flow")
+        path_esc=$(json_escape "$path")
+        host_esc=$(json_escape "$host")
+        serviceName_esc=$(json_escape "$serviceName")
 
         echo "    {"
         echo "      \"type\": \"vless\","
@@ -240,6 +253,28 @@ parse_link_to_json() {
         elif [ "$security" = "tls" ]; then
             echo "      \"tls\": { \"enabled\": true, \"server_name\": \"$sni\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$fp\" } },"
         fi
+
+        # Emit transport when the share link is not plain TCP (was previously ignored).
+        case "$type" in
+            ws)
+                [ -z "$path_esc" ] && path_esc="/"
+                echo "      \"transport\": {"
+                echo "        \"type\": \"ws\","
+                echo "        \"path\": \"$path_esc\""
+                if [ -n "$host_esc" ]; then
+                    echo "        ,\"headers\": { \"Host\": \"$host_esc\" }"
+                fi
+                echo "      },"
+                ;;
+            grpc)
+                echo "      \"transport\": { \"type\": \"grpc\", \"service_name\": \"$serviceName_esc\" },"
+                ;;
+            http|h2)
+                [ -z "$path_esc" ] && path_esc="/"
+                echo "      \"transport\": { \"type\": \"http\", \"path\": [\"$path_esc\"] },"
+                ;;
+        esac
+
         echo "      \"tcp_fast_open\": true"
         echo "    }"
     fi
@@ -381,7 +416,19 @@ case "$1" in
     status) if is_sb_running; then echo "Running"; else echo "Stopped"; fi; exit 0 ;;
     active) cat "$ACTIVE_NODE_POINTER" 2>/dev/null; exit 0 ;;
     switch) echo "$2" > "$ACTIVE_NODE_POINTER"; exit 0 ;;
-    addnode) parse_link_to_json "$3" > "$DIR_SB/node_$2.json"; exit 0 ;;
+    addnode)
+        if [ -z "$2" ] || [ -z "$3" ] || [ ! -f "$3" ]; then
+            echo "Usage: sb-manager addnode <id> <linkfile>" >&2
+            exit 1
+        fi
+        parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
+        if [ ! -s "$DIR_SB/node_$2.json" ]; then
+            rm -f "$DIR_SB/node_$2.json"
+            echo "Failed to parse link (expected a vless:// URL)" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
     delnode) rm -f "$DIR_SB/node_$2.json"; exit 0 ;;
     listnodes)
         for f in "$DIR_SB"/node_*.json; do
@@ -512,9 +559,17 @@ function action_addnode()
     end
     fh:write(link)
     fh:close()
-    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp))
+    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp) .. " >/tmp/sb_addnode.err 2>&1; echo $? > /tmp/sb_addnode.rc")
     os.remove(tmp)
-    luci.http.write_json({ ok = true })
+    local rc = tonumber(run("cat /tmp/sb_addnode.rc 2>/dev/null")) or 1
+    if rc ~= 0 then
+        local err = run("cat /tmp/sb_addnode.err 2>/dev/null")
+        luci.http.write_json({ ok = false, error = (err ~= "" and err) or "failed to parse vless link" })
+        return
+    end
+    -- Activate the new node so Start/Restart actually uses it.
+    run("/usr/bin/sb-manager switch " .. shq(id))
+    luci.http.write_json({ ok = true, activated = id })
 end
 
 function action_delnode()
@@ -561,15 +616,21 @@ function action_watchdog()
 end
 
 function action_log()
-    luci.http.prepare_content("text/plain")
+    -- Return JSON so LuCI XHR.get can parse it (text/plain left data=null in the UI).
+    local text = ""
     local f = io.open("/var/log/singbox.log", "r")
-    if not f then
-        luci.http.write("")
-        return
+    if f then
+        local size = f:seek("end")
+        if size and size > 8000 then
+            f:seek("set", size - 8000)
+        else
+            f:seek("set", 0)
+        end
+        text = f:read("*a") or ""
+        f:close()
     end
-    f:seek("end", -8000)
-    luci.http.write(f:read("*a") or "")
-    f:close()
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ log = text })
 end
 SB_LUA_EOF
 
@@ -662,11 +723,19 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 	}
 
 	function sb_refresh_log() {
-		XHR.get(sb_url + "/log", null, function(x, data) {
+		sb_api("log", null, function(data) {
 			var el = document.getElementById("sb_log");
-			el.textContent = data || "";
+			el.textContent = (data && data.log) ? data.log : "";
 			el.scrollTop = el.scrollHeight;
 		});
+	}
+
+	function sb_refresh_after_start() {
+		// start/restart run in background; give sing-box a moment before polling.
+		setTimeout(function() {
+			sb_refresh_status();
+			sb_refresh_log();
+		}, 1500);
 	}
 
 	function sb_render_nodes() {
@@ -682,7 +751,9 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			switchBtn.className = "cbi-button cbi-button-apply";
 			switchBtn.textContent = "Activate";
 			switchBtn.onclick = function() {
-				sb_api("switch", { id: id }, function() { sb_refresh_status(); });
+				sb_api("switch", { id: id }, function() {
+					sb_api("restart", null, sb_refresh_after_start);
+				});
 			};
 
 			var delBtn = document.createElement("button");
@@ -701,9 +772,9 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 		});
 	}
 
-	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_status); };
+	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_after_start); };
 	document.getElementById("sb_btn_stop").onclick = function() { sb_api("stop", null, sb_refresh_status); };
-	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_status); };
+	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_after_start); };
 
 	document.getElementById("sb_mode_select").onchange = function(e) {
 		sb_api("mode", { mode: e.target.value }, function() {
@@ -734,6 +805,8 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 				sb_render_nodes();
 				document.getElementById("sb_new_node_id").value = "";
 				document.getElementById("sb_new_node_link").value = "";
+				// Node is activated server-side; start/restart so status leaves "Stopped".
+				sb_api("restart", null, sb_refresh_after_start);
 			} else {
 				alert("Failed to add node: " + (data && data.error ? data.error : "unknown error"));
 			}

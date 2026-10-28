@@ -100,9 +100,17 @@ function action_addnode()
     end
     fh:write(link)
     fh:close()
-    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp))
+    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp) .. " >/tmp/sb_addnode.err 2>&1; echo $? > /tmp/sb_addnode.rc")
     os.remove(tmp)
-    luci.http.write_json({ ok = true })
+    local rc = tonumber(run("cat /tmp/sb_addnode.rc 2>/dev/null")) or 1
+    if rc ~= 0 then
+        local err = run("cat /tmp/sb_addnode.err 2>/dev/null")
+        luci.http.write_json({ ok = false, error = (err ~= "" and err) or "failed to parse vless link" })
+        return
+    end
+    -- Activate the new node so Start/Restart actually uses it.
+    run("/usr/bin/sb-manager switch " .. shq(id))
+    luci.http.write_json({ ok = true, activated = id })
 end
 
 function action_delnode()
@@ -149,13 +157,19 @@ function action_watchdog()
 end
 
 function action_log()
-    luci.http.prepare_content("text/plain")
+    -- Return JSON so LuCI XHR.get can parse it (text/plain left data=null in the UI).
+    local text = ""
     local f = io.open("/var/log/singbox.log", "r")
-    if not f then
-        luci.http.write("")
-        return
+    if f then
+        local size = f:seek("end")
+        if size and size > 8000 then
+            f:seek("set", size - 8000)
+        else
+            f:seek("set", 0)
+        end
+        text = f:read("*a") or ""
+        f:close()
     end
-    f:seek("end", -8000)
-    luci.http.write(f:read("*a") or "")
-    f:close()
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ log = text })
 end
