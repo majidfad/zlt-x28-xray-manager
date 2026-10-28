@@ -15,7 +15,50 @@ MAINT_FLAG="$DIR_SB/maint.flag"
 WATCHDOG_PID="/var/run/sb_watchdog.pid"
 WATCHDOG_STATUS_FILE="/tmp/sb_wd_status"
 BYPASS_LIST="$DIR_SB/bypass.list"
+SB_BIN_POINTER="$DIR_SB/sb_bin.path"
 SB_BIN="/data/singbox_core/sing-box"
+
+# Resolve a sing-box binary that actually executes on this device.
+# A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
+resolve_sb_bin() {
+    SB_BIN="/data/singbox_core/sing-box"
+    if [ -f "$SB_BIN_POINTER" ]; then
+        _p=$(cat "$SB_BIN_POINTER" 2>/dev/null)
+        if [ -n "$_p" ] && [ -f "$_p" ]; then
+            SB_BIN="$_p"
+        fi
+    fi
+    for _p in \
+        "$SB_BIN" \
+        "/data/singbox_core/sing-box" \
+        "/opt/singbox_core/sing-box" \
+        "/usr/local/bin/sing-box" \
+        "/usr/bin/sing-box"
+    do
+        [ -n "$_p" ] && [ -f "$_p" ] || continue
+        if "$_p" version >/dev/null 2>&1; then
+            SB_BIN="$_p"
+            return 0
+        fi
+        # Keep first existing path for a clearer error if none run.
+        [ "$SB_BIN" = "/data/singbox_core/sing-box" ] && [ ! -f "$SB_BIN" ] && SB_BIN="$_p"
+    done
+    return 1
+}
+
+sb_bin_usable() {
+    [ -n "$SB_BIN" ] && [ -f "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1
+}
+
+report_sb_bin_error() {
+    _mach=$(uname -m 2>/dev/null || echo unknown)
+    if [ -f "$SB_BIN" ]; then
+        echo "[System] sing-box at $SB_BIN exists but cannot run (wrong CPU arch or corrupt binary)." >> "$LOG_FILE"
+        echo "[System] Device arch: $_mach. Re-run install.sh (try SINGBOX_ARCH=armv7 if this is 32-bit ARM)." >> "$LOG_FILE"
+    else
+        echo "[System] sing-box binary missing (looked for $SB_BIN). Re-run scripts/install.sh to download it." >> "$LOG_FILE"
+    fi
+}
 
 is_sb_running() {
     # Prefer PID file (survives BusyBox ps cmdline truncation).
@@ -188,10 +231,8 @@ build_final_config() {
     ' "$BASE_CONFIG" > "$CONFIG_FILE"
     rm -f /tmp/sb_node_tmp.json
 
-    # Validate the generated config is well-formed JSON before handing it to sing-box.
-    # Falls back to sing-box's own "check" command when available, which catches both
-    # JSON syntax errors and invalid field values (e.g. malformed reality keys).
-    if [ -x "$SB_BIN" ]; then
+    # Validate with sing-box check when a runnable binary is available.
+    if sb_bin_usable; then
         if ! "$SB_BIN" check -c "$CONFIG_FILE" >/tmp/sb_check.log 2>&1; then
             echo "[System] Generated config failed validation:" >> "$LOG_FILE"
             cat /tmp/sb_check.log >> "$LOG_FILE"
@@ -226,7 +267,10 @@ stop_sb() {
 }
 
 start_sb() {
-    [ ! -x "$SB_BIN" ] && { echo "[System] sing-box binary not found/executable at $SB_BIN" >> "$LOG_FILE"; return 1; }
+    if ! resolve_sb_bin || ! sb_bin_usable; then
+        report_sb_bin_error
+        return 1
+    fi
     if ! build_final_config; then
         echo "[System] Aborting start: config build/validation failed." >> "$LOG_FILE"
         return 1

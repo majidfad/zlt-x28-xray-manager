@@ -29,11 +29,15 @@ sh install.sh
 Or clone the repo onto the router and run `sh scripts/install.sh` from the
 repo root (the script locates `files/` relative to itself).
 
-By default it targets `arm64`. Override for other platforms:
+Architecture is auto-detected from `uname -m`. Override if needed:
 
 ```sh
-SINGBOX_ARCH=amd64 sh scripts/install.sh
+SINGBOX_ARCH=armv7 sh scripts/install.sh   # 32-bit ARM
+SINGBOX_ARCH=amd64 sh scripts/install.sh   # x86_64
 ```
+
+If Start fails with `sing-box: not found` even though the file exists, the
+binary is the wrong CPU arch — re-run install with the matching `SINGBOX_ARCH`.
 
 ## Uninstall
 

@@ -22,8 +22,8 @@ ip rule del fwmark 1 table 100 2>/dev/null || true
 ip route del local default dev lo table 100 2>/dev/null || true
 
 log "Removing files..."
-rm -rf /data/singbox_core /etc/singbox
-rm -f /usr/bin/sb-manager
+rm -rf /data/singbox_core /opt/singbox_core /usr/local/singbox_core /etc/singbox
+rm -f /usr/bin/sb-manager /usr/bin/sing-box
 rm -f /usr/lib/lua/luci/controller/singbox.lua
 rm -f /usr/lib/lua/luci/view/singbox_panel.htm
 

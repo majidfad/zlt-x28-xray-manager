@@ -10,11 +10,45 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-SINGBOX_ARCH="${SINGBOX_ARCH:-arm64}"
+
+log() { echo "[install] $*"; }
+
+# Auto-detect CPU arch unless the caller already set SINGBOX_ARCH.
+if [ -z "${SINGBOX_ARCH:-}" ]; then
+    case "$(uname -m)" in
+        aarch64|arm64) SINGBOX_ARCH="arm64" ;;
+        armv7*|armv6*|arm) SINGBOX_ARCH="armv7" ;;
+        x86_64|amd64) SINGBOX_ARCH="amd64" ;;
+        i386|i686) SINGBOX_ARCH="386" ;;
+        *)
+            log "ERROR: unsupported machine '$(uname -m)'."
+            log "Set SINGBOX_ARCH explicitly (arm64, armv7, amd64, 386) and re-run."
+            exit 1
+            ;;
+    esac
+fi
+
 SINGBOX_ASSET="sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz"
 SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${SINGBOX_ASSET}"
 
-log() { echo "[install] $*"; }
+# Prefer a writable directory that allows executing binaries (/data is often noexec).
+pick_core_dir() {
+    for d in /data/singbox_core /opt/singbox_core /usr/local/singbox_core; do
+        mkdir -p "$d" 2>/dev/null || continue
+        _t="$d/.sb_exec_test"
+        printf '#!/bin/sh\nexit 0\n' > "$_t"
+        chmod +x "$_t" 2>/dev/null || true
+        if "$_t" 2>/dev/null; then
+            rm -f "$_t"
+            echo "$d"
+            return 0
+        fi
+        rm -f "$_t"
+        log "Skipping $d (cannot execute binaries there)."
+    done
+    mkdir -p /usr/bin
+    echo "/usr/bin"
+}
 
 log "1. Stopping services and cleaning up..."
 killall -9 xray sing-box sb-manager xr-manager 2>/dev/null || true
@@ -32,42 +66,82 @@ done
 ip rule del fwmark 1 table 100 2>/dev/null || true
 ip route del local default dev lo table 100 2>/dev/null || true
 
-log "2. Removing old core directories..."
+log "2. Preparing directories..."
 rm -rf /data/xray_core /etc/xray
-mkdir -p /data/singbox_core /etc/singbox
+mkdir -p /etc/singbox
 mkdir -p /usr/lib/lua/luci/controller/ /usr/lib/lua/luci/view/
+CORE_DIR="$(pick_core_dir)"
+SB_BIN_PATH="$CORE_DIR/sing-box"
+# When falling back to /usr/bin, binary name is just sing-box there already.
+if [ "$CORE_DIR" = "/usr/bin" ]; then
+    SB_BIN_PATH="/usr/bin/sing-box"
+fi
+log "Core install dir: $CORE_DIR (machine=$(uname -m), arch=$SINGBOX_ARCH)"
 
 log "3. Downloading sing-box ${SINGBOX_VERSION} (${SINGBOX_ARCH})..."
 CURRENT_VERSION=""
-if [ -x "/data/singbox_core/sing-box" ]; then
-    # "sing-box version X.Y.Z" on the first line - extract just the number.
-    CURRENT_VERSION=$(/data/singbox_core/sing-box version 2>/dev/null | head -n1 | awk '{print $3}')
+if [ -f "$SB_BIN_PATH" ]; then
+    # Only trust version if the binary actually runs on this CPU.
+    CURRENT_VERSION=$("$SB_BIN_PATH" version 2>/dev/null | head -n1 | awk '{print $3}') || CURRENT_VERSION=""
 fi
 
 if [ "$CURRENT_VERSION" != "$SINGBOX_VERSION" ]; then
     if [ -n "$CURRENT_VERSION" ]; then
         log "Found existing sing-box $CURRENT_VERSION, replacing with $SINGBOX_VERSION..."
+    elif [ -f "$SB_BIN_PATH" ]; then
+        log "Existing binary at $SB_BIN_PATH does not run; re-downloading for $SINGBOX_ARCH..."
     fi
     rm -f "/tmp/${SINGBOX_ASSET}"
     if ! curl -k -L --connect-timeout 20 --fail -o "/tmp/${SINGBOX_ASSET}" "$SINGBOX_URL"; then
         log "ERROR: download failed from $SINGBOX_URL"
-        log "Check connectivity or set SINGBOX_ARCH if this router is not arm64."
+        log "Check connectivity or set SINGBOX_ARCH if auto-detect was wrong (uname -m=$(uname -m))."
         exit 1
     fi
-    rm -f /data/singbox_core/sing-box
-    tar -xzf "/tmp/${SINGBOX_ASSET}" -C /data/singbox_core/ >/dev/null 2>&1
-    mv /data/singbox_core/sing-box-*/sing-box /data/singbox_core/sing-box 2>/dev/null || true
-    chmod +x /data/singbox_core/sing-box
-    rm -rf /data/singbox_core/sing-box-* "/tmp/${SINGBOX_ASSET}" 2>/dev/null || true
+    # Extract into CORE_DIR (or a temp subdir when CORE_DIR is /usr/bin).
+    EXTRACT_DIR="$CORE_DIR"
+    if [ "$CORE_DIR" = "/usr/bin" ]; then
+        EXTRACT_DIR="/tmp/singbox_extract"
+        rm -rf "$EXTRACT_DIR"
+        mkdir -p "$EXTRACT_DIR"
+    fi
+    rm -f "$SB_BIN_PATH"
+    if ! tar -xzf "/tmp/${SINGBOX_ASSET}" -C "$EXTRACT_DIR"; then
+        log "ERROR: failed to extract /tmp/${SINGBOX_ASSET}"
+        exit 1
+    fi
+    EXTRACTED=""
+    for f in "$EXTRACT_DIR"/sing-box-*/sing-box; do
+        if [ -f "$f" ]; then
+            EXTRACTED="$f"
+            break
+        fi
+    done
+    if [ -z "$EXTRACTED" ]; then
+        log "ERROR: sing-box binary not found inside archive."
+        exit 1
+    fi
+    mv "$EXTRACTED" "$SB_BIN_PATH"
+    chmod +x "$SB_BIN_PATH"
+    rm -rf /data/singbox_core/sing-box-* /opt/singbox_core/sing-box-* /tmp/singbox_extract "/tmp/${SINGBOX_ASSET}" 2>/dev/null || true
 else
     log "sing-box $SINGBOX_VERSION already installed, skipping download."
 fi
 
-if [ ! -x /data/singbox_core/sing-box ]; then
-    log "ERROR: sing-box binary missing after extraction. Aborting."
+if [ ! -f "$SB_BIN_PATH" ]; then
+    log "ERROR: sing-box binary missing after extraction ($SB_BIN_PATH). Aborting."
     exit 1
 fi
-/data/singbox_core/sing-box version || true
+
+if ! "$SB_BIN_PATH" version >/tmp/sb_ver.out 2>&1; then
+    log "ERROR: $SB_BIN_PATH exists but cannot execute on this device."
+    log "Machine: $(uname -m)  Downloaded arch: $SINGBOX_ARCH"
+    log "Kernel says: $(cat /tmp/sb_ver.out 2>/dev/null)"
+    log "If this is 32-bit ARM try: SINGBOX_ARCH=armv7 sh install.sh"
+    log "If this is 64-bit ARM try: SINGBOX_ARCH=arm64 sh install.sh"
+    exit 1
+fi
+log "sing-box OK: $(head -n1 /tmp/sb_ver.out 2>/dev/null)"
+printf '%s\n' "$SB_BIN_PATH" > /etc/singbox/sb_bin.path
 
 log "4. Generating base configuration..."
 cat << 'SB_CFG_EOF' > /etc/singbox/base_config.json
@@ -127,7 +201,50 @@ MAINT_FLAG="$DIR_SB/maint.flag"
 WATCHDOG_PID="/var/run/sb_watchdog.pid"
 WATCHDOG_STATUS_FILE="/tmp/sb_wd_status"
 BYPASS_LIST="$DIR_SB/bypass.list"
+SB_BIN_POINTER="$DIR_SB/sb_bin.path"
 SB_BIN="/data/singbox_core/sing-box"
+
+# Resolve a sing-box binary that actually executes on this device.
+# A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
+resolve_sb_bin() {
+    SB_BIN="/data/singbox_core/sing-box"
+    if [ -f "$SB_BIN_POINTER" ]; then
+        _p=$(cat "$SB_BIN_POINTER" 2>/dev/null)
+        if [ -n "$_p" ] && [ -f "$_p" ]; then
+            SB_BIN="$_p"
+        fi
+    fi
+    for _p in \
+        "$SB_BIN" \
+        "/data/singbox_core/sing-box" \
+        "/opt/singbox_core/sing-box" \
+        "/usr/local/bin/sing-box" \
+        "/usr/bin/sing-box"
+    do
+        [ -n "$_p" ] && [ -f "$_p" ] || continue
+        if "$_p" version >/dev/null 2>&1; then
+            SB_BIN="$_p"
+            return 0
+        fi
+        # Keep first existing path for a clearer error if none run.
+        [ "$SB_BIN" = "/data/singbox_core/sing-box" ] && [ ! -f "$SB_BIN" ] && SB_BIN="$_p"
+    done
+    return 1
+}
+
+sb_bin_usable() {
+    [ -n "$SB_BIN" ] && [ -f "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1
+}
+
+report_sb_bin_error() {
+    _mach=$(uname -m 2>/dev/null || echo unknown)
+    if [ -f "$SB_BIN" ]; then
+        echo "[System] sing-box at $SB_BIN exists but cannot run (wrong CPU arch or corrupt binary)." >> "$LOG_FILE"
+        echo "[System] Device arch: $_mach. Re-run install.sh (try SINGBOX_ARCH=armv7 if this is 32-bit ARM)." >> "$LOG_FILE"
+    else
+        echo "[System] sing-box binary missing (looked for $SB_BIN). Re-run scripts/install.sh to download it." >> "$LOG_FILE"
+    fi
+}
 
 is_sb_running() {
     # Prefer PID file (survives BusyBox ps cmdline truncation).
@@ -300,10 +417,8 @@ build_final_config() {
     ' "$BASE_CONFIG" > "$CONFIG_FILE"
     rm -f /tmp/sb_node_tmp.json
 
-    # Validate the generated config is well-formed JSON before handing it to sing-box.
-    # Falls back to sing-box's own "check" command when available, which catches both
-    # JSON syntax errors and invalid field values (e.g. malformed reality keys).
-    if [ -x "$SB_BIN" ]; then
+    # Validate with sing-box check when a runnable binary is available.
+    if sb_bin_usable; then
         if ! "$SB_BIN" check -c "$CONFIG_FILE" >/tmp/sb_check.log 2>&1; then
             echo "[System] Generated config failed validation:" >> "$LOG_FILE"
             cat /tmp/sb_check.log >> "$LOG_FILE"
@@ -338,7 +453,10 @@ stop_sb() {
 }
 
 start_sb() {
-    [ ! -x "$SB_BIN" ] && { echo "[System] sing-box binary not found/executable at $SB_BIN" >> "$LOG_FILE"; return 1; }
+    if ! resolve_sb_bin || ! sb_bin_usable; then
+        report_sb_bin_error
+        return 1
+    fi
     if ! build_final_config; then
         echo "[System] Aborting start: config build/validation failed." >> "$LOG_FILE"
         return 1
@@ -831,12 +949,13 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 SB_HTM_EOF
 rm -f /usr/lib/lua/luci/controller/xray.lua /usr/lib/lua/luci/view/xray_panel.htm 2>/dev/null || true
 
-log "7. Initializing state files..."
-rm -f /etc/singbox/node_*.json
+log "7. Initializing state files (preserving existing nodes)..."
 : > /etc/singbox/nodes.list
-printf 'none' > /etc/singbox/active_node
-printf 'tunnel' > /etc/singbox/routing_mode
-printf '0' > /etc/singbox/watchdog.flag
+[ -f /etc/singbox/active_node ] || printf 'none' > /etc/singbox/active_node
+[ -f /etc/singbox/routing_mode ] || printf 'tunnel' > /etc/singbox/routing_mode
+[ -f /etc/singbox/watchdog.flag ] || printf '0' > /etc/singbox/watchdog.flag
+# Keep sb_bin.path written during binary install.
+[ -f /etc/singbox/sb_bin.path ] || printf '%s\n' "$SB_BIN_PATH" > /etc/singbox/sb_bin.path
 
 log "8. Clearing LuCI cache..."
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-templatecache 2>/dev/null || true
