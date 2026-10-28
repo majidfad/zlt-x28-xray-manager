@@ -29,15 +29,17 @@ sh install.sh
 Or clone the repo onto the router and run `sh scripts/install.sh` from the
 repo root (the script locates `files/` relative to itself).
 
-Architecture is auto-detected from `uname -m`. Override if needed:
+Architecture is auto-detected from userspace (not only `uname -m`). OpenWrt
+needs the **musl** build; the installer prefers `linux-*-musl.tar.gz` and
+falls back across arch/libc variants until one actually runs.
 
 ```sh
-SINGBOX_ARCH=armv7 sh scripts/install.sh   # 32-bit ARM
-SINGBOX_ARCH=amd64 sh scripts/install.sh   # x86_64
+SINGBOX_ARCH=armv7 SINGBOX_LIBC=musl sh scripts/install.sh   # 32-bit ARM OpenWrt
+SINGBOX_ARCH=arm64 SINGBOX_LIBC=musl sh scripts/install.sh   # 64-bit ARM OpenWrt
 ```
 
-If Start fails with `sing-box: not found` even though the file exists, the
-binary is the wrong CPU arch — re-run install with the matching `SINGBOX_ARCH`.
+If the binary exists but Start/install says `not found`, it is the wrong
+arch or a glibc build on musl OpenWrt — re-run install (musl is default now).
 
 ## Uninstall
 

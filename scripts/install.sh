@@ -13,23 +13,46 @@ SINGBOX_VERSION="1.14.3"
 
 log() { echo "[install] $*"; }
 
-# Auto-detect CPU arch unless the caller already set SINGBOX_ARCH.
-if [ -z "${SINGBOX_ARCH:-}" ]; then
+# Detect userspace arch. Many aarch64 kernels still run a 32-bit OpenWrt rootfs.
+detect_arch() {
+    _bits="$(getconf LONG_BIT 2>/dev/null || echo "")"
+    if [ "$_bits" = "32" ]; then
+        case "$(uname -m)" in
+            aarch64|arm64|armv7*|armv6*|arm*) echo "armv7"; return ;;
+            x86_64|i386|i686) echo "386"; return ;;
+        esac
+    fi
+    # Prefer dynamic linker presence over uname (more accurate for mixed systems).
+    if [ -e /lib/ld-musl-aarch64.so.1 ] || [ -e /lib/ld-linux-aarch64.so.1 ]; then
+        echo "arm64"; return
+    fi
+    if [ -e /lib/ld-musl-armhf.so.1 ] || [ -e /lib/ld-linux-armhf.so.3 ] || [ -e /lib/ld-linux.so.3 ]; then
+        echo "armv7"; return
+    fi
+    if [ -e /lib/ld-musl-x86_64.so.1 ] || [ -e /lib/ld-linux-x86-64.so.2 ]; then
+        echo "amd64"; return
+    fi
     case "$(uname -m)" in
-        aarch64|arm64) SINGBOX_ARCH="arm64" ;;
-        armv7*|armv6*|arm) SINGBOX_ARCH="armv7" ;;
-        x86_64|amd64) SINGBOX_ARCH="amd64" ;;
-        i386|i686) SINGBOX_ARCH="386" ;;
-        *)
-            log "ERROR: unsupported machine '$(uname -m)'."
-            log "Set SINGBOX_ARCH explicitly (arm64, armv7, amd64, 386) and re-run."
-            exit 1
-            ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7*|armv6*|arm) echo "armv7" ;;
+        x86_64|amd64) echo "amd64" ;;
+        i386|i686) echo "386" ;;
+        *) echo "" ;;
     esac
+}
+
+if [ -z "${SINGBOX_ARCH:-}" ]; then
+    SINGBOX_ARCH="$(detect_arch)"
+    if [ -z "$SINGBOX_ARCH" ]; then
+        log "ERROR: unsupported machine '$(uname -m)'."
+        log "Set SINGBOX_ARCH explicitly (arm64, armv7, amd64, 386) and re-run."
+        exit 1
+    fi
 fi
 
-SINGBOX_ASSET="sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz"
-SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${SINGBOX_ASSET}"
+# OpenWrt is musl. Upstream now ships separate -musl / -glibc builds; the
+# unsuffixed linux-*.tar.gz often won't exec (BusyBox reports "not found").
+SINGBOX_LIBC="${SINGBOX_LIBC:-musl}"
 
 # Prefer a writable directory that allows executing binaries (/data is often noexec).
 pick_core_dir() {
@@ -48,6 +71,108 @@ pick_core_dir() {
     done
     mkdir -p /usr/bin
     echo "/usr/bin"
+}
+
+asset_name() {
+    _arch="$1"
+    _libc="$2"
+    if [ -n "$_libc" ]; then
+        echo "sing-box-${SINGBOX_VERSION}-linux-${_arch}-${_libc}.tar.gz"
+    else
+        echo "sing-box-${SINGBOX_VERSION}-linux-${_arch}.tar.gz"
+    fi
+}
+
+download_and_extract() {
+    _arch="$1"
+    _libc="$2"
+    _asset="$(asset_name "$_arch" "$_libc")"
+    _url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${_asset}"
+    log "Downloading ${_asset}..."
+    rm -f "/tmp/${_asset}"
+    if ! curl -k -L --connect-timeout 20 --fail -o "/tmp/${_asset}" "$_url"; then
+        log "Download failed: $_url"
+        return 1
+    fi
+    EXTRACT_DIR="$CORE_DIR"
+    if [ "$CORE_DIR" = "/usr/bin" ]; then
+        EXTRACT_DIR="/tmp/singbox_extract"
+        rm -rf "$EXTRACT_DIR"
+        mkdir -p "$EXTRACT_DIR"
+    else
+        # Clear previous extract leftovers in core dir.
+        rm -rf "$CORE_DIR"/sing-box-*
+    fi
+    rm -f "$SB_BIN_PATH"
+    if ! tar -xzf "/tmp/${_asset}" -C "$EXTRACT_DIR"; then
+        log "Extract failed for ${_asset}"
+        rm -f "/tmp/${_asset}"
+        return 1
+    fi
+    EXTRACTED=""
+    for f in "$EXTRACT_DIR"/sing-box-*/sing-box; do
+        if [ -f "$f" ]; then
+            EXTRACTED="$f"
+            break
+        fi
+    done
+    if [ -z "$EXTRACTED" ]; then
+        log "sing-box binary not found inside ${_asset}"
+        rm -f "/tmp/${_asset}"
+        return 1
+    fi
+    mv "$EXTRACTED" "$SB_BIN_PATH"
+    chmod +x "$SB_BIN_PATH"
+    rm -rf "$CORE_DIR"/sing-box-* /tmp/singbox_extract "/tmp/${_asset}" 2>/dev/null || true
+
+    # Also try executing from /tmp in case CORE_DIR is noexec for ELF only.
+    if ! "$SB_BIN_PATH" version >/tmp/sb_ver.out 2>&1; then
+        cp -f "$SB_BIN_PATH" /tmp/sing-box.test 2>/dev/null || true
+        chmod +x /tmp/sing-box.test 2>/dev/null || true
+        if /tmp/sing-box.test version >/tmp/sb_ver.out 2>&1; then
+            log "NOTE: binary runs from /tmp but not $CORE_DIR — moving to /usr/bin"
+            mv /tmp/sing-box.test /usr/bin/sing-box
+            chmod +x /usr/bin/sing-box
+            SB_BIN_PATH="/usr/bin/sing-box"
+            CORE_DIR="/usr/bin"
+            return 0
+        fi
+        rm -f /tmp/sing-box.test
+        log "Binary not executable with arch=${_arch} libc=${_libc:-default}: $(cat /tmp/sb_ver.out 2>/dev/null)"
+        return 1
+    fi
+    return 0
+}
+
+try_install_binary() {
+    # Candidate list: preferred first, then fallbacks for mixed aarch64/armv7 OpenWrt.
+    # Format: arch:libc  (libc empty = unsuffixed upstream asset)
+    _candidates=""
+    if [ -n "${SINGBOX_ARCH:-}" ] && [ -n "${SINGBOX_LIBC:-}" ]; then
+        _candidates="${SINGBOX_ARCH}:${SINGBOX_LIBC}"
+    fi
+    _candidates="$_candidates ${SINGBOX_ARCH}:musl ${SINGBOX_ARCH}: ${SINGBOX_ARCH}:glibc"
+    case "$SINGBOX_ARCH" in
+        arm64) _candidates="$_candidates armv7:musl armv7:" ;;
+        armv7) _candidates="$_candidates arm64:musl arm64:" ;;
+    esac
+
+    _tried=""
+    for _pair in $_candidates; do
+        _arch="${_pair%%:*}"
+        _libc="${_pair#*:}"
+        _key="${_arch}:${_libc}"
+        case " $_tried " in
+            *" $_key "*) continue ;;
+        esac
+        _tried="$_tried $_key"
+        if download_and_extract "$_arch" "$_libc"; then
+            SINGBOX_ARCH="$_arch"
+            SINGBOX_LIBC="${_libc:-default}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 log "1. Stopping services and cleaning up..."
@@ -76,55 +201,35 @@ SB_BIN_PATH="$CORE_DIR/sing-box"
 if [ "$CORE_DIR" = "/usr/bin" ]; then
     SB_BIN_PATH="/usr/bin/sing-box"
 fi
-log "Core install dir: $CORE_DIR (machine=$(uname -m), arch=$SINGBOX_ARCH)"
+log "Core install dir: $CORE_DIR (machine=$(uname -m), long_bit=$(getconf LONG_BIT 2>/dev/null || echo ?), arch=$SINGBOX_ARCH, libc=$SINGBOX_LIBC)"
 
-log "3. Downloading sing-box ${SINGBOX_VERSION} (${SINGBOX_ARCH})..."
+log "3. Installing sing-box ${SINGBOX_VERSION}..."
 CURRENT_VERSION=""
 if [ -f "$SB_BIN_PATH" ]; then
     # Only trust version if the binary actually runs on this CPU.
     CURRENT_VERSION=$("$SB_BIN_PATH" version 2>/dev/null | head -n1 | awk '{print $3}') || CURRENT_VERSION=""
 fi
 
-if [ "$CURRENT_VERSION" != "$SINGBOX_VERSION" ]; then
+if [ "$CURRENT_VERSION" = "$SINGBOX_VERSION" ]; then
+    log "sing-box $SINGBOX_VERSION already installed and runnable, skipping download."
+else
     if [ -n "$CURRENT_VERSION" ]; then
         log "Found existing sing-box $CURRENT_VERSION, replacing with $SINGBOX_VERSION..."
     elif [ -f "$SB_BIN_PATH" ]; then
-        log "Existing binary at $SB_BIN_PATH does not run; re-downloading for $SINGBOX_ARCH..."
+        log "Existing binary at $SB_BIN_PATH does not run; trying musl/arch fallbacks..."
     fi
-    rm -f "/tmp/${SINGBOX_ASSET}"
-    if ! curl -k -L --connect-timeout 20 --fail -o "/tmp/${SINGBOX_ASSET}" "$SINGBOX_URL"; then
-        log "ERROR: download failed from $SINGBOX_URL"
-        log "Check connectivity or set SINGBOX_ARCH if auto-detect was wrong (uname -m=$(uname -m))."
+    if ! try_install_binary; then
+        log "ERROR: could not install a runnable sing-box binary."
+        log "Diagnostics:"
+        log "  uname -m: $(uname -m)"
+        log "  LONG_BIT: $(getconf LONG_BIT 2>/dev/null || echo unknown)"
+        log "  linkers: $(ls /lib/ld-* 2>/dev/null || echo none)"
+        log "  tried musl/glibc for $SINGBOX_ARCH (and arm fallback)."
+        log "Manual override examples:"
+        log "  SINGBOX_ARCH=armv7 SINGBOX_LIBC=musl sh install.sh"
+        log "  SINGBOX_ARCH=arm64 SINGBOX_LIBC=musl sh install.sh"
         exit 1
     fi
-    # Extract into CORE_DIR (or a temp subdir when CORE_DIR is /usr/bin).
-    EXTRACT_DIR="$CORE_DIR"
-    if [ "$CORE_DIR" = "/usr/bin" ]; then
-        EXTRACT_DIR="/tmp/singbox_extract"
-        rm -rf "$EXTRACT_DIR"
-        mkdir -p "$EXTRACT_DIR"
-    fi
-    rm -f "$SB_BIN_PATH"
-    if ! tar -xzf "/tmp/${SINGBOX_ASSET}" -C "$EXTRACT_DIR"; then
-        log "ERROR: failed to extract /tmp/${SINGBOX_ASSET}"
-        exit 1
-    fi
-    EXTRACTED=""
-    for f in "$EXTRACT_DIR"/sing-box-*/sing-box; do
-        if [ -f "$f" ]; then
-            EXTRACTED="$f"
-            break
-        fi
-    done
-    if [ -z "$EXTRACTED" ]; then
-        log "ERROR: sing-box binary not found inside archive."
-        exit 1
-    fi
-    mv "$EXTRACTED" "$SB_BIN_PATH"
-    chmod +x "$SB_BIN_PATH"
-    rm -rf /data/singbox_core/sing-box-* /opt/singbox_core/sing-box-* /tmp/singbox_extract "/tmp/${SINGBOX_ASSET}" 2>/dev/null || true
-else
-    log "sing-box $SINGBOX_VERSION already installed, skipping download."
 fi
 
 if [ ! -f "$SB_BIN_PATH" ]; then
@@ -134,13 +239,10 @@ fi
 
 if ! "$SB_BIN_PATH" version >/tmp/sb_ver.out 2>&1; then
     log "ERROR: $SB_BIN_PATH exists but cannot execute on this device."
-    log "Machine: $(uname -m)  Downloaded arch: $SINGBOX_ARCH"
     log "Kernel says: $(cat /tmp/sb_ver.out 2>/dev/null)"
-    log "If this is 32-bit ARM try: SINGBOX_ARCH=armv7 sh install.sh"
-    log "If this is 64-bit ARM try: SINGBOX_ARCH=arm64 sh install.sh"
     exit 1
 fi
-log "sing-box OK: $(head -n1 /tmp/sb_ver.out 2>/dev/null)"
+log "sing-box OK: $(head -n1 /tmp/sb_ver.out 2>/dev/null) (arch=$SINGBOX_ARCH libc=$SINGBOX_LIBC path=$SB_BIN_PATH)"
 printf '%s\n' "$SB_BIN_PATH" > /etc/singbox/sb_bin.path
 
 log "4. Generating base configuration..."
