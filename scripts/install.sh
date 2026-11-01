@@ -193,8 +193,33 @@ ip route del local default dev lo table 100 2>/dev/null || true
 
 log "2. Preparing directories..."
 rm -rf /data/xray_core /etc/xray
-mkdir -p /etc/singbox
+mkdir -p /etc/singbox /etc/singbox/ipsec
 mkdir -p /usr/lib/lua/luci/controller/ /usr/lib/lua/luci/view/
+[ -f /etc/singbox/active_proto ] || printf 'none' > /etc/singbox/active_proto
+
+# Optional IKEv2/IPsec backend (Amnezia-style cert JSON). Best-effort — firmware
+# feeds differ; skip quietly if opkg/packages are unavailable.
+log "2b. Checking strongSwan (IPsec/IKEv2)..."
+if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
+    log "strongSwan already present."
+elif command -v opkg >/dev/null 2>&1; then
+    opkg update >/tmp/sb_opkg_update.log 2>&1 || true
+    _ss_ok=0
+    for _pkg in strongswan-full strongswan-default strongswan swanctl openssl-util; do
+        if opkg install "$_pkg" >/tmp/sb_opkg_ss.log 2>&1; then
+            log "Installed $_pkg"
+            _ss_ok=1
+        fi
+    done
+    if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
+        log "strongSwan ready for IPsec nodes."
+    elif [ "$_ss_ok" = "0" ]; then
+        log "NOTE: could not install strongSwan from opkg. VLESS still works;"
+        log "      IPsec JSON nodes need: opkg install strongswan-full swanctl openssl-util"
+    fi
+else
+    log "NOTE: no opkg — install strongSwan manually if you need IPsec."
+fi
 CORE_DIR="$(pick_core_dir)"
 SB_BIN_PATH="$CORE_DIR/sing-box"
 # When falling back to /usr/bin, binary name is just sing-box there already.
@@ -290,6 +315,7 @@ cat << 'SB_MGR_EOF' > /usr/bin/sb-manager
 # =======================================================
 # sb-manager - Sing-Box Enterprise VPN Manager
 # Core control daemon for ZLT-X28 Sing-Box VPN Manager
+# Supports VLESS (sing-box) and IKEv2/IPsec (strongSwan)
 # =======================================================
 DIR_SB="/etc/singbox"
 ACTIVE_NODE_POINTER="$DIR_SB/active_node"
@@ -305,6 +331,10 @@ WATCHDOG_STATUS_FILE="/tmp/sb_wd_status"
 BYPASS_LIST="$DIR_SB/bypass.list"
 SB_BIN_POINTER="$DIR_SB/sb_bin.path"
 SB_BIN="/data/singbox_core/sing-box"
+IPSEC_DIR="$DIR_SB/ipsec"
+IPSEC_CONN="sbvpn"
+IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
+PROTO_POINTER="$DIR_SB/active_proto"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -362,8 +392,40 @@ is_sb_running() {
     return 1
 }
 
+is_ipsec_running() {
+    if command -v swanctl >/dev/null 2>&1; then
+        swanctl --list-sas 2>/dev/null | grep -q "$IPSEC_CONN" && return 0
+    fi
+    if command -v ipsec >/dev/null 2>&1; then
+        ipsec status 2>/dev/null | grep -q "$IPSEC_CONN" && return 0
+    fi
+    return 1
+}
+
+is_vpn_running() {
+    if [ "$(cat "$PROTO_POINTER" 2>/dev/null)" = "ipsec" ]; then
+        is_ipsec_running
+    else
+        is_sb_running
+    fi
+}
+
 get_active_node_path() { echo "$DIR_SB/node_$(cat "$ACTIVE_NODE_POINTER" 2>/dev/null).json"; }
 get_mode() { cat "$MODE_POINTER" 2>/dev/null || echo "tunnel"; }
+
+node_proto() {
+    _n="$1"
+    [ -f "$_n" ] || { echo "none"; return; }
+    if grep -q '"type"[[:space:]]*:[[:space:]]*"ipsec"' "$_n" 2>/dev/null; then
+        echo "ipsec"
+    elif grep -q '"type"[[:space:]]*:[[:space:]]*"vless"' "$_n" 2>/dev/null; then
+        echo "vless"
+    elif grep -q '"hostName"' "$_n" 2>/dev/null && grep -q '"cert"' "$_n" 2>/dev/null; then
+        echo "ipsec"
+    else
+        echo "vless"
+    fi
+}
 
 # Decode percent-encoded URI components (full range, not a hardcoded subset).
 # Using awk because BusyBox ash has no printf '%b' / no native URL decode.
@@ -399,8 +461,83 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Extract a top-level JSON string field (ash-friendly; values must not contain raw quotes).
+extract_json_str() {
+    _file="$1"
+    _key="$2"
+    # Collapse to one line-ish stream but keep content; match "key":"value"
+    tr '\n\r' '  ' < "$_file" | awk -v key="$_key" '
+    {
+        s = $0
+        # Find "key"
+        qkey = "\"" key "\""
+        p = index(s, qkey)
+        if (p == 0) exit
+        rest = substr(s, p + length(qkey))
+        # Skip whitespace and colon
+        sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
+        if (substr(rest, 1, 1) != "\"") exit
+        rest = substr(rest, 2)
+        out = ""
+        n = length(rest)
+        for (i = 1; i <= n; i++) {
+            c = substr(rest, i, 1)
+            if (c == "\\") {
+                i++
+                if (i > n) break
+                out = out substr(rest, i, 1)
+                continue
+            }
+            if (c == "\"") break
+            out = out c
+        }
+        printf "%s", out
+    }'
+}
+
+parse_ipsec_json() {
+    FILE="$1"
+    OUT="$2"
+    host=$(extract_json_str "$FILE" hostName)
+    user=$(extract_json_str "$FILE" userName)
+    pass=$(extract_json_str "$FILE" password)
+    cert=$(extract_json_str "$FILE" cert)
+    if [ -z "$host" ] || [ -z "$cert" ]; then
+        return 1
+    fi
+    [ -z "$user" ] && user=$(extract_json_str "$FILE" clientId)
+    host_e=$(json_escape "$host")
+    user_e=$(json_escape "$user")
+    pass_e=$(json_escape "$pass")
+    # Cert is base64; escape for JSON just in case
+    cert_e=$(json_escape "$cert")
+    cat > "$OUT" << EOF
+{
+  "type": "ipsec",
+  "tag": "proxy",
+  "hostName": "$host_e",
+  "userName": "$user_e",
+  "password": "$pass_e",
+  "cert": "$cert_e"
+}
+EOF
+    return 0
+}
+
 parse_link_to_json() {
     FILE="$1"
+    # Detect Amnezia-style IKEv2 JSON ({ "cert": "...", "hostName": ... })
+    _head=$(head -c 256 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
+    case "$_head" in
+        \{*)
+            if grep -q '"hostName"' "$FILE" 2>/dev/null && grep -q '"cert"' "$FILE" 2>/dev/null; then
+                parse_ipsec_json "$FILE" /tmp/sb_parse_out.json && cat /tmp/sb_parse_out.json
+                rm -f /tmp/sb_parse_out.json
+                return
+            fi
+            ;;
+    esac
+
     link=$(cat "$FILE" | tr -d '\r\n ')
     if echo "$link" | grep -q "^vless://"; then
         link="${link#*://}"; link="${link%%#*}"
@@ -532,7 +669,20 @@ build_final_config() {
     return 0
 }
 
-get_server_ip() { ACTIVE_NODE=$(get_active_node_path); if [ -f "$ACTIVE_NODE" ]; then awk -F'"' '/"server":/ {print $4; exit}' "$ACTIVE_NODE"; fi; }
+get_server_ip() {
+    ACTIVE_NODE=$(get_active_node_path)
+    [ -f "$ACTIVE_NODE" ] || return
+    _proto=$(node_proto "$ACTIVE_NODE")
+    if [ "$_proto" = "ipsec" ]; then
+        extract_json_str "$ACTIVE_NODE" hostName
+    else
+        awk -F'"' '/"server":/ {print $4; exit}' "$ACTIVE_NODE"
+    fi
+}
+
+have_strongswan() {
+    command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1
+}
 
 clean_iptables() {
     iptables -t mangle -D PREROUTING -j SB_TRANS 2>/dev/null
@@ -545,16 +695,342 @@ clean_iptables() {
     ip route del local default dev lo table 100 2>/dev/null
 }
 
+clean_ipsec_nat() {
+    iptables -t nat -D POSTROUTING -j SB_IPSEC_NAT 2>/dev/null
+    iptables -t nat -F SB_IPSEC_NAT 2>/dev/null
+    iptables -t nat -X SB_IPSEC_NAT 2>/dev/null
+}
+
+stop_ipsec() {
+    clean_ipsec_nat
+    if command -v swanctl >/dev/null 2>&1; then
+        swanctl --terminate --ike "$IPSEC_CONN" >/dev/null 2>&1 || true
+        rm -f "$IPSEC_SWANCTL"
+        swanctl --load-conns >/dev/null 2>&1 || swanctl --load-all >/dev/null 2>&1 || true
+    elif command -v ipsec >/dev/null 2>&1; then
+        ipsec down "$IPSEC_CONN" >/dev/null 2>&1 || true
+        rm -f /etc/ipsec.d/sbvpn.conf /etc/ipsec.conf.sbvpn 2>/dev/null
+        # Remove our include block if present
+        if [ -f /etc/ipsec.conf ] && grep -q "sbvpn-begin" /etc/ipsec.conf 2>/dev/null; then
+            awk '/# sbvpn-begin/{skip=1} /# sbvpn-end/{skip=0; next} !skip{print}' /etc/ipsec.conf > /tmp/ipsec.conf.new
+            mv /tmp/ipsec.conf.new /etc/ipsec.conf
+            ipsec reload >/dev/null 2>&1 || true
+        fi
+    fi
+    echo "[System] IPsec/IKEv2 terminated." >> "$LOG_FILE"
+}
+
 stop_sb() {
     [ -f "$WATCHDOG_PID" ] && kill -9 "$(cat "$WATCHDOG_PID" 2>/dev/null)" 2>/dev/null
     rm -f "$WATCHDOG_PID" "$WATCHDOG_STATUS_FILE"
     [ -f "$PID_FILE" ] && kill -9 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
     killall -9 sing-box 2>/dev/null
     clean_iptables
-    echo "[System] Sing-Box fully terminated." >> "$LOG_FILE"
+    stop_ipsec >/dev/null 2>&1
+    echo "none" > "$PROTO_POINTER"
+    echo "[System] VPN fully terminated." >> "$LOG_FILE"
+}
+
+# Prepare PKCS#12 material for an IPsec node id.
+prepare_ipsec_material() {
+    _id="$1"
+    _node="$DIR_SB/node_${_id}.json"
+    _dir="$IPSEC_DIR/$_id"
+    mkdir -p "$_dir"
+    _cert=$(extract_json_str "$_node" cert)
+    _pass=$(extract_json_str "$_node" password)
+    _host=$(extract_json_str "$_node" hostName)
+    _user=$(extract_json_str "$_node" userName)
+
+    if [ -z "$_cert" ] || [ -z "$_host" ]; then
+        echo "[System] IPsec node $_id missing cert/hostName." >> "$LOG_FILE"
+        return 1
+    fi
+
+    # Decode PKCS#12 (Amnezia / strongSwan .p12, may use BER indefinite length).
+    if command -v base64 >/dev/null 2>&1; then
+        printf '%s' "$_cert" | base64 -d > "$_dir/client.p12" 2>/dev/null || \
+        printf '%s' "$_cert" | base64 -d 2>/dev/null > "$_dir/client.p12"
+    else
+        printf '%s' "$_cert" | openssl base64 -d -A > "$_dir/client.p12" 2>/dev/null
+    fi
+    if [ ! -s "$_dir/client.p12" ]; then
+        echo "[System] Failed to base64-decode IPsec certificate." >> "$LOG_FILE"
+        return 1
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[System] openssl required to unpack IPsec PKCS#12. Install openssl-util." >> "$LOG_FILE"
+        return 1
+    fi
+
+    # Extract PEM bag; OpenSSL 3 may need -legacy for older P12 bags.
+    rm -f "$_dir/all.pem" "$_dir/client.pem" "$_dir/client.key" "$_dir/ca.pem"
+    if ! openssl pkcs12 -in "$_dir/client.p12" -nodes -password "pass:$_pass" -out "$_dir/all.pem" >/tmp/sb_p12.err 2>&1; then
+        if ! openssl pkcs12 -in "$_dir/client.p12" -nodes -legacy -password "pass:$_pass" -out "$_dir/all.pem" >/tmp/sb_p12.err 2>&1; then
+            echo "[System] openssl pkcs12 extract failed:" >> "$LOG_FILE"
+            cat /tmp/sb_p12.err >> "$LOG_FILE"
+            return 1
+        fi
+    fi
+
+    # Split certificates / key from the bag.
+    awk '
+        /BEGIN (ENCRYPTED )?PRIVATE KEY/,/END (ENCRYPTED )?PRIVATE KEY/ {print > keyf}
+        /BEGIN CERTIFICATE/ {c++; n=c}
+        /BEGIN CERTIFICATE/,/END CERTIFICATE/ {
+            if (n==1) print > certf
+            else print > caf
+        }
+    ' keyf="$_dir/client.key" certf="$_dir/client.pem" caf="$_dir/ca.pem" "$_dir/all.pem"
+
+    if [ ! -s "$_dir/client.key" ] || [ ! -s "$_dir/client.pem" ]; then
+        echo "[System] PKCS#12 did not contain a client key+cert." >> "$LOG_FILE"
+        return 1
+    fi
+    chmod 600 "$_dir/client.key" "$_dir/client.p12" "$_dir/all.pem"
+
+    # Export for caller via files; also write a tiny env file.
+    printf '%s\n' "$_host" > "$_dir/host"
+    printf '%s\n' "$_user" > "$_dir/user"
+    printf '%s\n' "$_pass" > "$_dir/pass"
+    return 0
+}
+
+write_swanctl_conn() {
+    _id="$1"
+    _dir="$IPSEC_DIR/$_id"
+    _host=$(cat "$_dir/host")
+    _user=$(cat "$_dir/user")
+    mkdir -p /etc/swanctl/conf.d /etc/swanctl/x509 /etc/swanctl/private /etc/swanctl/x509ca
+
+    cp -f "$_dir/client.pem" "/etc/swanctl/x509/sbvpn_client.pem"
+    cp -f "$_dir/client.key" "/etc/swanctl/private/sbvpn_client.key"
+    if [ -s "$_dir/ca.pem" ]; then
+        cp -f "$_dir/ca.pem" "/etc/swanctl/x509ca/sbvpn_ca.pem"
+    fi
+    chmod 600 /etc/swanctl/private/sbvpn_client.key
+
+    _local_id=""
+    if [ -n "$_user" ]; then
+        _local_id="id = $_user"
+    fi
+
+    cat > "$IPSEC_SWANCTL" << EOF
+connections {
+    $IPSEC_CONN {
+        version = 2
+        remote_addrs = $_host
+        vips = 0.0.0.0
+        proposals = aes256-sha256-modp2048,aes256-sha256-ecp256,aes128-sha256-modp2048,default
+        local {
+            auth = pubkey
+            certs = sbvpn_client.pem
+            rsa_pss = yes
+            $_local_id
+        }
+        remote {
+            auth = pubkey
+        }
+        children {
+            net {
+                remote_ts = 0.0.0.0/0
+                esp_proposals = aes128gcm16,aes256gcm16,aes128-sha256,default
+                start_action = start
+                dpd_action = restart
+                hostaccess = yes
+            }
+        }
+    }
+}
+
+secrets {
+    private-sbvpn {
+        file = sbvpn_client.key
+    }
+}
+EOF
+}
+
+write_ipsec_conf_conn() {
+    _id="$1"
+    _dir="$IPSEC_DIR/$_id"
+    _host=$(cat "$_dir/host")
+    _user=$(cat "$_dir/user")
+    mkdir -p /etc/ipsec.d/certs /etc/ipsec.d/private /etc/ipsec.d/cacerts
+    cp -f "$_dir/client.pem" /etc/ipsec.d/certs/sbvpn_client.pem
+    cp -f "$_dir/client.key" /etc/ipsec.d/private/sbvpn_client.key
+    [ -s "$_dir/ca.pem" ] && cp -f "$_dir/ca.pem" /etc/ipsec.d/cacerts/sbvpn_ca.pem
+    chmod 600 /etc/ipsec.d/private/sbvpn_client.key
+
+    _leftid="%any"
+    [ -n "$_user" ] && _leftid="$_user"
+
+    # Ensure private key is listed in secrets
+    if [ -f /etc/ipsec.secrets ]; then
+        grep -q "sbvpn_client.key" /etc/ipsec.secrets 2>/dev/null || \
+            echo ': RSA sbvpn_client.key' >> /etc/ipsec.secrets
+    else
+        echo ': RSA sbvpn_client.key' > /etc/ipsec.secrets
+        chmod 600 /etc/ipsec.secrets
+    fi
+
+    # Inject / replace conn block in ipsec.conf
+    if [ -f /etc/ipsec.conf ]; then
+        awk '/# sbvpn-begin/{skip=1} /# sbvpn-end/{skip=0; next} !skip{print}' /etc/ipsec.conf > /tmp/ipsec.conf.base
+    else
+        echo "config setup" > /tmp/ipsec.conf.base
+        echo "  uniqueids=never" >> /tmp/ipsec.conf.base
+    fi
+    cat >> /tmp/ipsec.conf.base << EOF
+
+# sbvpn-begin
+conn $IPSEC_CONN
+  keyexchange=ikev2
+  auto=start
+  type=tunnel
+  left=%defaultroute
+  leftauth=pubkey
+  leftcert=sbvpn_client.pem
+  leftid=$_leftid
+  leftsourceip=%config
+  right=$_host
+  rightauth=pubkey
+  rightid=%any
+  rightsubnet=0.0.0.0/0
+  ike=aes256-sha256-modp2048,aes256-sha256-ecp256!
+  esp=aes128gcm16,aes256gcm16,aes128-sha256!
+  dpdaction=restart
+  dpddelay=30s
+  fragmentation=yes
+  forceencaps=yes
+# sbvpn-end
+EOF
+    mv /tmp/ipsec.conf.base /etc/ipsec.conf
+}
+
+setup_ipsec_lan_nat() {
+    # SNAT LAN clients to the IPsec virtual IP so policy-based tunnel covers them.
+    clean_ipsec_nat
+    _vip=""
+    # Prefer address from swanctl / xfrm / ipsec
+    if command -v swanctl >/dev/null 2>&1; then
+        _vip=$(swanctl --list-sas 2>/dev/null | awk '/local.*SPI|vip|===/{next} /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{
+            for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print $i; exit }
+        }')
+    fi
+    if [ -z "$_vip" ]; then
+        _vip=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ && $2 !~ /^192\.168\./ && $2 !~ /^10\./ {
+            split($2,a,"/"); print a[1]; exit
+        }')
+    fi
+    # Also try XFRM interface
+    if [ -z "$_vip" ]; then
+        _vip=$(ip -4 addr show 2>/dev/null | awk '/xfrm|ipsec|vti/ {getline; if ($1=="inet"){split($2,a,"/"); print a[1]; exit}}')
+    fi
+
+    SERVER_IP=$(get_server_ip)
+    iptables -t nat -N SB_IPSEC_NAT 2>/dev/null
+    iptables -t nat -F SB_IPSEC_NAT
+    # Bypass private / VPN server
+    iptables -t nat -A SB_IPSEC_NAT -d 0.0.0.0/8 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 169.254.0.0/16 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A SB_IPSEC_NAT -d 224.0.0.0/4 -j RETURN
+    [ -n "$SERVER_IP" ] && iptables -t nat -A SB_IPSEC_NAT -d "$SERVER_IP" -j RETURN 2>/dev/null
+
+    if [ -n "$_vip" ]; then
+        iptables -t nat -A SB_IPSEC_NAT -j SNAT --to-source "$_vip"
+        echo "[System] IPsec LAN SNAT to VIP $_vip" >> "$LOG_FILE"
+    else
+        iptables -t nat -A SB_IPSEC_NAT -j MASQUERADE
+        echo "[System] IPsec LAN MASQUERADE (VIP not detected yet)" >> "$LOG_FILE"
+    fi
+    iptables -t nat -I POSTROUTING -j SB_IPSEC_NAT
+}
+
+start_ipsec() {
+    if ! have_strongswan; then
+        echo "[System] strongSwan not installed. On OpenWrt run:" >> "$LOG_FILE"
+        echo "[System]   opkg update && opkg install strongswan-full swanctl openssl-util" >> "$LOG_FILE"
+        echo "[System] (package names vary by firmware; try strongswan-default if -full is missing)." >> "$LOG_FILE"
+        return 1
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[System] openssl not found. Install openssl-util." >> "$LOG_FILE"
+        return 1
+    fi
+
+    _id=$(cat "$ACTIVE_NODE_POINTER" 2>/dev/null)
+    if [ -z "$_id" ]; then
+        echo "[System] No active node for IPsec." >> "$LOG_FILE"
+        return 1
+    fi
+    if ! prepare_ipsec_material "$_id"; then
+        return 1
+    fi
+
+    # Ensure charon is running
+    if [ -x /etc/init.d/swanctl ]; then
+        /etc/init.d/swanctl enable >/dev/null 2>&1 || true
+        /etc/init.d/swanctl start >/dev/null 2>&1 || true
+    fi
+    if [ -x /etc/init.d/ipsec ]; then
+        /etc/init.d/ipsec enable >/dev/null 2>&1 || true
+        /etc/init.d/ipsec start >/dev/null 2>&1 || true
+    fi
+
+    if command -v swanctl >/dev/null 2>&1; then
+        write_swanctl_conn "$_id"
+        swanctl --load-all >/tmp/sb_swan.err 2>&1 || swanctl --load-conns >/tmp/sb_swan.err 2>&1 || true
+        swanctl --load-creds >/dev/null 2>&1 || true
+        # Initiate if not already up
+        if ! swanctl --list-sas 2>/dev/null | grep -q "$IPSEC_CONN"; then
+            swanctl --initiate --child net >/tmp/sb_swan_init.err 2>&1 || \
+            swanctl --initiate --ike "$IPSEC_CONN" >/tmp/sb_swan_init.err 2>&1 || true
+        fi
+        sleep 2
+        if ! is_ipsec_running; then
+            echo "[System] swanctl initiate failed:" >> "$LOG_FILE"
+            cat /tmp/sb_swan.err /tmp/sb_swan_init.err 2>/dev/null >> "$LOG_FILE"
+            return 1
+        fi
+    else
+        write_ipsec_conf_conn "$_id"
+        ipsec reload >/tmp/sb_ipsec.err 2>&1 || true
+        ipsec up "$IPSEC_CONN" >/tmp/sb_ipsec.err 2>&1 || true
+        sleep 2
+        if ! is_ipsec_running; then
+            echo "[System] ipsec up failed:" >> "$LOG_FILE"
+            cat /tmp/sb_ipsec.err 2>/dev/null >> "$LOG_FILE"
+            return 1
+        fi
+    fi
+
+    echo "ipsec" > "$PROTO_POINTER"
+    if [ "$(get_mode)" = "tunnel" ]; then
+        setup_ipsec_lan_nat
+    fi
+    echo "[System] IPsec/IKEv2 connected to $(cat "$IPSEC_DIR/$_id/host")." >> "$LOG_FILE"
+    start_watchdog
+    return 0
 }
 
 start_sb() {
+    ACTIVE_NODE=$(get_active_node_path)
+    _proto=$(node_proto "$ACTIVE_NODE")
+
+    # Always tear down the other engine first.
+    stop_sb >/dev/null 2>&1
+
+    if [ "$_proto" = "ipsec" ]; then
+        start_ipsec
+        return $?
+    fi
+
     if ! resolve_sb_bin || ! sb_bin_usable; then
         report_sb_bin_error
         return 1
@@ -565,7 +1041,6 @@ start_sb() {
     fi
     SERVER_IP=$(get_server_ip)
 
-    stop_sb >/dev/null 2>&1
     sysctl -w net.core.netdev_max_backlog=10000 >/dev/null 2>&1
     ulimit -n 65535 >/dev/null 2>&1
 
@@ -606,20 +1081,21 @@ start_sb() {
         echo "[System] Sing-Box Routing Active." >> "$LOG_FILE"
     fi
 
+    echo "vless" > "$PROTO_POINTER"
     start-stop-daemon -S -b -m -p "$PID_FILE" -x /bin/sh -- -c "export GOMEMLIMIT=150MiB GOGC=100; exec $SB_BIN run -c '$CONFIG_FILE' >> '$LOG_FILE' 2>&1"
     start_watchdog
 }
 
 maint_run() {
     sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-    if is_sb_running; then stop_sb; sleep 2; start_sb; fi
+    if is_vpn_running; then stop_sb; sleep 2; start_sb; fi
 }
 
 daemon_watchdog() {
     echo $$ > "$WATCHDOG_PID"
     while true; do
         sleep 15
-        if is_sb_running; then echo "green" > "$WATCHDOG_STATUS_FILE"
+        if is_vpn_running; then echo "green" > "$WATCHDOG_STATUS_FILE"
         else echo "offline" > "$WATCHDOG_STATUS_FILE"; exit 0; fi
     done
 }
@@ -633,8 +1109,16 @@ case "$1" in
     start) start_sb; exit 0 ;;
     stop) stop_sb; exit 0 ;;
     restart) stop_sb; sleep 1; start_sb; exit 0 ;;
-    status) if is_sb_running; then echo "Running"; else echo "Stopped"; fi; exit 0 ;;
+    status)
+        if [ "$(cat "$PROTO_POINTER" 2>/dev/null)" = "ipsec" ]; then
+            if is_ipsec_running; then echo "Running (IPsec)"; else echo "Stopped"; fi
+        else
+            if is_sb_running; then echo "Running"; else echo "Stopped"; fi
+        fi
+        exit 0
+        ;;
     active) cat "$ACTIVE_NODE_POINTER" 2>/dev/null; exit 0 ;;
+    proto) cat "$PROTO_POINTER" 2>/dev/null || echo "none"; exit 0 ;;
     switch) echo "$2" > "$ACTIVE_NODE_POINTER"; exit 0 ;;
     addnode)
         if [ -z "$2" ] || [ -z "$3" ] || [ ! -f "$3" ]; then
@@ -644,12 +1128,16 @@ case "$1" in
         parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
         if [ ! -s "$DIR_SB/node_$2.json" ]; then
             rm -f "$DIR_SB/node_$2.json"
-            echo "Failed to parse link (expected a vless:// URL)" >&2
+            echo "Failed to parse config (expected vless:// URL or IPsec JSON with cert/hostName)" >&2
             exit 1
         fi
         exit 0
         ;;
-    delnode) rm -f "$DIR_SB/node_$2.json"; exit 0 ;;
+    delnode)
+        rm -f "$DIR_SB/node_$2.json"
+        rm -rf "$IPSEC_DIR/$2"
+        exit 0
+        ;;
     listnodes)
         for f in "$DIR_SB"/node_*.json; do
             [ -f "$f" ] || continue
@@ -660,6 +1148,15 @@ case "$1" in
         done
         exit 0
         ;;
+    nodetype)
+        # Print protocol of a node id (or active node if none given)
+        if [ -n "$2" ]; then
+            node_proto "$DIR_SB/node_$2.json"
+        else
+            node_proto "$(get_active_node_path)"
+        fi
+        exit 0
+        ;;
     mode_toggle) echo "$2" > "$MODE_POINTER"; exit 0 ;;
     mode_status) get_mode; exit 0 ;;
     maint_run) maint_run; exit 0 ;;
@@ -668,7 +1165,7 @@ case "$1" in
     led_status) cat "$WATCHDOG_STATUS_FILE" 2>/dev/null || echo "offline"; exit 0 ;;
     daemon_watchdog) daemon_watchdog; exit 0 ;;
     *)
-        echo "Usage: sb-manager {start|stop|restart|status|active|switch <id>|addnode <id> <linkfile>|delnode <id>|listnodes|mode_toggle <tunnel|proxy>|mode_status|watchdog_toggle <0|1>|watchdog_status|led_status}"
+        echo "Usage: sb-manager {start|stop|restart|status|active|switch <id>|addnode <id> <linkfile>|delnode <id>|listnodes|nodetype [id]|mode_toggle <tunnel|proxy>|mode_status|watchdog_toggle <0|1>|watchdog_status|led_status}"
         exit 1
         ;;
 esac
@@ -724,6 +1221,7 @@ function action_status()
     local mode = run("/usr/bin/sb-manager mode_status")
     local led = run("/usr/bin/sb-manager led_status")
     local watchdog = run("/usr/bin/sb-manager watchdog_status")
+    local proto = run("/usr/bin/sb-manager nodetype")
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         running = running,
@@ -731,6 +1229,7 @@ function action_status()
         mode = mode,
         led = led,
         watchdog = watchdog,
+        proto = proto,
     })
 end
 
@@ -772,14 +1271,28 @@ function action_addnode()
         return
     end
     if not link or link == "" then
-        luci.http.write_json({ ok = false, error = "empty link (use POST; GET truncates long vless URLs)" })
+        luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
         return
     end
-    -- Normalize pasted links: strip whitespace and optional surrounding quotes.
-    link = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
-    if not link:match("^vless://") then
-        luci.http.write_json({ ok = false, error = "link must start with vless://" })
+    -- Detect Amnezia-style IPsec JSON vs vless:// share link.
+    local trimmed = link:match("^%s*(.-)%s*$") or link
+    local is_ipsec = trimmed:sub(1, 1) == "{"
+    local is_vless = trimmed:match("^vless://") ~= nil
+    if not is_ipsec and not is_vless then
+        -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
+        luci.http.write_json({
+            ok = false,
+            error = "paste a vless:// URL or IPsec JSON ({cert, hostName, userName, password})"
+        })
         return
+    end
+    local payload = link
+    if is_vless then
+        -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+        payload = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
+    else
+        -- Keep JSON structure; only trim outer whitespace.
+        payload = trimmed
     end
     local tmp = "/tmp/sb_link_" .. id .. ".txt"
     local fh = io.open(tmp, "w")
@@ -787,19 +1300,23 @@ function action_addnode()
         luci.http.write_json({ ok = false, error = "failed to write temp file" })
         return
     end
-    fh:write(link)
+    fh:write(payload)
     fh:close()
     run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp) .. " >/tmp/sb_addnode.err 2>&1; echo $? > /tmp/sb_addnode.rc")
     os.remove(tmp)
     local rc = tonumber(run("cat /tmp/sb_addnode.rc 2>/dev/null")) or 1
     if rc ~= 0 then
         local err = run("cat /tmp/sb_addnode.err 2>/dev/null")
-        luci.http.write_json({ ok = false, error = (err ~= "" and err) or "failed to parse vless link" })
+        luci.http.write_json({
+            ok = false,
+            error = (err ~= "" and err) or "failed to parse vless/IPsec config"
+        })
         return
     end
     -- Activate the new node so Start/Restart actually uses it.
     run("/usr/bin/sb-manager switch " .. shq(id))
-    luci.http.write_json({ ok = true, activated = id })
+    local ntype = run("/usr/bin/sb-manager nodetype " .. shq(id))
+    luci.http.write_json({ ok = true, activated = id, proto = ntype })
 end
 
 function action_delnode()
@@ -914,9 +1431,10 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			</table>
 			<div class="cbi-page-actions">
 				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
-				<textarea id="sb_new_node_link" placeholder="vless://..." rows="2" style="width:60%"></textarea>
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  IPsec JSON {&quot;cert&quot;:&quot;...&quot;,&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;password&quot;:&quot;&quot;}" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
+			<p style="opacity:0.75;margin-top:4px">Accepts <code>vless://</code> share links (sing-box) or Amnezia-style IKEv2/IPsec JSON (<code>cert</code> + <code>hostName</code>). IPsec needs strongSwan on the router.</p>
 		</div>
 	</div>
 
@@ -966,8 +1484,13 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 	function sb_refresh_status() {
 		sb_api("status", null, function(data) {
 			if (!data) return;
-			document.getElementById("sb_status").textContent = data.running || "Unknown";
-			document.getElementById("sb_active_node").textContent = data.active_node || "none";
+			var status = data.running || "Unknown";
+			if (data.proto && data.proto !== "none" && data.proto !== "vless") {
+				status = status + " [" + data.proto + "]";
+			}
+			document.getElementById("sb_status").textContent = status;
+			document.getElementById("sb_active_node").textContent =
+				(data.active_node || "none") + (data.proto && data.proto !== "none" ? " (" + data.proto + ")" : "");
 			document.getElementById("sb_mode_select").value = data.mode || "tunnel";
 			document.getElementById("sb_watchdog_toggle").checked = (data.watchdog === "1");
 		});
@@ -1047,10 +1570,16 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			return;
 		}
 		if (!link) {
-			alert("Paste a vless:// link first.");
+			alert("Paste a vless:// link or IPsec JSON config first.");
 			return;
 		}
-		// POST: vless links are too long/fragile for GET query strings (caused "unknown error").
+		var isJson = link.charAt(0) === "{";
+		var isVless = link.indexOf("vless://") === 0;
+		if (!isJson && !isVless) {
+			alert("Config must be a vless:// URL or IPsec JSON starting with {");
+			return;
+		}
+		// POST: payloads are too long/fragile for GET query strings.
 		sb_api("addnode", { id: id, link: link }, function(data) {
 			if (data && data.ok) {
 				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
@@ -1096,6 +1625,8 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-templatecache 2>/dev
 
 log "======================================================="
 log "Sing-Box VPN Manager ${SINGBOX_VERSION} installed."
-log "Add a node with: sb-manager addnode <id> <path-to-file-containing-vless-link>"
-log "Then activate it: sb-manager switch <id> && sb-manager start"
+log "VLESS:  echo 'vless://...' > /tmp/link.txt && sb-manager addnode home1 /tmp/link.txt"
+log "IPsec:  save Amnezia JSON (cert/hostName/userName/password) to a file, then:"
+log "        sb-manager addnode ike1 /tmp/ipsec.json"
+log "Then:   sb-manager switch <id> && sb-manager start"
 log "======================================================="

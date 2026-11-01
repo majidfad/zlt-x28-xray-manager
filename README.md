@@ -2,8 +2,9 @@
 
 Transparent-proxy VPN manager for the ZLT-X28 (and similar OpenWrt/ARM64
 routers), built on [sing-box](https://github.com/SagerNet/sing-box). Supports
-VLESS + REALITY / TLS nodes, full-tunnel (tproxy) or SOCKS/HTTP proxy-only
-routing modes, a watchdog, and a LuCI web UI.
+VLESS + REALITY / TLS nodes, Amnezia-style IKEv2/IPsec (PKCS#12 JSON) via
+strongSwan, full-tunnel (tproxy) or SOCKS/HTTP proxy-only routing modes, a
+watchdog, and a LuCI web UI.
 
 ## Status
 
@@ -17,6 +18,7 @@ current sing-box release. UI is a minimal first pass — see
 - `iptables` + `ip` (standard OpenWrt iptables-legacy stack)
 - `curl`, `tar`
 - LuCI + `uhttpd` (optional, only needed for the web UI)
+- For IKEv2/IPsec nodes: `strongswan` / `swanctl` + `openssl-util`
 
 ## Install
 
@@ -57,6 +59,31 @@ sb-manager addnode home1 /tmp/link.txt
 sb-manager switch home1
 sb-manager start
 ```
+
+Or paste an Amnezia-style **IKEv2/IPsec** JSON config (certificate auth):
+
+```json
+{
+  "cert": "<base64 PKCS#12>",
+  "hostName": "45.59.114.193",
+  "password": "",
+  "userName": "bh0tvgzSYjve"
+}
+```
+
+```sh
+# Save the JSON to a file, then:
+sb-manager addnode ike1 /tmp/ipsec.json
+sb-manager switch ike1
+sb-manager start
+```
+
+IPsec requires **strongSwan** + **openssl** on the router (`swanctl` or `ipsec`).
+The installer tries `opkg install strongswan-full swanctl openssl-util` when
+possible; on locked-down firmware you may need to install those packages
+yourself. Switching between VLESS and IPsec nodes stops the other engine
+automatically. Proxy-only mode applies to sing-box (VLESS); IPsec always uses
+policy-based tunnel + LAN SNAT.
 
 Common commands:
 
@@ -147,8 +174,9 @@ files/
 Functionality is stable; these are the planned next improvements, roughly in
 priority order:
 
-1. **Multi-protocol support** — currently only `vless`. Add `trojan`,
-   `hysteria2`, `shadowsocks` parsing to `sb-manager addnode`.
+1. **Multi-protocol support** — `vless` (sing-box) and IKEv2/IPsec (strongSwan)
+   are supported. Still planned: `trojan`, `hysteria2`, `shadowsocks` share-link
+   parsing in `sb-manager addnode`.
 2. **Subscription import** — fetch a base64 subscription URL and expand it
    into multiple nodes instead of pasting links one at a time.
 3. **Latency/health check per node** — periodic TCP connect + HTTP probe

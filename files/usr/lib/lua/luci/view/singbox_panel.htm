@@ -47,9 +47,10 @@
 			</table>
 			<div class="cbi-page-actions">
 				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
-				<textarea id="sb_new_node_link" placeholder="vless://..." rows="2" style="width:60%"></textarea>
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  IPsec JSON {&quot;cert&quot;:&quot;...&quot;,&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;password&quot;:&quot;&quot;}" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
+			<p style="opacity:0.75;margin-top:4px">Accepts <code>vless://</code> share links (sing-box) or Amnezia-style IKEv2/IPsec JSON (<code>cert</code> + <code>hostName</code>). IPsec needs strongSwan on the router.</p>
 		</div>
 	</div>
 
@@ -99,8 +100,13 @@
 	function sb_refresh_status() {
 		sb_api("status", null, function(data) {
 			if (!data) return;
-			document.getElementById("sb_status").textContent = data.running || "Unknown";
-			document.getElementById("sb_active_node").textContent = data.active_node || "none";
+			var status = data.running || "Unknown";
+			if (data.proto && data.proto !== "none" && data.proto !== "vless") {
+				status = status + " [" + data.proto + "]";
+			}
+			document.getElementById("sb_status").textContent = status;
+			document.getElementById("sb_active_node").textContent =
+				(data.active_node || "none") + (data.proto && data.proto !== "none" ? " (" + data.proto + ")" : "");
 			document.getElementById("sb_mode_select").value = data.mode || "tunnel";
 			document.getElementById("sb_watchdog_toggle").checked = (data.watchdog === "1");
 		});
@@ -180,10 +186,16 @@
 			return;
 		}
 		if (!link) {
-			alert("Paste a vless:// link first.");
+			alert("Paste a vless:// link or IPsec JSON config first.");
 			return;
 		}
-		// POST: vless links are too long/fragile for GET query strings (caused "unknown error").
+		var isJson = link.charAt(0) === "{";
+		var isVless = link.indexOf("vless://") === 0;
+		if (!isJson && !isVless) {
+			alert("Config must be a vless:// URL or IPsec JSON starting with {");
+			return;
+		}
+		// POST: payloads are too long/fragile for GET query strings.
 		sb_api("addnode", { id: id, link: link }, function(data) {
 			if (data && data.ok) {
 				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);

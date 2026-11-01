@@ -18,8 +18,20 @@ for t in nat mangle; do
     iptables -t "$t" -F SB_TRANS 2>/dev/null || true
     iptables -t "$t" -X SB_TRANS 2>/dev/null || true
 done
+iptables -t nat -D POSTROUTING -j SB_IPSEC_NAT 2>/dev/null || true
+iptables -t nat -F SB_IPSEC_NAT 2>/dev/null || true
+iptables -t nat -X SB_IPSEC_NAT 2>/dev/null || true
 ip rule del fwmark 1 table 100 2>/dev/null || true
 ip route del local default dev lo table 100 2>/dev/null || true
+
+log "Removing IPsec helper config (leaves strongSwan package installed)..."
+rm -f /etc/swanctl/conf.d/sbvpn.conf \
+      /etc/swanctl/x509/sbvpn_client.pem \
+      /etc/swanctl/private/sbvpn_client.key \
+      /etc/swanctl/x509ca/sbvpn_ca.pem \
+      /etc/ipsec.d/certs/sbvpn_client.pem \
+      /etc/ipsec.d/private/sbvpn_client.key \
+      /etc/ipsec.d/cacerts/sbvpn_ca.pem 2>/dev/null || true
 
 log "Removing files..."
 rm -rf /data/singbox_core /opt/singbox_core /usr/local/singbox_core /etc/singbox

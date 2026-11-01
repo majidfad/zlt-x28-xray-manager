@@ -45,6 +45,7 @@ function action_status()
     local mode = run("/usr/bin/sb-manager mode_status")
     local led = run("/usr/bin/sb-manager led_status")
     local watchdog = run("/usr/bin/sb-manager watchdog_status")
+    local proto = run("/usr/bin/sb-manager nodetype")
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         running = running,
@@ -52,6 +53,7 @@ function action_status()
         mode = mode,
         led = led,
         watchdog = watchdog,
+        proto = proto,
     })
 end
 
@@ -93,14 +95,28 @@ function action_addnode()
         return
     end
     if not link or link == "" then
-        luci.http.write_json({ ok = false, error = "empty link (use POST; GET truncates long vless URLs)" })
+        luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
         return
     end
-    -- Normalize pasted links: strip whitespace and optional surrounding quotes.
-    link = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
-    if not link:match("^vless://") then
-        luci.http.write_json({ ok = false, error = "link must start with vless://" })
+    -- Detect Amnezia-style IPsec JSON vs vless:// share link.
+    local trimmed = link:match("^%s*(.-)%s*$") or link
+    local is_ipsec = trimmed:sub(1, 1) == "{"
+    local is_vless = trimmed:match("^vless://") ~= nil
+    if not is_ipsec and not is_vless then
+        -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
+        luci.http.write_json({
+            ok = false,
+            error = "paste a vless:// URL or IPsec JSON ({cert, hostName, userName, password})"
+        })
         return
+    end
+    local payload = link
+    if is_vless then
+        -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+        payload = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
+    else
+        -- Keep JSON structure; only trim outer whitespace.
+        payload = trimmed
     end
     local tmp = "/tmp/sb_link_" .. id .. ".txt"
     local fh = io.open(tmp, "w")
@@ -108,19 +124,23 @@ function action_addnode()
         luci.http.write_json({ ok = false, error = "failed to write temp file" })
         return
     end
-    fh:write(link)
+    fh:write(payload)
     fh:close()
     run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp) .. " >/tmp/sb_addnode.err 2>&1; echo $? > /tmp/sb_addnode.rc")
     os.remove(tmp)
     local rc = tonumber(run("cat /tmp/sb_addnode.rc 2>/dev/null")) or 1
     if rc ~= 0 then
         local err = run("cat /tmp/sb_addnode.err 2>/dev/null")
-        luci.http.write_json({ ok = false, error = (err ~= "" and err) or "failed to parse vless link" })
+        luci.http.write_json({
+            ok = false,
+            error = (err ~= "" and err) or "failed to parse vless/IPsec config"
+        })
         return
     end
     -- Activate the new node so Start/Restart actually uses it.
     run("/usr/bin/sb-manager switch " .. shq(id))
-    luci.http.write_json({ ok = true, activated = id })
+    local ntype = run("/usr/bin/sb-manager nodetype " .. shq(id))
+    luci.http.write_json({ ok = true, activated = id, proto = ntype })
 end
 
 function action_delnode()
