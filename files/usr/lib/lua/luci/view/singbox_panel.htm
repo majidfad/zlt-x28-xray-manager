@@ -50,7 +50,7 @@
 				<textarea id="sb_new_node_link" placeholder="vless://...  OR  vpn://... (Amnezia)  OR  IPsec JSON" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
-			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> share link, export JSON, or <code>.sswan</code>. Needs strongSwan + python3 on the router.</p>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> (decoded in your browser), export JSON, or <code>.sswan</code>. Connecting IPsec needs <code>strongswan</code>/<code>swanctl</code> on the router (often missing on OEM ZLT firmware).</p>
 		</div>
 	</div>
 
@@ -178,6 +178,91 @@
 		sb_api("watchdog", { state: e.target.checked ? "1" : "0" }, sb_refresh_status);
 	};
 
+	/* Amnezia vpn:// = Base64URL(qCompress(JSON)). Decode in-browser so the
+	   router does not need python3 (OEM ZLT feeds often lack it). */
+	function sb_b64url_to_u8(s) {
+		s = s.replace(/-/g, "+").replace(/_/g, "/");
+		while (s.length % 4) s += "=";
+		var bin = atob(s);
+		var out = new Uint8Array(bin.length);
+		for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
+	}
+
+	function sb_inflate_zlib(u8) {
+		return new Promise(function(resolve, reject) {
+			if (typeof DecompressionStream === "undefined") {
+				reject(new Error("Browser lacks DecompressionStream; use Chrome/Firefox/Edge, or paste IPsec JSON"));
+				return;
+			}
+			var ds = new DecompressionStream("deflate");
+			var stream = new Blob([u8]).stream().pipeThrough(ds);
+			new Response(stream).arrayBuffer().then(function(buf) {
+				resolve(new TextDecoder("utf-8").decode(buf));
+			}).catch(reject);
+		});
+	}
+
+	function sb_extract_ipsec(obj) {
+		if (!obj || typeof obj !== "object") return null;
+		if (obj.cert && (obj.hostName || obj.addr)) return obj;
+		var containers = obj.containers || [];
+		var def = obj.defaultContainer || "";
+		function fromContainer(c) {
+			if (!c) return null;
+			var ike = c.ikev2 || c.ipsec || {};
+			var last = ike.last_config;
+			if (!last) return null;
+			var lastObj = (typeof last === "string") ? JSON.parse(last) : last;
+			if (lastObj && typeof lastObj.config === "string" && lastObj.config.charAt(0) === "{") {
+				try { return JSON.parse(lastObj.config); } catch (e) {}
+			}
+			if (!lastObj.hostName && obj.hostName) lastObj.hostName = obj.hostName;
+			if (lastObj.password == null) lastObj.password = "";
+			if (!lastObj.userName && lastObj.clientId) lastObj.userName = lastObj.clientId;
+			return lastObj;
+		}
+		var i, c, got = null;
+		for (i = 0; i < containers.length; i++) {
+			c = containers[i];
+			if (def && c.container === def) {
+				got = fromContainer(c);
+				if (got) return got;
+			}
+		}
+		for (i = 0; i < containers.length; i++) {
+			got = fromContainer(containers[i]);
+			if (got) return got;
+		}
+		return null;
+	}
+
+	function sb_decode_vpn_link(link) {
+		var raw = link.replace(/^vpn:\/\//i, "");
+		var blob = sb_b64url_to_u8(raw);
+		var zlibPart = blob.slice(4);
+		return sb_inflate_zlib(zlibPart).then(function(text) {
+			var obj = JSON.parse(text);
+			var ipsec = sb_extract_ipsec(obj);
+			if (!ipsec || !ipsec.cert) throw new Error("No Amnezia IPsec/IKEv2 cert in vpn:// payload");
+			return JSON.stringify(ipsec);
+		});
+	}
+
+	function sb_do_addnode(id, payload) {
+		sb_api("addnode", { id: id, link: payload }, function(data) {
+			if (data && data.ok) {
+				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
+				sb_render_nodes();
+				document.getElementById("sb_new_node_id").value = "";
+				document.getElementById("sb_new_node_link").value = "";
+				sb_api("restart", null, sb_refresh_after_start);
+			} else {
+				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
+			}
+		}, true);
+	}
+
 	document.getElementById("sb_btn_addnode").onclick = function() {
 		var id = document.getElementById("sb_new_node_id").value.trim();
 		var link = document.getElementById("sb_new_node_link").value.trim();
@@ -197,18 +282,15 @@
 			alert("Config must be vless://, vpn://, or JSON starting with {");
 			return;
 		}
-		// POST: payloads are too long/fragile for GET query strings.
-		sb_api("addnode", { id: id, link: link }, function(data) {
-			if (data && data.ok) {
-				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
-				sb_render_nodes();
-				document.getElementById("sb_new_node_id").value = "";
-				document.getElementById("sb_new_node_link").value = "";
-				sb_api("restart", null, sb_refresh_after_start);
-			} else {
-				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
-			}
-		}, true);
+		if (isVpn) {
+			sb_decode_vpn_link(link.replace(/\s+/g, "")).then(function(jsonPayload) {
+				sb_do_addnode(id, jsonPayload);
+			}).catch(function(err) {
+				alert("Failed to decode vpn:// in browser: " + (err && err.message ? err.message : err));
+			});
+			return;
+		}
+		sb_do_addnode(id, isVless ? link.replace(/\s+/g, "") : link);
 	};
 
 	function sb_load_nodes() {

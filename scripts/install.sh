@@ -197,47 +197,56 @@ mkdir -p /etc/singbox /etc/singbox/ipsec
 mkdir -p /usr/lib/lua/luci/controller/ /usr/lib/lua/luci/view/
 [ -f /etc/singbox/active_proto ] || printf 'none' > /etc/singbox/active_proto
 
-# Optional IKEv2/IPsec backend (Amnezia-style cert JSON). Best-effort — firmware
-# feeds differ; skip quietly if opkg/packages are unavailable.
+# Optional IKEv2/IPsec backend. OEM ZLT feeds often lack strongSwan entirely.
 log "2b. Checking strongSwan (IPsec/IKEv2)..."
 if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
     log "strongSwan already present."
 elif command -v opkg >/dev/null 2>&1; then
     opkg update >/tmp/sb_opkg_update.log 2>&1 || true
-    _ss_ok=0
-    for _pkg in strongswan-full strongswan-default strongswan swanctl openssl-util; do
-        if opkg install "$_pkg" >/tmp/sb_opkg_ss.log 2>&1; then
-            log "Installed $_pkg"
-            _ss_ok=1
-        fi
+    # Real OpenWrt package names (not "strongswan-full" / bare "swanctl").
+    for _pkg in \
+        openssl-util \
+        strongswan \
+        strongswan-default \
+        strongswan-swanctl \
+        strongswan-charon \
+        strongswan-mod-kernel-netlink \
+        strongswan-mod-openssl \
+        strongswan-mod-pem \
+        strongswan-mod-pkcs12 \
+        strongswan-mod-socket-default \
+        strongswan-mod-vici \
+        strongswan-mod-nonce \
+        strongswan-mod-random \
+        strongswan-mod-stroke \
+        strongswan-ipsec
+    do
+        opkg install "$_pkg" >/tmp/sb_opkg_ss.log 2>&1 && log "Installed $_pkg" || true
     done
     if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
-        log "strongSwan ready for IPsec nodes."
-    elif [ "$_ss_ok" = "0" ]; then
-        log "NOTE: could not install strongSwan from opkg. VLESS still works;"
-        log "      IPsec JSON nodes need: opkg install strongswan-full swanctl openssl-util"
+        log "strongSwan ready for Amnezia IPsec nodes."
+    else
+        log "NOTE: strongSwan packages are not in this firmware's opkg feeds."
+        log "      Common on OEM ZLT-X28 builds. VLESS (sing-box) still works."
+        log "      Amnezia IPsec needs swanctl/ipsec + kernel XFRM (kmod-ipsec)."
+        log "      Check: opkg list | grep -i swan ; lsmod | grep xfrm"
     fi
 else
     log "NOTE: no opkg — install strongSwan manually if you need IPsec."
 fi
 
-# python3 is required to decode Amnezia vpn:// share links (qCompress+Base64URL).
-log "2c. Checking python3 (for vpn:// Amnezia links)..."
+# python3 optional: CLI vpn:// decode. LuCI decodes vpn:// in the browser.
+log "2c. Checking python3 (optional CLI vpn:// decode)..."
 if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
-    log "python3 available for vpn:// decode."
+    log "python3 available for CLI vpn:// decode."
 elif command -v opkg >/dev/null 2>&1; then
     for _pkg in python3-light python3; do
-        if opkg install "$_pkg" >/tmp/sb_opkg_py.log 2>&1; then
-            log "Installed $_pkg"
-            break
-        fi
+        opkg install "$_pkg" >/tmp/sb_opkg_py.log 2>&1 && log "Installed $_pkg" && break || true
     done
     if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-        log "NOTE: python3 not installed — vpn:// import needs: opkg install python3-light"
-        log "      (raw IPsec JSON still works without python3)"
+        log "NOTE: no python3 in feeds — use LuCI to paste vpn:// (browser decode),"
+        log "      or paste flat IPsec JSON. CLI: sb-vpn-decode needs python3."
     fi
-else
-    log "NOTE: install python3 to import Amnezia vpn:// share links."
 fi
 CORE_DIR="$(pick_core_dir)"
 SB_BIN_PATH="$CORE_DIR/sing-box"
@@ -1073,9 +1082,13 @@ setup_ipsec_lan_nat() {
 
 start_ipsec() {
     if ! have_strongswan; then
-        echo "[System] strongSwan not installed. On OpenWrt run:" >> "$LOG_FILE"
-        echo "[System]   opkg update && opkg install strongswan-full swanctl openssl-util" >> "$LOG_FILE"
-        echo "[System] (package names vary by firmware; try strongswan-default if -full is missing)." >> "$LOG_FILE"
+        echo "[System] strongSwan not installed (no swanctl/ipsec in PATH)." >> "$LOG_FILE"
+        echo "[System] OEM ZLT feeds often lack it. Try:" >> "$LOG_FILE"
+        echo "[System]   opkg update" >> "$LOG_FILE"
+        echo "[System]   opkg list | grep -i swan" >> "$LOG_FILE"
+        echo "[System]   opkg install strongswan strongswan-default strongswan-swanctl" >> "$LOG_FILE"
+        echo "[System] If packages are Unknown, this firmware cannot run Amnezia IPsec" >> "$LOG_FILE"
+        echo "[System] without a custom strongSwan build / official OpenWrt image." >> "$LOG_FILE"
         return 1
     fi
     if ! command -v openssl >/dev/null 2>&1; then
@@ -1717,7 +1730,7 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 				<textarea id="sb_new_node_link" placeholder="vless://...  OR  vpn://... (Amnezia)  OR  IPsec JSON" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
-			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> share link, export JSON, or <code>.sswan</code>. Needs strongSwan + python3 on the router.</p>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> (decoded in your browser), export JSON, or <code>.sswan</code>. Connecting IPsec needs <code>strongswan</code>/<code>swanctl</code> on the router (often missing on OEM ZLT firmware).</p>
 		</div>
 	</div>
 
@@ -1845,6 +1858,91 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 		sb_api("watchdog", { state: e.target.checked ? "1" : "0" }, sb_refresh_status);
 	};
 
+	/* Amnezia vpn:// = Base64URL(qCompress(JSON)). Decode in-browser so the
+	   router does not need python3 (OEM ZLT feeds often lack it). */
+	function sb_b64url_to_u8(s) {
+		s = s.replace(/-/g, "+").replace(/_/g, "/");
+		while (s.length % 4) s += "=";
+		var bin = atob(s);
+		var out = new Uint8Array(bin.length);
+		for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
+	}
+
+	function sb_inflate_zlib(u8) {
+		return new Promise(function(resolve, reject) {
+			if (typeof DecompressionStream === "undefined") {
+				reject(new Error("Browser lacks DecompressionStream; use Chrome/Firefox/Edge, or paste IPsec JSON"));
+				return;
+			}
+			var ds = new DecompressionStream("deflate");
+			var stream = new Blob([u8]).stream().pipeThrough(ds);
+			new Response(stream).arrayBuffer().then(function(buf) {
+				resolve(new TextDecoder("utf-8").decode(buf));
+			}).catch(reject);
+		});
+	}
+
+	function sb_extract_ipsec(obj) {
+		if (!obj || typeof obj !== "object") return null;
+		if (obj.cert && (obj.hostName || obj.addr)) return obj;
+		var containers = obj.containers || [];
+		var def = obj.defaultContainer || "";
+		function fromContainer(c) {
+			if (!c) return null;
+			var ike = c.ikev2 || c.ipsec || {};
+			var last = ike.last_config;
+			if (!last) return null;
+			var lastObj = (typeof last === "string") ? JSON.parse(last) : last;
+			if (lastObj && typeof lastObj.config === "string" && lastObj.config.charAt(0) === "{") {
+				try { return JSON.parse(lastObj.config); } catch (e) {}
+			}
+			if (!lastObj.hostName && obj.hostName) lastObj.hostName = obj.hostName;
+			if (lastObj.password == null) lastObj.password = "";
+			if (!lastObj.userName && lastObj.clientId) lastObj.userName = lastObj.clientId;
+			return lastObj;
+		}
+		var i, c, got = null;
+		for (i = 0; i < containers.length; i++) {
+			c = containers[i];
+			if (def && c.container === def) {
+				got = fromContainer(c);
+				if (got) return got;
+			}
+		}
+		for (i = 0; i < containers.length; i++) {
+			got = fromContainer(containers[i]);
+			if (got) return got;
+		}
+		return null;
+	}
+
+	function sb_decode_vpn_link(link) {
+		var raw = link.replace(/^vpn:\/\//i, "");
+		var blob = sb_b64url_to_u8(raw);
+		var zlibPart = blob.slice(4);
+		return sb_inflate_zlib(zlibPart).then(function(text) {
+			var obj = JSON.parse(text);
+			var ipsec = sb_extract_ipsec(obj);
+			if (!ipsec || !ipsec.cert) throw new Error("No Amnezia IPsec/IKEv2 cert in vpn:// payload");
+			return JSON.stringify(ipsec);
+		});
+	}
+
+	function sb_do_addnode(id, payload) {
+		sb_api("addnode", { id: id, link: payload }, function(data) {
+			if (data && data.ok) {
+				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
+				sb_render_nodes();
+				document.getElementById("sb_new_node_id").value = "";
+				document.getElementById("sb_new_node_link").value = "";
+				sb_api("restart", null, sb_refresh_after_start);
+			} else {
+				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
+			}
+		}, true);
+	}
+
 	document.getElementById("sb_btn_addnode").onclick = function() {
 		var id = document.getElementById("sb_new_node_id").value.trim();
 		var link = document.getElementById("sb_new_node_link").value.trim();
@@ -1864,18 +1962,15 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			alert("Config must be vless://, vpn://, or JSON starting with {");
 			return;
 		}
-		// POST: payloads are too long/fragile for GET query strings.
-		sb_api("addnode", { id: id, link: link }, function(data) {
-			if (data && data.ok) {
-				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
-				sb_render_nodes();
-				document.getElementById("sb_new_node_id").value = "";
-				document.getElementById("sb_new_node_link").value = "";
-				sb_api("restart", null, sb_refresh_after_start);
-			} else {
-				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
-			}
-		}, true);
+		if (isVpn) {
+			sb_decode_vpn_link(link.replace(/\s+/g, "")).then(function(jsonPayload) {
+				sb_do_addnode(id, jsonPayload);
+			}).catch(function(err) {
+				alert("Failed to decode vpn:// in browser: " + (err && err.message ? err.message : err));
+			});
+			return;
+		}
+		sb_do_addnode(id, isVless ? link.replace(/\s+/g, "") : link);
 	};
 
 	function sb_load_nodes() {

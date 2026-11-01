@@ -741,9 +741,13 @@ setup_ipsec_lan_nat() {
 
 start_ipsec() {
     if ! have_strongswan; then
-        echo "[System] strongSwan not installed. On OpenWrt run:" >> "$LOG_FILE"
-        echo "[System]   opkg update && opkg install strongswan-full swanctl openssl-util" >> "$LOG_FILE"
-        echo "[System] (package names vary by firmware; try strongswan-default if -full is missing)." >> "$LOG_FILE"
+        echo "[System] strongSwan not installed (no swanctl/ipsec in PATH)." >> "$LOG_FILE"
+        echo "[System] OEM ZLT feeds often lack it. Try:" >> "$LOG_FILE"
+        echo "[System]   opkg update" >> "$LOG_FILE"
+        echo "[System]   opkg list | grep -i swan" >> "$LOG_FILE"
+        echo "[System]   opkg install strongswan strongswan-default strongswan-swanctl" >> "$LOG_FILE"
+        echo "[System] If packages are Unknown, this firmware cannot run Amnezia IPsec" >> "$LOG_FILE"
+        echo "[System] without a custom strongSwan build / official OpenWrt image." >> "$LOG_FILE"
         return 1
     fi
     if ! command -v openssl >/dev/null 2>&1; then
