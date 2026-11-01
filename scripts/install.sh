@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec19"
+INSTALLER_VERSION="2026.11.01-ipsec20"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -275,7 +275,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec19"
+STACK_VER="5.9.2-ipsec20"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -361,8 +361,12 @@ fetch_github_tgz() {
         mkdir -p "$OPT"
         mv "$WORK/out/"* "$OPT/" 2>/dev/null || true
     fi
-    [ -x "$OPT/lib/ipsec/charon" ] || return 1
+    [ -f "$OPT/lib/ipsec/charon" ] || return 1
     [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ] || return 1
+    # ZLT /data often extracts without +x
+    chmod 755 "$OPT/lib/ipsec/charon" "$OPT/lib/ipsec/starter" \
+              "$OPT/lib/ipsec/stroke" "$OPT/sbin/"* 2>/dev/null || true
+    chmod 755 "$OPT/lib/ipsec/"*.so* "$OPT/lib/ipsec/plugins/"*.so 2>/dev/null || true
     echo "[ss-plugins] tarball extracted to $OPT"
     return 0
 }
@@ -533,7 +537,9 @@ overlay_free_kb() {
 bind_mount_stack() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
-    [ -x "$SRC/charon" ] || return 1
+    [ -f "$SRC/charon" ] || return 1
+    chmod 755 "$SRC/charon" "$SRC/starter" "$SRC/stroke" 2>/dev/null || true
+    chmod 755 "$SRC/"*.so* "$SRC/plugins/"*.so 2>/dev/null || true
     mkdir -p "$IPSEC_LIB"
     if mount | grep -q " on $IPSEC_LIB "; then
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
@@ -661,8 +667,11 @@ echo "[ss-plugins] stack root: $OPT (avail $(free_kb "$(dirname "$OPT")")K)"
 
 mkdir -p /etc/singbox "$IPSEC_LIB/plugins" /etc/strongswan.d/charon "$WORK"
 
-if [ -x "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]; then
+if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]; then
     echo "[ss-plugins] using existing $OPT"
+    chmod 755 "$OPT/lib/ipsec/charon" "$OPT/lib/ipsec/starter" \
+              "$OPT/lib/ipsec/stroke" "$OPT/sbin/"* 2>/dev/null || true
+    chmod 755 "$OPT/lib/ipsec/"*.so* "$OPT/lib/ipsec/plugins/"*.so 2>/dev/null || true
 elif fetch_github_tgz "$OPT"; then
     :
 else

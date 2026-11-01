@@ -63,8 +63,19 @@ done
 }
 echo "[fix-ss] stack root: $OPT"
 
+# /data on ZLT often extracts tar as 666 (no +x). Always fix modes.
+fix_exec_bits() {
+    _root="$1"
+    echo "[fix-ss] chmod +x on stack binaries/plugins under $_root"
+    chmod 755 "$_root/lib/ipsec/charon" "$_root/lib/ipsec/starter" \
+              "$_root/lib/ipsec/stroke" "$_root/sbin/ipsec" \
+              "$_root/sbin/swanctl" 2>/dev/null || true
+    chmod 755 "$_root/lib/ipsec/"*.so* 2>/dev/null || true
+    chmod 755 "$_root/lib/ipsec/plugins/"*.so 2>/dev/null || true
+}
+
 need_fetch=1
-if [ -x "$OPT/lib/ipsec/charon" ] && [ -x "$OPT/sbin/swanctl" ] \
+if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/sbin/swanctl" ] \
     && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ] \
     && grep -aq '5\.9\.2' "$OPT/lib/ipsec/charon" 2>/dev/null \
     && grep -aq '5\.9\.2' "$OPT/sbin/swanctl" 2>/dev/null; then
@@ -103,21 +114,34 @@ if [ "$need_fetch" = "1" ]; then
     rm -rf "$WORK"
 fi
 
+fix_exec_bits "$OPT"
+
 echo "[fix-ss] source tree:"
 ls -la "$OPT/lib/ipsec/charon" "$OPT/sbin/swanctl" "$OPT/sbin/ipsec" \
        "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" \
        "$OPT/lib/ipsec/plugins/libstrongswan-pkcs1.so" 2>&1 || true
 
-[ -x "$OPT/lib/ipsec/charon" ] || {
+[ -f "$OPT/lib/ipsec/charon" ] || {
     echo "[fix-ss] ERROR: charon missing in $OPT" >&2
     ls -la "$OPT/lib/ipsec" >&2 || true
     exit 1
 }
-[ -x "$OPT/sbin/swanctl" ] || {
+[ -f "$OPT/sbin/swanctl" ] || {
     echo "[fix-ss] ERROR: swanctl missing in $OPT/sbin" >&2
     ls -la "$OPT/sbin" >&2 || true
     exit 1
 }
+if [ ! -x "$OPT/lib/ipsec/charon" ]; then
+    echo "[fix-ss] WARN: charon still not -x after chmod; remount exec + retry"
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    fix_exec_bits "$OPT"
+fi
+if [ ! -x "$OPT/lib/ipsec/charon" ]; then
+    echo "[fix-ss] ERROR: cannot set execute bit on $OPT/lib/ipsec/charon" >&2
+    echo "[fix-ss] mount:"; mount | grep ' /data' || mount | grep data || true
+    ls -la "$OPT/lib/ipsec/charon" >&2
+    exit 1
+fi
 
 echo "[fix-ss] bind-mount $OPT/lib/ipsec -> $IPSEC_LIB"
 mkdir -p "$IPSEC_LIB" "$IPSEC_LIB/plugins" 2>/dev/null || true
