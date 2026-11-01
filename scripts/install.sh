@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec21"
+INSTALLER_VERSION="2026.11.01-ipsec22"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -843,7 +843,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec21"
+SB_MANAGER_VERSION="2026.11.01-ipsec22"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1978,13 +1978,9 @@ prepare_swanctl_dir() {
         sanitize_pem_file "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem" \
             || cp -f "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem"
     fi
-    if [ -s "$_dir/client.p12" ]; then
-        cp -f "$_dir/client.p12" "$IPSEC_SWANCTL_DIR/pkcs12/sbvpn_client.p12"
-        # swanctl secrets "file =" resolves under private/ by default
-        cp -f "$_dir/client.p12" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.p12"
-        chmod 600 "$IPSEC_SWANCTL_DIR/pkcs12/sbvpn_client.p12" \
-                  "$IPSEC_SWANCTL_DIR/private/sbvpn_client.p12"
-    fi
+    # Do NOT drop .p12 into private/ — swanctl auto-loads it and prompts
+    # "Password for pkcs12 file" even when PEM key already works.
+    # Keep P12 only as backup under the node dir; use extracted PEMs here.
     chmod 600 "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
     # Minimal main file — only our connection.
     echo "include conf.d/*.conf" > "$IPSEC_SWANCTL_DIR/swanctl.conf"
@@ -2057,14 +2053,6 @@ write_swanctl_conn() {
         echo "    private-sbvpn {"
         echo "        file = sbvpn_client.key"
         echo "    }"
-        # Also offer PKCS#12 (Amnezia native) if present — helps some builds.
-        if [ -s "$_dir/client.p12" ]; then
-            _p12pass=$(cat "$_dir/pass" 2>/dev/null || true)
-            echo "    private-sbvpn-p12 {"
-            echo "        file = sbvpn_client.p12"
-            echo "        secret = \"${_p12pass}\""
-            echo "    }"
-        fi
         echo "}"
     } > "$_cfg"
 
@@ -2194,7 +2182,17 @@ setup_ipsec_lan_nat() {
 # Force our conf + isolated SWANCTL_DIR (never OEM /tmp UCI conf alone).
 swanctl_iso() {
     export_ss_env
-    STRONGSWAN_CONF="$SB_SS_CONF" SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl "$@"
+    prefer_matched_ss_bins
+    # Append --noprompt on load commands so LuCI never blocks on PKCS#12 password.
+    case "$1" in
+        --load-all|--load-creds|--load-conns|--load-pools|--load-authorities)
+            STRONGSWAN_CONF="$SB_SS_CONF" SWANCTL_DIR="$IPSEC_SWANCTL_DIR" \
+                swanctl "$@" --noprompt
+            ;;
+        *)
+            STRONGSWAN_CONF="$SB_SS_CONF" SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl "$@"
+            ;;
+    esac
 }
 
 try_start_ipsec_stroke() {
