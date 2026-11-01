@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec8"
+SB_MANAGER_VERSION="2026.11.01-ipsec9"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -816,12 +816,15 @@ sb_opkg_arch() {
 sb_http_get() {
     _url="$1"
     _out="$2"
+    # Short timeouts — OEM WAN/DNS to openwrt.org often hangs forever.
     if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
+        wget -q -T 8 -t 1 -O "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
+        curl -fsSL --connect-timeout 5 --max-time 15 -o "$_out" "$_url" 2>/dev/null \
+            && [ -s "$_out" ] && return 0
     fi
+    rm -f "$_out"
     return 1
 }
 
@@ -886,44 +889,37 @@ fetch_strongswan_plugins_ipk() {
         echo "[System] Required plugin .so files already on disk." >> "$LOG_FILE"
         return 0
     }
-    echo "[System] Missing plugin .so — fetching from OpenWrt CDN:$_need" >> "$LOG_FILE"
+    echo "[System] Missing plugin .so — quick CDN fetch (8s timeout):$_need" >> "$LOG_FILE"
+
+    # Prefer plugins already staged by install.sh under /usr/lib/ipsec/plugins.
+    if [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
+        echo "[System] x509 appeared on disk — skip CDN." >> "$LOG_FILE"
+        return 0
+    fi
 
     _native=$(sb_opkg_arch)
-    _arches="$_native aarch64_cortex-a53 aarch64_generic"
-    _vers="5.9.2-3 5.9.2-2 5.9.2-1 5.9.5-1 5.9.8-1"
-    _mirrors="
-https://downloads.openwrt.org/releases/21.02.7/packages
-https://archive.openwrt.org/releases/21.02.7/packages
-https://downloads.openwrt.org/releases/22.03.5/packages
-https://archive.openwrt.org/releases/packages-21.02
-"
+    [ -z "$_native" ] && _native="aarch64_cortex-a53"
+    # One mirror, one version, native arch then a53 — do NOT hang the router.
+    _ver="5.9.2-3"
     _got=0
-    for _mod in $_need; do
-        _okmod=0
-        for _arch in $_arches; do
-            [ -n "$_arch" ] || continue
-            for _ver in $_vers; do
-                _fn="strongswan-mod-${_mod}_${_ver}_${_arch}.ipk"
-                for _mir in $_mirrors; do
-                    [ -n "$_mir" ] || continue
-                    _url="${_mir}/${_arch}/packages/${_fn}"
-                    _dst="/tmp/${_fn}"
-                    echo "[System] try $_url" >> "$LOG_FILE"
-                    if sb_http_get "$_url" "$_dst"; then
-                        if sb_install_ipk_file "$_dst"; then
-                            echo "[System] Installed $_fn" >> "$LOG_FILE"
-                            _okmod=1
-                            _got=1
-                            break 3
-                        fi
-                        echo "[System] extract/install failed for $_fn" >> "$LOG_FILE"
-                    fi
-                done
-            done
+    for _arch in "$_native" aarch64_cortex-a53; do
+        [ -n "$_arch" ] || continue
+        for _mod in $_need; do
+            [ -f "/usr/lib/ipsec/plugins/libstrongswan-${_mod}.so" ] && continue
+            _fn="strongswan-mod-${_mod}_${_ver}_${_arch}.ipk"
+            _url="https://downloads.openwrt.org/releases/21.02.7/packages/${_arch}/packages/${_fn}"
+            _dst="/tmp/${_fn}"
+            echo "[System] try $_url" >> "$LOG_FILE"
+            if sb_http_get "$_url" "$_dst" && sb_install_ipk_file "$_dst"; then
+                echo "[System] Installed $_fn" >> "$LOG_FILE"
+                _got=1
+            else
+                echo "[System] skip $_mod ($_arch) — download/install failed" >> "$LOG_FILE"
+            fi
         done
-        [ "$_okmod" = "1" ] || echo "[System] WARNING: could not fetch strongswan-mod-$_mod" >> "$LOG_FILE"
+        [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && break
     done
-    [ "$_got" = "1" ]
+    [ "$_got" = "1" ] || [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]
 }
 
 # charon needs x509 + pkcs1 (or openssl) to parse PEM certs/keys. Without them:
