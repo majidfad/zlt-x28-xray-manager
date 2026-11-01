@@ -1,29 +1,52 @@
 #!/bin/sh
-# Install bundled strongSwan credential plugins (OpenWrt 21.02.7 aarch64).
-# Uses openssl (always present on ZLT for PKCS#12) — not busybox base64.
-set -e
+# Bundled strongSwan plugins for ZLT/OEM OpenWrt (aarch64, strongSwan 5.9.x).
+# Source binaries: files/usr/lib/ipsec/plugins/libstrongswan-*.so
+# Decode with openssl (device already has it for PKCS#12). No network.
 DEST="${SB_SS_PLUGIN_DIR:-/usr/lib/ipsec/plugins}"
+DEST2="/usr/lib/ipsec"
 STASH="${SB_SS_PLUGIN_STASH:-/etc/singbox/ss-plugins}"
 CONFDIR="/etc/strongswan.d/charon"
-mkdir -p "$DEST" "$STASH" "$CONFDIR"
+mkdir -p "$DEST" "$DEST2" "$STASH" "$CONFDIR" /tmp/sb_ss_b64
 
-sb_decode_b64() {
-    _out="$1"
-    # openssl enc -base64 -d accepts multi-line stdin on OpenSSL 1.x/3.x
-    if openssl enc -base64 -d -out "$_out" 2>/dev/null; then
+sb_decode_b64_file() {
+    _b64f="$1"
+    _out="$2"
+    rm -f "$_out"
+    if openssl enc -base64 -d -in "$_b64f" -out "$_out" 2>/tmp/sb_b64.err; then
         [ -s "$_out" ] && return 0
     fi
-    if openssl base64 -d -out "$_out" 2>/dev/null; then
+    if openssl base64 -d -in "$_b64f" -out "$_out" 2>/tmp/sb_b64.err; then
         [ -s "$_out" ] && return 0
     fi
+    # Last resort: busybox base64
+    if command -v base64 >/dev/null 2>&1; then
+        tr -d "\n\r " <"$_b64f" | base64 -d >"$_out" 2>/tmp/sb_b64.err \
+            || tr -d "\n\r " <"$_b64f" | base64 --decode >"$_out" 2>/tmp/sb_b64.err
+        [ -s "$_out" ] && return 0
+    fi
+    echo "[ss-plugins] decode failed for $_out" >&2
+    cat /tmp/sb_b64.err >&2 2>/dev/null || true
     return 1
 }
 
-echo "[ss-plugins] installing into $DEST"
+sb_install_so() {
+    _name="$1"
+    _src="$2"
+    cp -f "$_src" "$DEST/libstrongswan-${_name}.so"
+    cp -f "$_src" "$DEST2/libstrongswan-${_name}.so" 2>/dev/null || true
+    cp -f "$_src" "$STASH/libstrongswan-${_name}.so"
+    chmod 755 "$DEST/libstrongswan-${_name}.so" "$STASH/libstrongswan-${_name}.so"
+    echo "[ss-plugins] ${_name} installed ($(wc -c < "$DEST/libstrongswan-${_name}.so") bytes)"
+}
 
-if [ ! -s "$DEST/libstrongswan-x509.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-x509.so (86672 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-x509.so" <<'SB_SO_X509_B64'
+echo "[ss-plugins] offline install into $DEST (+ stash $STASH)"
+
+# --- x509 (86672 bytes) ---
+if [ -s "$DEST/libstrongswan-x509.so" ] && [ "$(wc -c < "$DEST/libstrongswan-x509.so")" -ge 1000 ]; then
+    echo "[ss-plugins] x509 already present"
+    cp -f "$DEST/libstrongswan-x509.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/x509.b64 <<'SB_SO_X509_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAgDoAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+BsBAAAAAAD4GwEAAAAAAAAA
 AQAAAAAAAQAAAAYAAAC4KwEAAAAAALgrAgAAAAAAuCsCAAAAAADYJgAAAAAAABAnAAAAAAAAAAAB
@@ -1546,17 +1569,12 @@ AAADAAAAEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEwAAAAcAAAAAAAAAAAAAAAAAAAADAAAAEgAA
 AAEAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAAcAAAAAAAAAAAAAAAAAAAAwCQYDVR04BAIFAAQNMAsG
 CSsGAQUFBzABAQYJKwYBBQUHMAEEBgkrBgEFBQcwAQI=
 SB_SO_X509_B64
-    then
-        cp -f "$DEST/libstrongswan-x509.so" "$STASH/libstrongswan-x509.so"
-        chmod 755 "$DEST/libstrongswan-x509.so"
-        echo "[ss-plugins] x509 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/x509.b64 /tmp/sb_ss_b64/x509.so \
+        && [ -s /tmp/sb_ss_b64/x509.so ]; then
+        sb_install_so x509 /tmp/sb_ss_b64/x509.so
     else
-        echo "[ss-plugins] FAILED x509" >&2
-        rm -f "$DEST/libstrongswan-x509.so"
+        echo "[ss-plugins] FAILED to decode x509" >&2
     fi
-else
-    echo "[ss-plugins] x509 already present"
-    cp -f "$DEST/libstrongswan-x509.so" "$STASH/libstrongswan-x509.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/x509.conf" <<'SB_PLUG_X509_CONF'
@@ -1569,9 +1587,12 @@ x509 {
 }
 SB_PLUG_X509_CONF
 
-if [ ! -s "$DEST/libstrongswan-pkcs1.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-pkcs1.so (12665 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-pkcs1.so" <<'SB_SO_PKCS1_B64'
+# --- pkcs1 (12665 bytes) ---
+if [ -s "$DEST/libstrongswan-pkcs1.so" ] && [ "$(wc -c < "$DEST/libstrongswan-pkcs1.so")" -ge 1000 ]; then
+    echo "[ss-plugins] pkcs1 already present"
+    cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/pkcs1.b64 <<'SB_SO_PKCS1_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAQAwAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGCAAAAAAAAAYIAAAAAAAAAAA
 AQAAAAAAAQAAAAYAAAAIKwAAAAAAAAgrAQAAAAAACCsBAAAAAABxBgAAAAAAALgGAAAAAAAAAAAB
@@ -1796,17 +1817,12 @@ DwAAAAQAAAAAAAAAAAAAAAAAAAACAAAADwAAAAUAAAAAAAAAAAAAAAAAAAACAAAADwAAAAYAAAAA
 AAAAAAAAAAAAAAACAAAADwAAAAMAAAAAAAAAAAAAAAAAAAADAAAADwAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAADwAAAAE=
 SB_SO_PKCS1_B64
-    then
-        cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/libstrongswan-pkcs1.so"
-        chmod 755 "$DEST/libstrongswan-pkcs1.so"
-        echo "[ss-plugins] pkcs1 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/pkcs1.b64 /tmp/sb_ss_b64/pkcs1.so \
+        && [ -s /tmp/sb_ss_b64/pkcs1.so ]; then
+        sb_install_so pkcs1 /tmp/sb_ss_b64/pkcs1.so
     else
-        echo "[ss-plugins] FAILED pkcs1" >&2
-        rm -f "$DEST/libstrongswan-pkcs1.so"
+        echo "[ss-plugins] FAILED to decode pkcs1" >&2
     fi
-else
-    echo "[ss-plugins] pkcs1 already present"
-    cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/libstrongswan-pkcs1.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/pkcs1.conf" <<'SB_PLUG_PKCS1_CONF'
@@ -1819,9 +1835,12 @@ pkcs1 {
 }
 SB_PLUG_PKCS1_CONF
 
-if [ ! -s "$DEST/libstrongswan-pkcs8.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-pkcs8.so (8329 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-pkcs8.so" <<'SB_SO_PKCS8_B64'
+# --- pkcs8 (8329 bytes) ---
+if [ -s "$DEST/libstrongswan-pkcs8.so" ] && [ "$(wc -c < "$DEST/libstrongswan-pkcs8.so")" -ge 1000 ]; then
+    echo "[ss-plugins] pkcs8 already present"
+    cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/pkcs8.b64 <<'SB_SO_PKCS8_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAAAgAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxA8AAAAAAADEDwAAAAAAAAAA
 AQAAAAAAAQAAAAYAAACYHAAAAAAAAJgcAQAAAAAAmBwBAAAAAADxAwAAAAAAADgEAAAAAAAAAAAB
@@ -1970,17 +1989,12 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAAQAAAAAAAAAA
 AAAAAAAAAAAAAAALAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAALAAAABAAAAAAAAAAAAAAAAAAAAAAA
 AAALAAAABQ==
 SB_SO_PKCS8_B64
-    then
-        cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/libstrongswan-pkcs8.so"
-        chmod 755 "$DEST/libstrongswan-pkcs8.so"
-        echo "[ss-plugins] pkcs8 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/pkcs8.b64 /tmp/sb_ss_b64/pkcs8.so \
+        && [ -s /tmp/sb_ss_b64/pkcs8.so ]; then
+        sb_install_so pkcs8 /tmp/sb_ss_b64/pkcs8.so
     else
-        echo "[ss-plugins] FAILED pkcs8" >&2
-        rm -f "$DEST/libstrongswan-pkcs8.so"
+        echo "[ss-plugins] FAILED to decode pkcs8" >&2
     fi
-else
-    echo "[ss-plugins] pkcs8 already present"
-    cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/libstrongswan-pkcs8.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/pkcs8.conf" <<'SB_PLUG_PKCS8_CONF'
@@ -1993,9 +2007,12 @@ pkcs8 {
 }
 SB_PLUG_PKCS8_CONF
 
-if [ ! -s "$DEST/libstrongswan-gcm.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-gcm.so (8649 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-gcm.so" <<'SB_SO_GCM_B64'
+# --- gcm (8649 bytes) ---
+if [ -s "$DEST/libstrongswan-gcm.so" ] && [ "$(wc -c < "$DEST/libstrongswan-gcm.so")" -ge 1000 ]; then
+    echo "[ss-plugins] gcm already present"
+    cp -f "$DEST/libstrongswan-gcm.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/gcm.b64 <<'SB_SO_GCM_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAAAgAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0BgAAAAAAADQGAAAAAAAAAAA
 AQAAAAAAAQAAAAYAAACAHQAAAAAAAIAdAQAAAAAAgB0BAAAAAABJBAAAAAAAAIgEAAAAAAAAAAAB
@@ -2149,17 +2166,12 @@ AAAADAAAAAAAAAAgAAAAAAAAAAAAAAACAAAAFAAAAAAAAAAQAAAAAAAAAAEAAAABAAAADAAAAAAA
 AAAQAAAAAAAAAAAAAAACAAAAFAAAAAAAAAAYAAAAAAAAAAEAAAABAAAADAAAAAAAAAAYAAAAAAAA
 AAAAAAACAAAAFAAAAAAAAAAgAAAAAAAAAAEAAAABAAAADAAAAAAAAAAg
 SB_SO_GCM_B64
-    then
-        cp -f "$DEST/libstrongswan-gcm.so" "$STASH/libstrongswan-gcm.so"
-        chmod 755 "$DEST/libstrongswan-gcm.so"
-        echo "[ss-plugins] gcm OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/gcm.b64 /tmp/sb_ss_b64/gcm.so \
+        && [ -s /tmp/sb_ss_b64/gcm.so ]; then
+        sb_install_so gcm /tmp/sb_ss_b64/gcm.so
     else
-        echo "[ss-plugins] FAILED gcm" >&2
-        rm -f "$DEST/libstrongswan-gcm.so"
+        echo "[ss-plugins] FAILED to decode gcm" >&2
     fi
-else
-    echo "[ss-plugins] gcm already present"
-    cp -f "$DEST/libstrongswan-gcm.so" "$STASH/libstrongswan-gcm.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/gcm.conf" <<'SB_PLUG_GCM_CONF'
@@ -2172,9 +2184,13 @@ gcm {
 }
 SB_PLUG_GCM_CONF
 
+rm -rf /tmp/sb_ss_b64
+echo "[ss-plugins] listing:"
+ls -la "$DEST"/libstrongswan-x509.so "$DEST"/libstrongswan-pkcs1.so \
+       "$DEST"/libstrongswan-gcm.so "$DEST"/libstrongswan-pkcs8.so 2>&1 || true
 if [ -s "$DEST/libstrongswan-x509.so" ] && [ -s "$DEST/libstrongswan-pkcs1.so" ]; then
     echo "[ss-plugins] credential plugins ready."
     exit 0
 fi
-echo "[ss-plugins] ERROR: x509/pkcs1 not installed" >&2
+echo "[ss-plugins] ERROR: x509/pkcs1 missing after install" >&2
 exit 1

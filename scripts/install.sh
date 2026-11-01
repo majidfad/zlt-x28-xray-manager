@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec10"
+INSTALLER_VERSION="2026.11.01-ipsec11"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -255,31 +255,54 @@ fi
 log "2b+. [${INSTALLER_VERSION}] Installing bundled strongSwan plugins (offline)..."
 cat << 'SB_SSPLUG_EOF' > /usr/bin/sb-install-ss-plugins
 #!/bin/sh
-# Install bundled strongSwan credential plugins (OpenWrt 21.02.7 aarch64).
-# Uses openssl (always present on ZLT for PKCS#12) — not busybox base64.
-set -e
+# Bundled strongSwan plugins for ZLT/OEM OpenWrt (aarch64, strongSwan 5.9.x).
+# Source binaries: files/usr/lib/ipsec/plugins/libstrongswan-*.so
+# Decode with openssl (device already has it for PKCS#12). No network.
 DEST="${SB_SS_PLUGIN_DIR:-/usr/lib/ipsec/plugins}"
+DEST2="/usr/lib/ipsec"
 STASH="${SB_SS_PLUGIN_STASH:-/etc/singbox/ss-plugins}"
 CONFDIR="/etc/strongswan.d/charon"
-mkdir -p "$DEST" "$STASH" "$CONFDIR"
+mkdir -p "$DEST" "$DEST2" "$STASH" "$CONFDIR" /tmp/sb_ss_b64
 
-sb_decode_b64() {
-    _out="$1"
-    # openssl enc -base64 -d accepts multi-line stdin on OpenSSL 1.x/3.x
-    if openssl enc -base64 -d -out "$_out" 2>/dev/null; then
+sb_decode_b64_file() {
+    _b64f="$1"
+    _out="$2"
+    rm -f "$_out"
+    if openssl enc -base64 -d -in "$_b64f" -out "$_out" 2>/tmp/sb_b64.err; then
         [ -s "$_out" ] && return 0
     fi
-    if openssl base64 -d -out "$_out" 2>/dev/null; then
+    if openssl base64 -d -in "$_b64f" -out "$_out" 2>/tmp/sb_b64.err; then
         [ -s "$_out" ] && return 0
     fi
+    # Last resort: busybox base64
+    if command -v base64 >/dev/null 2>&1; then
+        tr -d "\n\r " <"$_b64f" | base64 -d >"$_out" 2>/tmp/sb_b64.err \
+            || tr -d "\n\r " <"$_b64f" | base64 --decode >"$_out" 2>/tmp/sb_b64.err
+        [ -s "$_out" ] && return 0
+    fi
+    echo "[ss-plugins] decode failed for $_out" >&2
+    cat /tmp/sb_b64.err >&2 2>/dev/null || true
     return 1
 }
 
-echo "[ss-plugins] installing into $DEST"
+sb_install_so() {
+    _name="$1"
+    _src="$2"
+    cp -f "$_src" "$DEST/libstrongswan-${_name}.so"
+    cp -f "$_src" "$DEST2/libstrongswan-${_name}.so" 2>/dev/null || true
+    cp -f "$_src" "$STASH/libstrongswan-${_name}.so"
+    chmod 755 "$DEST/libstrongswan-${_name}.so" "$STASH/libstrongswan-${_name}.so"
+    echo "[ss-plugins] ${_name} installed ($(wc -c < "$DEST/libstrongswan-${_name}.so") bytes)"
+}
 
-if [ ! -s "$DEST/libstrongswan-x509.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-x509.so (86672 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-x509.so" <<'SB_SO_X509_B64'
+echo "[ss-plugins] offline install into $DEST (+ stash $STASH)"
+
+# --- x509 (86672 bytes) ---
+if [ -s "$DEST/libstrongswan-x509.so" ] && [ "$(wc -c < "$DEST/libstrongswan-x509.so")" -ge 1000 ]; then
+    echo "[ss-plugins] x509 already present"
+    cp -f "$DEST/libstrongswan-x509.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/x509.b64 <<'SB_SO_X509_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAgDoAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+BsBAAAAAAD4GwEAAAAAAAAA
 AQAAAAAAAQAAAAYAAAC4KwEAAAAAALgrAgAAAAAAuCsCAAAAAADYJgAAAAAAABAnAAAAAAAAAAAB
@@ -1802,17 +1825,12 @@ AAADAAAAEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEwAAAAcAAAAAAAAAAAAAAAAAAAADAAAAEgAA
 AAEAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAAcAAAAAAAAAAAAAAAAAAAAwCQYDVR04BAIFAAQNMAsG
 CSsGAQUFBzABAQYJKwYBBQUHMAEEBgkrBgEFBQcwAQI=
 SB_SO_X509_B64
-    then
-        cp -f "$DEST/libstrongswan-x509.so" "$STASH/libstrongswan-x509.so"
-        chmod 755 "$DEST/libstrongswan-x509.so"
-        echo "[ss-plugins] x509 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/x509.b64 /tmp/sb_ss_b64/x509.so \
+        && [ -s /tmp/sb_ss_b64/x509.so ]; then
+        sb_install_so x509 /tmp/sb_ss_b64/x509.so
     else
-        echo "[ss-plugins] FAILED x509" >&2
-        rm -f "$DEST/libstrongswan-x509.so"
+        echo "[ss-plugins] FAILED to decode x509" >&2
     fi
-else
-    echo "[ss-plugins] x509 already present"
-    cp -f "$DEST/libstrongswan-x509.so" "$STASH/libstrongswan-x509.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/x509.conf" <<'SB_PLUG_X509_CONF'
@@ -1825,9 +1843,12 @@ x509 {
 }
 SB_PLUG_X509_CONF
 
-if [ ! -s "$DEST/libstrongswan-pkcs1.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-pkcs1.so (12665 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-pkcs1.so" <<'SB_SO_PKCS1_B64'
+# --- pkcs1 (12665 bytes) ---
+if [ -s "$DEST/libstrongswan-pkcs1.so" ] && [ "$(wc -c < "$DEST/libstrongswan-pkcs1.so")" -ge 1000 ]; then
+    echo "[ss-plugins] pkcs1 already present"
+    cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/pkcs1.b64 <<'SB_SO_PKCS1_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAQAwAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGCAAAAAAAAAYIAAAAAAAAAAA
 AQAAAAAAAQAAAAYAAAAIKwAAAAAAAAgrAQAAAAAACCsBAAAAAABxBgAAAAAAALgGAAAAAAAAAAAB
@@ -2052,17 +2073,12 @@ DwAAAAQAAAAAAAAAAAAAAAAAAAACAAAADwAAAAUAAAAAAAAAAAAAAAAAAAACAAAADwAAAAYAAAAA
 AAAAAAAAAAAAAAACAAAADwAAAAMAAAAAAAAAAAAAAAAAAAADAAAADwAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAADwAAAAE=
 SB_SO_PKCS1_B64
-    then
-        cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/libstrongswan-pkcs1.so"
-        chmod 755 "$DEST/libstrongswan-pkcs1.so"
-        echo "[ss-plugins] pkcs1 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/pkcs1.b64 /tmp/sb_ss_b64/pkcs1.so \
+        && [ -s /tmp/sb_ss_b64/pkcs1.so ]; then
+        sb_install_so pkcs1 /tmp/sb_ss_b64/pkcs1.so
     else
-        echo "[ss-plugins] FAILED pkcs1" >&2
-        rm -f "$DEST/libstrongswan-pkcs1.so"
+        echo "[ss-plugins] FAILED to decode pkcs1" >&2
     fi
-else
-    echo "[ss-plugins] pkcs1 already present"
-    cp -f "$DEST/libstrongswan-pkcs1.so" "$STASH/libstrongswan-pkcs1.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/pkcs1.conf" <<'SB_PLUG_PKCS1_CONF'
@@ -2075,9 +2091,12 @@ pkcs1 {
 }
 SB_PLUG_PKCS1_CONF
 
-if [ ! -s "$DEST/libstrongswan-pkcs8.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-pkcs8.so (8329 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-pkcs8.so" <<'SB_SO_PKCS8_B64'
+# --- pkcs8 (8329 bytes) ---
+if [ -s "$DEST/libstrongswan-pkcs8.so" ] && [ "$(wc -c < "$DEST/libstrongswan-pkcs8.so")" -ge 1000 ]; then
+    echo "[ss-plugins] pkcs8 already present"
+    cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/pkcs8.b64 <<'SB_SO_PKCS8_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAAAgAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxA8AAAAAAADEDwAAAAAAAAAA
 AQAAAAAAAQAAAAYAAACYHAAAAAAAAJgcAQAAAAAAmBwBAAAAAADxAwAAAAAAADgEAAAAAAAAAAAB
@@ -2226,17 +2245,12 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALAAAAAQAAAAAAAAAA
 AAAAAAAAAAAAAAALAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAALAAAABAAAAAAAAAAAAAAAAAAAAAAA
 AAALAAAABQ==
 SB_SO_PKCS8_B64
-    then
-        cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/libstrongswan-pkcs8.so"
-        chmod 755 "$DEST/libstrongswan-pkcs8.so"
-        echo "[ss-plugins] pkcs8 OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/pkcs8.b64 /tmp/sb_ss_b64/pkcs8.so \
+        && [ -s /tmp/sb_ss_b64/pkcs8.so ]; then
+        sb_install_so pkcs8 /tmp/sb_ss_b64/pkcs8.so
     else
-        echo "[ss-plugins] FAILED pkcs8" >&2
-        rm -f "$DEST/libstrongswan-pkcs8.so"
+        echo "[ss-plugins] FAILED to decode pkcs8" >&2
     fi
-else
-    echo "[ss-plugins] pkcs8 already present"
-    cp -f "$DEST/libstrongswan-pkcs8.so" "$STASH/libstrongswan-pkcs8.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/pkcs8.conf" <<'SB_PLUG_PKCS8_CONF'
@@ -2249,9 +2263,12 @@ pkcs8 {
 }
 SB_PLUG_PKCS8_CONF
 
-if [ ! -s "$DEST/libstrongswan-gcm.so" ]; then
-    echo "[ss-plugins] decoding libstrongswan-gcm.so (8649 bytes)..."
-    if sb_decode_b64 "$DEST/libstrongswan-gcm.so" <<'SB_SO_GCM_B64'
+# --- gcm (8649 bytes) ---
+if [ -s "$DEST/libstrongswan-gcm.so" ] && [ "$(wc -c < "$DEST/libstrongswan-gcm.so")" -ge 1000 ]; then
+    echo "[ss-plugins] gcm already present"
+    cp -f "$DEST/libstrongswan-gcm.so" "$STASH/" 2>/dev/null || true
+else
+    cat > /tmp/sb_ss_b64/gcm.b64 <<'SB_SO_GCM_B64'
 f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAAAgAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAAG
 AEAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0BgAAAAAAADQGAAAAAAAAAAA
 AQAAAAAAAQAAAAYAAACAHQAAAAAAAIAdAQAAAAAAgB0BAAAAAABJBAAAAAAAAIgEAAAAAAAAAAAB
@@ -2405,17 +2422,12 @@ AAAADAAAAAAAAAAgAAAAAAAAAAAAAAACAAAAFAAAAAAAAAAQAAAAAAAAAAEAAAABAAAADAAAAAAA
 AAAQAAAAAAAAAAAAAAACAAAAFAAAAAAAAAAYAAAAAAAAAAEAAAABAAAADAAAAAAAAAAYAAAAAAAA
 AAAAAAACAAAAFAAAAAAAAAAgAAAAAAAAAAEAAAABAAAADAAAAAAAAAAg
 SB_SO_GCM_B64
-    then
-        cp -f "$DEST/libstrongswan-gcm.so" "$STASH/libstrongswan-gcm.so"
-        chmod 755 "$DEST/libstrongswan-gcm.so"
-        echo "[ss-plugins] gcm OK"
+    if sb_decode_b64_file /tmp/sb_ss_b64/gcm.b64 /tmp/sb_ss_b64/gcm.so \
+        && [ -s /tmp/sb_ss_b64/gcm.so ]; then
+        sb_install_so gcm /tmp/sb_ss_b64/gcm.so
     else
-        echo "[ss-plugins] FAILED gcm" >&2
-        rm -f "$DEST/libstrongswan-gcm.so"
+        echo "[ss-plugins] FAILED to decode gcm" >&2
     fi
-else
-    echo "[ss-plugins] gcm already present"
-    cp -f "$DEST/libstrongswan-gcm.so" "$STASH/libstrongswan-gcm.so" 2>/dev/null || true
 fi
 
 cat > "$CONFDIR/gcm.conf" <<'SB_PLUG_GCM_CONF'
@@ -2428,11 +2440,15 @@ gcm {
 }
 SB_PLUG_GCM_CONF
 
+rm -rf /tmp/sb_ss_b64
+echo "[ss-plugins] listing:"
+ls -la "$DEST"/libstrongswan-x509.so "$DEST"/libstrongswan-pkcs1.so \
+       "$DEST"/libstrongswan-gcm.so "$DEST"/libstrongswan-pkcs8.so 2>&1 || true
 if [ -s "$DEST/libstrongswan-x509.so" ] && [ -s "$DEST/libstrongswan-pkcs1.so" ]; then
     echo "[ss-plugins] credential plugins ready."
     exit 0
 fi
-echo "[ss-plugins] ERROR: x509/pkcs1 not installed" >&2
+echo "[ss-plugins] ERROR: x509/pkcs1 missing after install" >&2
 exit 1
 SB_SSPLUG_EOF
 chmod +x /usr/bin/sb-install-ss-plugins
@@ -2575,7 +2591,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec10"
+SB_MANAGER_VERSION="2026.11.01-ipsec11"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -3355,182 +3371,51 @@ enable_charon_plugin() {
     fi
 }
 
-# Detect opkg arch (OEM ZLT often aarch64_cortex-a53 / aarch64_generic).
-sb_opkg_arch() {
-    if command -v opkg >/dev/null 2>&1; then
-        opkg print-architecture 2>/dev/null | awk '
-            $1=="arch" && $2!="all" && $2!="noarch" { print $2; exit }
-        '
-    fi
-}
-
-sb_http_get() {
-    _url="$1"
-    _out="$2"
-    # Short timeouts — OEM WAN/DNS to openwrt.org often hangs forever.
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -T 8 -t 1 -O "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
-    fi
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 5 --max-time 15 -o "$_out" "$_url" 2>/dev/null \
-            && [ -s "$_out" ] && return 0
-    fi
-    rm -f "$_out"
-    return 1
-}
-
-# Extract an OpenWrt .ipk straight into / (bypass empty OEM feeds).
-sb_install_ipk_file() {
-    _ipk="$1"
-    [ -s "$_ipk" ] || return 1
-    _work="/tmp/sb_ipk_$$"
-    rm -rf "$_work"
-    mkdir -p "$_work"
-    # Prefer opkg when it works (registers package).
-    if command -v opkg >/dev/null 2>&1; then
-        if opkg install --force-depends --force-checksum --force-overwrite "$_ipk" \
-                >/tmp/sb_ipk_install.log 2>&1; then
-            rm -rf "$_work"
-            return 0
-        fi
-    fi
-    # Manual extract: ipk = tar of debian-binary + control.tar.gz + data.tar.gz
-    ( cd "$_work" && tar -xf "$_ipk" 2>/dev/null ) || {
-        rm -rf "$_work"
-        return 1
-    }
-    if [ -f "$_work/data.tar.gz" ]; then
-        tar -xzf "$_work/data.tar.gz" -C / >/tmp/sb_ipk_untar.log 2>&1 || {
-            rm -rf "$_work"
-            return 1
-        }
-    elif [ -f "$_work/data.tar.xz" ]; then
-        tar -xJf "$_work/data.tar.xz" -C / >/tmp/sb_ipk_untar.log 2>&1 || {
-            rm -rf "$_work"
-            return 1
-        }
-    else
-        rm -rf "$_work"
-        return 1
-    fi
-    rm -rf "$_work"
-    return 0
-}
-
-# OEM ZLT feeds often omit strongswan-mod-* — fetch OpenWrt official ipks that match
-# strongSwan 5.9.x (device reports 5.9.1; closest public build is 5.9.2).
-fetch_strongswan_plugins_ipk() {
-    _need=""
-    for _m in x509 pkcs1; do
-        if [ ! -f "/usr/lib/ipsec/plugins/libstrongswan-${_m}.so" ] \
-            && [ ! -f "/usr/lib/ipsec/libstrongswan-${_m}.so" ]; then
-            _need="$_need $_m"
-        fi
-    done
-    # gcm needed for Amnezia esp=aes128gcm16
-    if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-gcm.so ] \
-        && [ ! -f /usr/lib/ipsec/libstrongswan-gcm.so ]; then
-        _need="$_need gcm"
-    fi
-    if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-pkcs8.so ] \
-        && [ ! -f /usr/lib/ipsec/libstrongswan-pkcs8.so ]; then
-        _need="$_need pkcs8"
-    fi
-    [ -n "$_need" ] || {
-        echo "[System] Required plugin .so files already on disk." >> "$LOG_FILE"
-        return 0
-    }
-    echo "[System] Missing plugin .so — quick CDN fetch (8s timeout):$_need" >> "$LOG_FILE"
-
-    # Prefer plugins already staged by install.sh under /usr/lib/ipsec/plugins.
-    if [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
-        echo "[System] x509 appeared on disk — skip CDN." >> "$LOG_FILE"
-        return 0
-    fi
-
-    _native=$(sb_opkg_arch)
-    [ -z "$_native" ] && _native="aarch64_cortex-a53"
-    # One mirror, one version, native arch then a53 — do NOT hang the router.
-    _ver="5.9.2-3"
-    _got=0
-    for _arch in "$_native" aarch64_cortex-a53; do
-        [ -n "$_arch" ] || continue
-        for _mod in $_need; do
-            [ -f "/usr/lib/ipsec/plugins/libstrongswan-${_mod}.so" ] && continue
-            _fn="strongswan-mod-${_mod}_${_ver}_${_arch}.ipk"
-            _url="https://downloads.openwrt.org/releases/21.02.7/packages/${_arch}/packages/${_fn}"
-            _dst="/tmp/${_fn}"
-            echo "[System] try $_url" >> "$LOG_FILE"
-            if sb_http_get "$_url" "$_dst" && sb_install_ipk_file "$_dst"; then
-                echo "[System] Installed $_fn" >> "$LOG_FILE"
-                _got=1
-            else
-                echo "[System] skip $_mod ($_arch) — download/install failed" >> "$LOG_FILE"
-            fi
-        done
-        [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && break
-    done
-    [ "$_got" = "1" ] || [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]
-}
-
-# Restore plugins from stash or bundled installer (NO CDN — OEM WAN can't reach it).
+# Offline-only: plugins ship in-repo under files/usr/lib/ipsec/plugins/ and are
+# installed by /usr/bin/sb-install-ss-plugins (embedded in install.sh). NO CDN.
 install_local_strongswan_plugins() {
-    mkdir -p /usr/lib/ipsec/plugins /etc/strongswan.d/charon
-    # Stash copied by sb-install-ss-plugins / previous runs
+    mkdir -p /usr/lib/ipsec/plugins /usr/lib/ipsec /etc/strongswan.d/charon /etc/singbox/ss-plugins
+    echo "[System] Offline plugin install (sb-manager $SB_MANAGER_VERSION)..." >> "$LOG_FILE"
+
+    # 1) Stash from a previous successful install
     if [ -d /etc/singbox/ss-plugins ]; then
         for _f in /etc/singbox/ss-plugins/libstrongswan-*.so; do
             [ -f "$_f" ] || continue
             _bn=$(basename "$_f")
             if [ ! -s "/usr/lib/ipsec/plugins/$_bn" ]; then
                 cp -f "$_f" "/usr/lib/ipsec/plugins/$_bn"
+                cp -f "$_f" "/usr/lib/ipsec/$_bn" 2>/dev/null || true
                 chmod 755 "/usr/lib/ipsec/plugins/$_bn"
-                echo "[System] Restored $_bn from stash." >> "$LOG_FILE"
+                echo "[System] Restored $_bn from /etc/singbox/ss-plugins." >> "$LOG_FILE"
             fi
         done
     fi
-    if [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
-        && [ -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]; then
-        return 0
+
+    # 2) Bundled decoder written by install.sh (contains the .so payloads)
+    if [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
+        || [ ! -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]; then
+        if [ -x /usr/bin/sb-install-ss-plugins ]; then
+            echo "[System] Running /usr/bin/sb-install-ss-plugins ..." >> "$LOG_FILE"
+            /usr/bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
+        else
+            echo "[System] ERROR: /usr/bin/sb-install-ss-plugins missing." >> "$LOG_FILE"
+            echo "[System] Re-run install.sh $SB_MANAGER_VERSION (must embed SB_SSPLUG)." >> "$LOG_FILE"
+        fi
     fi
-    if [ -x /usr/bin/sb-install-ss-plugins ]; then
-        echo "[System] Running bundled sb-install-ss-plugins..." >> "$LOG_FILE"
-        /usr/bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
-    fi
+
     [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
         && [ -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]
 }
 
-# charon needs x509 + pkcs1 (or openssl) to parse PEM certs/keys. Without them:
-#   "parsing X509 certificate failed" / "no private key found for 'CN'"
+# charon needs x509 + pkcs1 to parse PEM certs/keys.
 ensure_strongswan_plugins() {
     echo "[System] Checking strongSwan credential plugins..." >> "$LOG_FILE"
 
-    # 1) Offline bundled installer / stash (preferred on ZLT — no CDN).
     if [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
         || [ ! -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]; then
         install_local_strongswan_plugins || true
     fi
 
-    # 2) Local feeds (usually empty on OEM ZLT).
-    if [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
-        && command -v opkg >/dev/null 2>&1; then
-        for _pkg in strongswan-mod-x509 strongswan-mod-pkcs1 strongswan-mod-pkcs8 \
-                    strongswan-mod-gcm strongswan-default; do
-            opkg install "$_pkg" >/tmp/sb_opkg_plug.log 2>&1 \
-                && echo "[System] Installed $_pkg from feed" >> "$LOG_FILE" \
-                || true
-        done
-    fi
-
-    # 3) CDN last resort — only if explicitly enabled (hangs/fails on most OEM WANs).
-    if [ "${SB_SS_ALLOW_CDN:-0}" = "1" ] \
-        && [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
-        fetch_strongswan_plugins_ipk || true
-    elif [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
-        echo "[System] x509 plugin still missing (CDN disabled; set SB_SS_ALLOW_CDN=1 to try)." >> "$LOG_FILE"
-    fi
-
-    # Enable drop-ins for every credential/crypto plugin we care about.
     for _pl in x509 pkcs1 pkcs8 pkcs12 pem openssl pubkey gmp gcm hmac sha1 sha2 \
                aes des md5 mgf1 random nonce constraints revocation \
                kernel-netlink socket-default stroke vici updown attr \
@@ -3538,23 +3423,19 @@ ensure_strongswan_plugins() {
         enable_charon_plugin "$_pl"
     done
 
-    # If OpenWrt keeps regenerating an explicit load= list without x509, force a
-    # load_modular conf that picks up the drop-ins above.
     write_strongswan_conf_file /etc/strongswan.conf
-    # Follow symlink target used by OEM (/etc/strongswan.conf -> /tmp/strongswan.conf)
     if [ -L /etc/strongswan.conf ]; then
         _tgt=$(readlink -f /etc/strongswan.conf 2>/dev/null || readlink /etc/strongswan.conf)
         [ -n "$_tgt" ] && write_strongswan_conf_file "$_tgt"
     fi
     write_strongswan_conf_file /etc/strongswan/strongswan.conf 2>/dev/null || true
 
-    # Log which plugin .so files exist on disk.
     echo "[System] Plugin .so present:" >> "$LOG_FILE"
     ls -la /usr/lib/ipsec/plugins/libstrongswan-x509.so \
            /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so \
            /usr/lib/ipsec/plugins/libstrongswan-gcm.so \
            /usr/lib/ipsec/plugins/libstrongswan-pkcs8.so >> "$LOG_FILE" 2>&1 \
-        || echo "(required plugins missing under /usr/lib/ipsec/plugins)" >> "$LOG_FILE"
+        || echo "[System] ERROR: required plugins missing — re-run install.sh" >> "$LOG_FILE"
 }
 
 # Return 0 if running charon has x509 (required for PEM certs).
@@ -3625,8 +3506,8 @@ start_charon_daemon() {
         echo "[System] loaded plugins: $_plist" >> "$LOG_FILE"
         if ! charon_has_x509; then
             echo "[System] ERROR: charon has no x509/openssl plugin — cannot load PEM certs." >> "$LOG_FILE"
-            echo "[System] Install: opkg install strongswan-mod-x509 strongswan-mod-pkcs1 strongswan-mod-pem" >> "$LOG_FILE"
-            echo "[System] Or: opkg install strongswan-default" >> "$LOG_FILE"
+            echo "[System] Fix: re-run install.sh (embeds sb-install-ss-plugins) or scp" >> "$LOG_FILE"
+            echo "[System]   files/usr/lib/ipsec/plugins/libstrongswan-*.so -> /usr/lib/ipsec/plugins/" >> "$LOG_FILE"
             return 1
         fi
         return 0
@@ -4029,9 +3910,10 @@ start_ipsec() {
         ls -la /etc/strongswan.conf /etc/strongswan/strongswan.conf >> "$LOG_FILE" 2>&1 || true
         ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' >> "$LOG_FILE" || true
         if ! charon_has_x509; then
-            echo "[System] ROOT CAUSE: missing strongswan x509/pkcs1 plugins." >> "$LOG_FILE"
-            echo "[System] Auto-fetch from OpenWrt CDN failed — check WAN to downloads.openwrt.org" >> "$LOG_FILE"
-            echo "[System] Manual: wget OpenWrt strongswan-mod-x509/pkcs1 5.9.2 ipk and opkg install --force-depends" >> "$LOG_FILE"
+            echo "[System] ROOT CAUSE: missing strongswan x509/pkcs1 .so on disk." >> "$LOG_FILE"
+            echo "[System] Fix: re-run install.sh $SB_MANAGER_VERSION OR scp repo plugins:" >> "$LOG_FILE"
+            echo "[System]   files/usr/lib/ipsec/plugins/libstrongswan-{x509,pkcs1,pkcs8,gcm}.so" >> "$LOG_FILE"
+            echo "[System]   -> /usr/lib/ipsec/plugins/  then restart IPsec" >> "$LOG_FILE"
         fi
         swanctl --version >> "$LOG_FILE" 2>&1 || true
         ipsec version >> "$LOG_FILE" 2>&1 || true

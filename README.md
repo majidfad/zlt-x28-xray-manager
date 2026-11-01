@@ -80,11 +80,10 @@ sb-manager start
 **Import:** paste `vpn://` in the LuCI panel — the **browser** decodes it (no
 python on the router). CLI `sb-vpn-decode` still wants optional `python3`.
 
-**Connect:** needs **strongSwan** (`swanctl` or `ipsec`) + openssl. On stock
-OpenWrt: `opkg install strongswan strongswan-default strongswan-swanctl`.
-**OEM ZLT-X28 feeds often do not ship those packages at all** — then Amnezia
-IPsec cannot start (VLESS/sing-box still works). Check with
-`opkg list | grep -i swan` and `lsmod | grep xfrm`.
+**Connect:** needs **strongSwan** (`swanctl` or `ipsec`) + openssl. OEM ZLT
+feeds usually lack `strongswan-mod-x509` / `pkcs1`; `install.sh` embeds those
+`.so` files from `files/usr/lib/ipsec/plugins/` and installs them **offline**
+(no CDN). Manual: scp `libstrongswan-*.so` → `/usr/lib/ipsec/plugins/`.
 
 Switching VLESS ↔ Amnezia IPsec stops the other engine automatically.
 Proxy-only mode is for sing-box; Amnezia IPsec uses policy-based tunnel + LAN SNAT.
