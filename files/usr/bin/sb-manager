@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec12"
+SB_MANAGER_VERSION="2026.11.01-ipsec15"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -712,7 +712,7 @@ charon {
     load_modular = no
     install_routes = yes
     install_virtual_ip = yes
-    load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc cmac gmp curve25519 pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default stroke vici updown counters gcm
+    load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default stroke vici updown counters gcm
 }
 SCONF
 }
@@ -789,40 +789,39 @@ enable_charon_plugin() {
     fi
 }
 
-# Offline-only: plugins ship in-repo under files/usr/lib/ipsec/plugins/ and are
-# installed by /usr/bin/sb-install-ss-plugins (embedded in install.sh). NO CDN.
+# Deploy matched 5.9.2 charon+libstrongswan+plugins (OEM 5.9.1 cannot load foreign .so).
 install_local_strongswan_plugins() {
-    mkdir -p /usr/lib/ipsec/plugins /usr/lib/ipsec /etc/strongswan.d/charon /etc/singbox/ss-plugins
-    echo "[System] Offline plugin install (sb-manager $SB_MANAGER_VERSION)..." >> "$LOG_FILE"
+    mkdir -p /usr/lib/ipsec/plugins /etc/strongswan.d/charon /etc/singbox
+    echo "[System] Offline matched-stack install (sb-manager $SB_MANAGER_VERSION)..." >> "$LOG_FILE"
 
-    # 1) Stash from a previous successful install
-    if [ -d /etc/singbox/ss-plugins ]; then
-        for _f in /etc/singbox/ss-plugins/libstrongswan-*.so; do
-            [ -f "$_f" ] || continue
-            _bn=$(basename "$_f")
-            if [ ! -s "/usr/lib/ipsec/plugins/$_bn" ]; then
-                cp -f "$_f" "/usr/lib/ipsec/plugins/$_bn"
-                cp -f "$_f" "/usr/lib/ipsec/$_bn" 2>/dev/null || true
-                chmod 755 "/usr/lib/ipsec/plugins/$_bn"
-                echo "[System] Restored $_bn from /etc/singbox/ss-plugins." >> "$LOG_FILE"
-            fi
-        done
-    fi
+    _need_stack=0
+    [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && _need_stack=1
+    [ ! -s /usr/lib/ipsec/plugins/libstrongswan-openssl.so ] && _need_stack=1
+    [ ! -s /usr/lib/ipsec/libstrongswan.so.0 ] && _need_stack=1
+    # Marker written by sb-install-ss-plugins after full stack deploy
+    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec15" ] && _need_stack=1
 
-    # 2) Bundled decoder written by install.sh (contains the .so payloads)
-    if [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
-        || [ ! -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]; then
+    if [ "$_need_stack" = "1" ]; then
         if [ -x /usr/bin/sb-install-ss-plugins ]; then
-            echo "[System] Running /usr/bin/sb-install-ss-plugins ..." >> "$LOG_FILE"
+            echo "[System] Running /usr/bin/sb-install-ss-plugins (full 5.9.2 stack)..." >> "$LOG_FILE"
             /usr/bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
+            echo "5.9.2-ipsec15" > /etc/singbox/ss-stack.ver 2>/dev/null || true
+        elif [ -x /opt/sb-swan/lib/ipsec/charon ]; then
+            echo "[System] Deploying /opt/sb-swan into /usr/lib/ipsec ..." >> "$LOG_FILE"
+            cp -f /opt/sb-swan/lib/ipsec/charon /usr/lib/ipsec/charon
+            cp -f /opt/sb-swan/lib/ipsec/libstrongswan.so.0 /usr/lib/ipsec/libstrongswan.so.0
+            cp -f /opt/sb-swan/lib/ipsec/libcharon.so.0 /usr/lib/ipsec/libcharon.so.0
+            cp -f /opt/sb-swan/lib/ipsec/plugins/*.so /usr/lib/ipsec/plugins/
+            echo "5.9.2-ipsec15" > /etc/singbox/ss-stack.ver
         else
-            echo "[System] ERROR: /usr/bin/sb-install-ss-plugins missing." >> "$LOG_FILE"
-            echo "[System] Re-run install.sh $SB_MANAGER_VERSION (must embed SB_SSPLUG)." >> "$LOG_FILE"
+            echo "[System] ERROR: run sb-install-ss-plugins (downloads sb-swan.tgz from GitHub)." >> "$LOG_FILE"
         fi
+    else
+        echo "[System] Matched stack marker OK (ss-stack.ver)." >> "$LOG_FILE"
     fi
 
     [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
-        && [ -s /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ]
+        && [ -s /usr/lib/ipsec/libstrongswan.so.0 ]
 }
 
 # charon needs x509 + pkcs1 to parse PEM certs/keys.
