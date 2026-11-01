@@ -816,7 +816,9 @@ __NODE_PLACEHOLDER__
 SB_CFG_EOF
 
 log "5. Installing sb-manager..."
-cat << 'SB_MGR_EOF' > /usr/bin/sb-manager
+# Overlay is tiny — keep the big script on /data and symlink into PATH.
+mkdir -p /data/sb-bin
+cat << 'SB_MGR_EOF' > /data/sb-bin/sb-manager
 #!/bin/sh
 # =======================================================
 # sb-manager - Sing-Box Enterprise VPN Manager
@@ -2551,8 +2553,13 @@ case "$1" in
         ;;
 esac
 SB_MGR_EOF
-chmod +x /usr/bin/sb-manager
-log "sb-manager installed: $(/usr/bin/sb-manager version 2>/dev/null || echo unknown)"
+chmod +x /data/sb-bin/sb-manager
+# Free overlay: replace fat /usr/bin copy with a tiny symlink
+rm -f /usr/bin/sb-manager
+ln -sf /data/sb-bin/sb-manager /usr/bin/sb-manager 2>/dev/null \
+    || cp -f /data/sb-bin/sb-manager /usr/bin/sb-manager
+log "sb-manager installed: $(/usr/bin/sb-manager version 2>/dev/null || /data/sb-bin/sb-manager version 2>/dev/null || echo unknown)"
+df -h / /data 2>/dev/null | while read -r _l; do log "  $_l"; done || true
 
 log "5b. Installing sb-vpn-decode (Amnezia vpn:// decoder)..."
 cat << 'SB_VPNDEC_EOF' > /usr/bin/sb-vpn-decode
