@@ -30,6 +30,7 @@ check_block() {
 }
 
 check_block "SB_CFG_EOF" "$REPO_DIR/files/etc/singbox/base_config.json"
+check_block "SB_SSPLUG_EOF" "$REPO_DIR/files/usr/bin/sb-install-ss-plugins"
 check_block "SB_MGR_EOF" "$REPO_DIR/files/usr/bin/sb-manager"
 check_block "SB_VPNDEC_EOF" "$REPO_DIR/files/usr/bin/sb-vpn-decode"
 check_block "SB_LUA_EOF" "$REPO_DIR/files/usr/lib/lua/luci/controller/singbox.lua"

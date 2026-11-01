@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 BLOCKS = {
     "SB_CFG_EOF": ROOT / "files/etc/singbox/base_config.json",
+    "SB_SSPLUG_EOF": ROOT / "files/usr/bin/sb-install-ss-plugins",
     "SB_MGR_EOF": ROOT / "files/usr/bin/sb-manager",
     "SB_VPNDEC_EOF": ROOT / "files/usr/bin/sb-vpn-decode",
     "SB_LUA_EOF": ROOT / "files/usr/lib/lua/luci/controller/singbox.lua",
