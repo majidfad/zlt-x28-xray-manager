@@ -204,22 +204,36 @@ if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
 elif command -v opkg >/dev/null 2>&1; then
     opkg update >/tmp/sb_opkg_update.log 2>&1 || true
     # Real OpenWrt package names (not "strongswan-full" / bare "swanctl").
+    # x509 + pkcs1 are REQUIRED to load PEM client certs/keys ("parsing X509 failed"
+    # / "no private key found" without them). strongswan-default pulls the usual set.
     for _pkg in \
         openssl-util \
         strongswan \
         strongswan-default \
         strongswan-swanctl \
         strongswan-charon \
+        strongswan-ipsec \
         strongswan-mod-kernel-netlink \
-        strongswan-mod-openssl \
-        strongswan-mod-pem \
-        strongswan-mod-pkcs12 \
         strongswan-mod-socket-default \
         strongswan-mod-vici \
+        strongswan-mod-stroke \
         strongswan-mod-nonce \
         strongswan-mod-random \
-        strongswan-mod-stroke \
-        strongswan-ipsec
+        strongswan-mod-pem \
+        strongswan-mod-pkcs1 \
+        strongswan-mod-pkcs8 \
+        strongswan-mod-pkcs12 \
+        strongswan-mod-x509 \
+        strongswan-mod-pubkey \
+        strongswan-mod-openssl \
+        strongswan-mod-gmp \
+        strongswan-mod-gcm \
+        strongswan-mod-hmac \
+        strongswan-mod-sha1 \
+        strongswan-mod-sha2 \
+        strongswan-mod-aes \
+        strongswan-mod-constraints \
+        strongswan-mod-revocation
     do
         opkg install "$_pkg" >/tmp/sb_opkg_ss.log 2>&1 && log "Installed $_pkg" || true
     done
@@ -365,7 +379,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec6"
+SB_MANAGER_VERSION="2026.11.01-ipsec7"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -891,6 +905,43 @@ b64_decode_to_file() {
     [ -s "$_out" ]
 }
 
+# Strip Bag Attributes / junk; keep only PEM blocks strongSwan accepts.
+sanitize_pem_file() {
+    _src="$1"
+    _dst="$2"
+    [ -s "$_src" ] || return 1
+    awk '
+        /-----BEGIN / { keep=1 }
+        keep { print }
+        /-----END / { keep=0 }
+    ' "$_src" > "$_dst.tmp" && mv "$_dst.tmp" "$_dst"
+    [ -s "$_dst" ]
+}
+
+# Normalize key to PKCS#1 "BEGIN RSA PRIVATE KEY" when possible (needs pkcs1 plugin,
+# which OEM builds often have via gmp path more reliably than pkcs8).
+normalize_private_key() {
+    _key="$1"
+    [ -s "$_key" ] || return 1
+    sanitize_pem_file "$_key" "$_key" || true
+    if grep -q 'BEGIN RSA PRIVATE KEY' "$_key" 2>/dev/null; then
+        return 0
+    fi
+    if openssl rsa -in "$_key" -out "$_key.rsa" 2>/tmp/sb_keynorm.err; then
+        mv "$_key.rsa" "$_key"
+        echo "[System] Normalized private key to PKCS#1 RSA PEM." >> "$LOG_FILE"
+        return 0
+    fi
+    if openssl ec -in "$_key" -out "$_key.ec" 2>/tmp/sb_keynorm.err; then
+        mv "$_key.ec" "$_key"
+        echo "[System] Normalized private key to EC PEM." >> "$LOG_FILE"
+        return 0
+    fi
+    echo "[System] Key normalize skipped (left as-is):" >> "$LOG_FILE"
+    cat /tmp/sb_keynorm.err >> "$LOG_FILE" 2>/dev/null
+    return 0
+}
+
 # Try openssl pkcs12 unpack with a given password into key/cert/ca PEMs.
 # Uses -clcerts so we never mistake the CA for the client cert.
 pkcs12_unpack() {
@@ -901,24 +952,34 @@ pkcs12_unpack() {
     rm -f "$_dir/client.key" "$_dir/client.pem" "$_dir/ca.pem" "$_dir/all.pem"
     # Prefer split extract (client cert vs CA).
     if openssl pkcs12 -in "$_p12" -nodes -nocerts -passin "pass:$_pass" \
-            -out "$_dir/client.key" >"$_err" 2>&1 \
+            -out "$_dir/client.key.raw" >"$_err" 2>&1 \
         && openssl pkcs12 -in "$_p12" -nodes -clcerts -nokeys -passin "pass:$_pass" \
-            -out "$_dir/client.pem" >>"$_err" 2>&1; then
+            -out "$_dir/client.pem.raw" >>"$_err" 2>&1; then
         openssl pkcs12 -in "$_p12" -nodes -cacerts -nokeys -passin "pass:$_pass" \
-            -out "$_dir/ca.pem" >>"$_err" 2>&1 || true
+            -out "$_dir/ca.pem.raw" >>"$_err" 2>&1 || true
+        sanitize_pem_file "$_dir/client.key.raw" "$_dir/client.key" || cp "$_dir/client.key.raw" "$_dir/client.key"
+        sanitize_pem_file "$_dir/client.pem.raw" "$_dir/client.pem" || cp "$_dir/client.pem.raw" "$_dir/client.pem"
+        [ -s "$_dir/ca.pem.raw" ] && sanitize_pem_file "$_dir/ca.pem.raw" "$_dir/ca.pem" || true
+        rm -f "$_dir/"*.raw
         if [ -s "$_dir/client.key" ] && [ -s "$_dir/client.pem" ]; then
+            normalize_private_key "$_dir/client.key"
             return 0
         fi
     fi
     # OpenSSL 3 legacy ciphers (ignore failure on 1.1.x).
     if openssl pkcs12 -help 2>&1 | grep -q -- '-legacy'; then
         if openssl pkcs12 -in "$_p12" -nodes -legacy -nocerts -passin "pass:$_pass" \
-                -out "$_dir/client.key" >"$_err" 2>&1 \
+                -out "$_dir/client.key.raw" >"$_err" 2>&1 \
             && openssl pkcs12 -in "$_p12" -nodes -legacy -clcerts -nokeys -passin "pass:$_pass" \
-                -out "$_dir/client.pem" >>"$_err" 2>&1; then
+                -out "$_dir/client.pem.raw" >>"$_err" 2>&1; then
             openssl pkcs12 -in "$_p12" -nodes -legacy -cacerts -nokeys -passin "pass:$_pass" \
-                -out "$_dir/ca.pem" >>"$_err" 2>&1 || true
+                -out "$_dir/ca.pem.raw" >>"$_err" 2>&1 || true
+            sanitize_pem_file "$_dir/client.key.raw" "$_dir/client.key" || cp "$_dir/client.key.raw" "$_dir/client.key"
+            sanitize_pem_file "$_dir/client.pem.raw" "$_dir/client.pem" || cp "$_dir/client.pem.raw" "$_dir/client.pem"
+            [ -s "$_dir/ca.pem.raw" ] && sanitize_pem_file "$_dir/ca.pem.raw" "$_dir/ca.pem" || true
+            rm -f "$_dir/"*.raw
             if [ -s "$_dir/client.key" ] && [ -s "$_dir/client.pem" ]; then
+                normalize_private_key "$_dir/client.key"
                 return 0
             fi
         fi
@@ -1080,9 +1141,101 @@ stop_strongswan_daemons() {
     sleep 1
 }
 
+# Enable a charon plugin drop-in (OpenWrt uses /etc/strongswan.d/charon/<name>.conf).
+enable_charon_plugin() {
+    _name="$1"
+    _conf="/etc/strongswan.d/charon/${_name}.conf"
+    mkdir -p /etc/strongswan.d/charon
+    if [ -f "$_conf" ]; then
+        # Force load = yes even if OEM shipped load = no
+        if grep -q 'load' "$_conf" 2>/dev/null; then
+            sed -i 's/load[[:space:]]*=[[:space:]]*no/load = yes/g' "$_conf" 2>/dev/null \
+                || sed -i 's/load = no/load = yes/g' "$_conf" 2>/dev/null || true
+        else
+            printf '%s {\n  load = yes\n}\n' "$_name" > "$_conf"
+        fi
+    else
+        printf '%s {\n  load = yes\n}\n' "$_name" > "$_conf"
+    fi
+}
+
+# charon needs x509 + pkcs1 (or openssl) to parse PEM certs/keys. Without them:
+#   "parsing X509 certificate failed" / "no private key found for 'CN'"
+ensure_strongswan_plugins() {
+    echo "[System] Checking strongSwan credential plugins..." >> "$LOG_FILE"
+
+    # Always try to install the critical mods (no-op if absent from feeds).
+    if command -v opkg >/dev/null 2>&1; then
+        for _pkg in \
+            strongswan-mod-x509 \
+            strongswan-mod-pkcs1 \
+            strongswan-mod-pkcs8 \
+            strongswan-mod-pkcs12 \
+            strongswan-mod-pem \
+            strongswan-mod-openssl \
+            strongswan-mod-pubkey \
+            strongswan-mod-gcm \
+            strongswan-mod-gmp \
+            strongswan-mod-hmac \
+            strongswan-mod-sha2 \
+            strongswan-mod-constraints \
+            strongswan-mod-revocation \
+            strongswan-mod-vici \
+            strongswan-mod-stroke \
+            strongswan-mod-kernel-netlink \
+            strongswan-mod-socket-default \
+            strongswan-default
+        do
+            if ! opkg list-installed "$_pkg" 2>/dev/null | grep -q .; then
+                opkg install "$_pkg" >/tmp/sb_opkg_plug.log 2>&1 \
+                    && echo "[System] Installed $_pkg" >> "$LOG_FILE" \
+                    || true
+            fi
+        done
+    fi
+
+    # Enable drop-ins for every credential/crypto plugin we care about.
+    for _pl in x509 pkcs1 pkcs8 pkcs12 pem openssl pubkey gmp gcm hmac sha1 sha2 \
+               aes des md5 mgf1 random nonce constraints revocation \
+               kernel-netlink socket-default stroke vici updown attr \
+               fips-prf xcbc curve25519 drbg counters; do
+        enable_charon_plugin "$_pl"
+    done
+
+    # If OpenWrt keeps regenerating an explicit load= list without x509, force a
+    # load_modular conf that picks up the drop-ins above.
+    write_strongswan_conf_file /etc/strongswan.conf
+    # Follow symlink target used by OEM (/etc/strongswan.conf -> /tmp/strongswan.conf)
+    if [ -L /etc/strongswan.conf ]; then
+        _tgt=$(readlink -f /etc/strongswan.conf 2>/dev/null || readlink /etc/strongswan.conf)
+        [ -n "$_tgt" ] && write_strongswan_conf_file "$_tgt"
+    fi
+    write_strongswan_conf_file /etc/strongswan/strongswan.conf 2>/dev/null || true
+
+    # Log which plugin .so files exist on disk.
+    echo "[System] Plugin .so present:" >> "$LOG_FILE"
+    ls /usr/lib/ipsec/plugins 2>/dev/null | grep -E 'x509|pkcs1|pkcs8|openssl|pem|gcm' >> "$LOG_FILE" 2>&1 \
+        || ls /usr/lib/ipsec 2>/dev/null | grep -E 'x509|pkcs1|openssl' >> "$LOG_FILE" 2>&1 \
+        || echo "(none found under /usr/lib/ipsec)" >> "$LOG_FILE"
+}
+
+# Return 0 if running charon has x509 (required for PEM certs).
+charon_has_x509() {
+    _plist=""
+    if [ -S /var/run/charon.vici ] || [ -S /var/run/charon.ctl ]; then
+        _plist=$(ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: //p' | head -n1)
+    fi
+    [ -z "$_plist" ] && return 1
+    echo "$_plist" | grep -qw x509 && return 0
+    # openssl plugin can also parse X509 in some builds
+    echo "$_plist" | grep -qw openssl && return 0
+    return 1
+}
+
 # Start charon so swanctl has a vici socket.
 start_charon_daemon() {
     ensure_strongswan_conf
+    ensure_strongswan_plugins
     # Prefer swanctl init (vici), then ipsec starter, then raw charon binary.
     if [ -x /etc/init.d/swanctl ]; then
         /etc/init.d/swanctl enable >/dev/null 2>&1 || true
@@ -1092,7 +1245,29 @@ start_charon_daemon() {
         /etc/init.d/ipsec enable >/dev/null 2>&1 || true
         /etc/init.d/ipsec start >>"$LOG_FILE" 2>&1 || true
     fi
+    # OpenWrt init.d often regenerates /tmp/strongswan.conf from UCI and drops
+    # plugins — rewrite again and bounce charon if x509 still missing.
+    ensure_strongswan_conf
+    ensure_strongswan_plugins
     ipsec start >>"$LOG_FILE" 2>&1 || true
+    sleep 1
+    if ! charon_has_x509; then
+        echo "[System] charon missing x509/openssl — restarting with forced conf..." >> "$LOG_FILE"
+        stop_strongswan_daemons
+        ensure_strongswan_conf
+        ensure_strongswan_plugins
+        # Start charon binary directly so UCI cannot clobber plugin load.
+        _charon=""
+        for _c in /usr/lib/ipsec/charon /usr/libexec/ipsec/charon /usr/sbin/charon; do
+            [ -x "$_c" ] && _charon="$_c" && break
+        done
+        if [ -n "$_charon" ]; then
+            STRONGSWAN_CONF=/etc/strongswan.conf "$_charon" >>"$LOG_FILE" 2>&1 &
+            # starter still needed for `ipsec up` stroke path
+            ipsec start >>"$LOG_FILE" 2>&1 || true
+            sleep 2
+        fi
+    fi
     # Raw charon if still no vici socket
     if [ ! -S /var/run/charon.vici ] && [ ! -S /var/run/charon.ctl ]; then
         _charon=""
@@ -1101,13 +1276,21 @@ start_charon_daemon() {
         done
         if [ -n "$_charon" ]; then
             echo "[System] Starting $_charon directly..." >> "$LOG_FILE"
-            "$_charon" >>"$LOG_FILE" 2>&1 &
+            STRONGSWAN_CONF=/etc/strongswan.conf "$_charon" >>"$LOG_FILE" 2>&1 &
             sleep 2
         fi
     fi
     sleep 1
     if [ -S /var/run/charon.vici ] || [ -S /var/run/charon.ctl ]; then
         echo "[System] charon vici socket is up." >> "$LOG_FILE"
+        _plist=$(ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: //p' | head -n1)
+        echo "[System] loaded plugins: $_plist" >> "$LOG_FILE"
+        if ! charon_has_x509; then
+            echo "[System] ERROR: charon has no x509/openssl plugin — cannot load PEM certs." >> "$LOG_FILE"
+            echo "[System] Install: opkg install strongswan-mod-x509 strongswan-mod-pkcs1 strongswan-mod-pem" >> "$LOG_FILE"
+            echo "[System] Or: opkg install strongswan-default" >> "$LOG_FILE"
+            return 1
+        fi
         return 0
     fi
     echo "[System] WARNING: no charon vici socket after start attempts." >> "$LOG_FILE"
@@ -1121,11 +1304,28 @@ prepare_swanctl_dir() {
     _dir="$IPSEC_DIR/$_id"
     rm -rf "$IPSEC_SWANCTL_DIR"
     mkdir -p "$IPSEC_SWANCTL_DIR/x509" "$IPSEC_SWANCTL_DIR/private" \
-             "$IPSEC_SWANCTL_DIR/x509ca" "$IPSEC_SWANCTL_DIR/conf.d"
-    cp -f "$_dir/client.pem" "$IPSEC_SWANCTL_DIR/x509/sbvpn_client.pem"
-    cp -f "$_dir/client.key" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
+             "$IPSEC_SWANCTL_DIR/x509ca" "$IPSEC_SWANCTL_DIR/pkcs12" \
+             "$IPSEC_SWANCTL_DIR/x509ocsp" "$IPSEC_SWANCTL_DIR/x509aa" \
+             "$IPSEC_SWANCTL_DIR/x509ac" "$IPSEC_SWANCTL_DIR/x509crl" \
+             "$IPSEC_SWANCTL_DIR/pubkey" "$IPSEC_SWANCTL_DIR/rsa" \
+             "$IPSEC_SWANCTL_DIR/ecdsa" "$IPSEC_SWANCTL_DIR/pkcs8" \
+             "$IPSEC_SWANCTL_DIR/conf.d"
+    # Re-sanitize on copy (in case older material still has Bag Attributes).
+    sanitize_pem_file "$_dir/client.pem" "$IPSEC_SWANCTL_DIR/x509/sbvpn_client.pem" \
+        || cp -f "$_dir/client.pem" "$IPSEC_SWANCTL_DIR/x509/sbvpn_client.pem"
+    sanitize_pem_file "$_dir/client.key" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key" \
+        || cp -f "$_dir/client.key" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
+    normalize_private_key "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key" || true
     if [ -s "$_dir/ca.pem" ]; then
-        cp -f "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem"
+        sanitize_pem_file "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem" \
+            || cp -f "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem"
+    fi
+    if [ -s "$_dir/client.p12" ]; then
+        cp -f "$_dir/client.p12" "$IPSEC_SWANCTL_DIR/pkcs12/sbvpn_client.p12"
+        # swanctl secrets "file =" resolves under private/ by default
+        cp -f "$_dir/client.p12" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.p12"
+        chmod 600 "$IPSEC_SWANCTL_DIR/pkcs12/sbvpn_client.p12" \
+                  "$IPSEC_SWANCTL_DIR/private/sbvpn_client.p12"
     fi
     chmod 600 "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
     # Minimal main file — only our connection.
@@ -1199,6 +1399,14 @@ write_swanctl_conn() {
         echo "    private-sbvpn {"
         echo "        file = sbvpn_client.key"
         echo "    }"
+        # Also offer PKCS#12 (Amnezia native) if present — helps some builds.
+        if [ -s "$_dir/client.p12" ]; then
+            _p12pass=$(cat "$_dir/pass" 2>/dev/null || true)
+            echo "    private-sbvpn-p12 {"
+            echo "        file = sbvpn_client.p12"
+            echo "        secret = \"${_p12pass}\""
+            echo "    }"
+        fi
         echo "}"
     } > "$_cfg"
 
@@ -1220,17 +1428,21 @@ write_ipsec_conf_conn() {
     _leftid="%any"
     [ -n "$_user" ] && _leftid="$_user"
 
-    # Prefer PKCS#12 in secrets (works for RSA/EC). Fall back to key file.
+    # Prefer PKCS#12 in secrets (works for RSA/EC). Also list absolute key paths.
     _p12abs="$IPSEC_DIR/$_id/client.p12"
+    _keyabs="/etc/ipsec.d/private/sbvpn_client.key"
     _pass=$(cat "$_dir/pass" 2>/dev/null)
+    sanitize_pem_file "$_dir/client.pem" /etc/ipsec.d/certs/sbvpn_client.pem || true
+    sanitize_pem_file "$_dir/client.key" "$_keyabs" || cp -f "$_dir/client.key" "$_keyabs"
+    normalize_private_key "$_keyabs" || true
+    chmod 600 "$_keyabs"
     {
         echo "# sbvpn-secrets-begin"
         if [ -s "$_p12abs" ]; then
             echo ": P12 ${_p12abs} \"${_pass}\""
-        else
-            echo ": RSA sbvpn_client.key"
-            echo ": ECDSA sbvpn_client.key"
         fi
+        echo ": RSA ${_keyabs}"
+        echo ": ECDSA ${_keyabs}"
         echo "# sbvpn-secrets-end"
     } > /tmp/sb_ipsec.secrets.frag
     if [ -f /etc/ipsec.secrets ]; then
@@ -1477,6 +1689,11 @@ start_ipsec() {
         echo "[System] Diagnostics: swanctl=$(command -v swanctl) ipsec=$(command -v ipsec)" >> "$LOG_FILE"
         echo "[System] strongswan.conf paths:" >> "$LOG_FILE"
         ls -la /etc/strongswan.conf /etc/strongswan/strongswan.conf >> "$LOG_FILE" 2>&1 || true
+        ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' >> "$LOG_FILE" || true
+        if ! charon_has_x509; then
+            echo "[System] ROOT CAUSE: missing strongswan x509/pkcs1 plugins." >> "$LOG_FILE"
+            echo "[System] Fix: opkg update && opkg install strongswan-default strongswan-mod-x509 strongswan-mod-pkcs1" >> "$LOG_FILE"
+        fi
         swanctl --version >> "$LOG_FILE" 2>&1 || true
         ipsec version >> "$LOG_FILE" 2>&1 || true
         return 1
