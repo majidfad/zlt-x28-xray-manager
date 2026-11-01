@@ -36,6 +36,12 @@ chmod +x /tmp/sb-install-ss-plugins
 /tmp/sb-install-ss-plugins
 ```
 
-Check: `ping -c1 raw.githubusercontent.com`
-`df -h / /data /customer`
-`mount | grep ipsec`
+Check:
+
+```sh
+ping -c1 raw.githubusercontent.com
+df -h / /data /customer
+sb-manager ss_check
+```
+
+Expect: `charon_version_tag: 5.9.2 OK` and `x509_loaded: YES` after Activate.

@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec16"
+INSTALLER_VERSION="2026.11.01-ipsec17"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -263,8 +263,8 @@ cat << 'SB_SSPLUG_EOF' > /tmp/sb-install-ss-plugins
 #!/bin/sh
 # Install matched strongSwan 5.9.2 stack for Amnezia on OEM ZLT.
 # Fetches ONLY sb-swan.tgz from GitHub (no full git clone, no OpenWrt CDN).
-# Stores binaries on /data or /customer (large), bind-mounts into /usr/lib/ipsec
-# so the tiny root overlay is not filled.
+# Stores binaries on /data or /customer (large). Links/bind-mounts into
+# /usr/lib/ipsec so the tiny root overlay is not filled.
 set -e
 IPSEC_LIB=/usr/lib/ipsec
 WORK=/tmp/sb_swan_dl
@@ -275,10 +275,9 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec16"
+STACK_VER="5.9.2-ipsec17"
 
 free_kb() {
-    # Available KiB on the filesystem containing $1 (BusyBox df -k).
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
 }
 
@@ -297,7 +296,6 @@ try_exec() {
 }
 
 pick_stack_root() {
-    # Prefer large partitions. Remount exec if needed (/data is often noexec).
     for _base in /data /customer /opt; do
         [ -d "$_base" ] || continue
         _avail=$(free_kb "$_base")
@@ -310,7 +308,6 @@ pick_stack_root() {
             echo "$_base/sb-swan"
             return 0
         fi
-        # Try remount with exec (common on ZLT /data).
         mount -o remount,rw,exec "$_base" 2>/dev/null || true
         if try_exec "$_base/sb-swan"; then
             echo "$_base/sb-swan"
@@ -374,7 +371,6 @@ backup_oem() {
     if [ -d "$BAK/done" ]; then
         return 0
     fi
-    # Only backup if /usr/lib/ipsec is not already our bind mount.
     if mount | grep -q " on $IPSEC_LIB "; then
         echo "[ss-plugins] $IPSEC_LIB already bind-mounted; skip OEM bak"
         return 0
@@ -388,6 +384,45 @@ backup_oem() {
     echo "[ss-plugins] OEM backup -> $BAK"
 }
 
+link_one() {
+    _src="$1"
+    _dst="$2"
+    [ -e "$_src" ] || return 0
+    # Remove real file/dir so symlink can take its place on overlay.
+    rm -rf "$_dst"
+    ln -sf "$_src" "$_dst"
+}
+
+symlink_stack_into_system() {
+    OPT="$1"
+    SRC="$OPT/lib/ipsec"
+    echo "[ss-plugins] symlinking $SRC -> $IPSEC_LIB (tiny overlay use)"
+    mkdir -p "$IPSEC_LIB/plugins"
+    for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+        link_one "$SRC/$f" "$IPSEC_LIB/$f"
+    done
+    # Drop OEM-only plugins that confuse ABI, then link ours.
+    for so in "$SRC/plugins/"*.so; do
+        [ -f "$so" ] || continue
+        bn=$(basename "$so")
+        link_one "$so" "$IPSEC_LIB/plugins/$bn"
+    done
+    # Prefer matched swanctl/ipsec on PATH (keep OEM as *.oem.bak if present).
+    for b in swanctl ipsec; do
+        if [ -x "$OPT/sbin/$b" ]; then
+            for d in /usr/sbin /usr/bin /sbin /bin; do
+                if [ -e "$d/$b" ] && [ ! -L "$d/$b" ]; then
+                    mv -f "$d/$b" "$d/${b}.oem.bak" 2>/dev/null || true
+                fi
+                if [ -d "$d" ]; then
+                    link_one "$OPT/sbin/$b" "$d/$b"
+                    break
+                fi
+            done
+        fi
+    done
+}
+
 write_bind_helper() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
@@ -395,73 +430,100 @@ write_bind_helper() {
     echo "$SRC" > "$BIND_FLAG"
     cat > "$INIT_SCRIPT" << EOF
 #!/bin/sh /etc/rc.common
-# Remount matched strongSwan stack from large partition into $IPSEC_LIB
+# Ensure matched strongSwan 5.9.2 stack is visible under $IPSEC_LIB
 START=15
 STOP=85
 SRC="$SRC"
 DST="$IPSEC_LIB"
+OPT="$OPT"
 start() {
     [ -x "\$SRC/charon" ] || return 1
-    # Ensure parent allows exec (ZLT /data often noexec).
     case "\$SRC" in
         /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
         /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
     esac
-    mkdir -p "\$DST"
-    if mount | grep -q " on \$DST "; then
-        return 0
-    fi
-    mount --bind "\$SRC" "\$DST" || return 1
+    mkdir -p "\$DST/plugins"
+    # Re-apply symlinks (survive OEM package upgrades).
+    for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+        [ -e "\$SRC/\$f" ] || continue
+        rm -rf "\$DST/\$f"
+        ln -sf "\$SRC/\$f" "\$DST/\$f"
+    done
+    for so in "\$SRC/plugins/"*.so; do
+        [ -f "\$so" ] || continue
+        bn=\$(basename "\$so")
+        rm -rf "\$DST/plugins/\$bn"
+        ln -sf "\$so" "\$DST/plugins/\$bn"
+    done
+    for b in swanctl ipsec; do
+        [ -x "\$OPT/sbin/\$b" ] || continue
+        for d in /usr/sbin /usr/bin /sbin /bin; do
+            [ -d "\$d" ] || continue
+            rm -rf "\$d/\$b"
+            ln -sf "\$OPT/sbin/\$b" "\$d/\$b"
+            break
+        done
+    done
 }
 stop() {
-    if mount | grep -q " on \$DST "; then
-        umount "\$DST" 2>/dev/null || umount -l "\$DST" 2>/dev/null || true
-    fi
+    return 0
 }
 EOF
     chmod +x "$INIT_SCRIPT"
-    # Enable at boot (OpenWrt). Ignore failures on non-procd systems.
     if [ -x /etc/rc.common ] || [ -d /etc/rc.d ]; then
         "$INIT_SCRIPT" enable 2>/dev/null || ln -sf "../init.d/sb-swan-bind" /etc/rc.d/S15sb-swan-bind 2>/dev/null || true
     fi
-    # Also hook rc.local as fallback
     if [ -f /etc/rc.local ]; then
         grep -q 'sb-swan-bind\|sb-swan/lib/ipsec' /etc/rc.local 2>/dev/null || \
             sed -i 's|^exit 0|/etc/init.d/sb-swan-bind start 2>/dev/null || true\nexit 0|' /etc/rc.local 2>/dev/null || true
     fi
 }
 
+verify_stack() {
+    OPT="$1"
+    echo "[ss-plugins] verifying matched stack is active..."
+    _ok=1
+    if ! grep -aq '5\.9\.2' "$IPSEC_LIB/charon" 2>/dev/null; then
+        echo "[ss-plugins] FAIL: $IPSEC_LIB/charon is NOT 5.9.2 (still OEM?)" >&2
+        ls -la "$IPSEC_LIB/charon" >&2 || true
+        _ok=0
+    else
+        echo "[ss-plugins] OK charon is 5.9.2 (-> $(readlink -f "$IPSEC_LIB/charon" 2>/dev/null || readlink "$IPSEC_LIB/charon" 2>/dev/null || echo '?'))"
+    fi
+    for p in x509 pkcs1 openssl; do
+        if [ ! -s "$IPSEC_LIB/plugins/libstrongswan-${p}.so" ]; then
+            echo "[ss-plugins] FAIL: missing libstrongswan-${p}.so" >&2
+            _ok=0
+        else
+            echo "[ss-plugins] OK plugin $p (-> $(readlink "$IPSEC_LIB/plugins/libstrongswan-${p}.so" 2>/dev/null || echo file))"
+        fi
+    done
+    if command -v swanctl >/dev/null 2>&1; then
+        _sv=$(swanctl --version 2>/dev/null | head -n1 || true)
+        echo "[ss-plugins] swanctl: $_sv"
+        echo "$_sv" | grep -q '5\.9\.2' || {
+            echo "[ss-plugins] WARN: swanctl is not 5.9.2 — PATH may still hit OEM"
+            ls -la "$(command -v swanctl)" 2>&1 || true
+        }
+    fi
+    [ "$_ok" = "1" ]
+}
+
 bind_deploy() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
-    echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (no copy onto overlay)"
     # Stop strongSwan so files are not busy
     ipsec stop 2>/dev/null || true
     /etc/init.d/ipsec stop 2>/dev/null || true
-    killall charon 2>/dev/null || true
+    killall charon starter 2>/dev/null || true
     sleep 1
-    # Drop previous bind
+    # Drop previous bind if any (we prefer symlinks — more reliable on OEM).
     if mount | grep -q " on $IPSEC_LIB "; then
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
     fi
-    mkdir -p "$IPSEC_LIB"
-    mount --bind "$SRC" "$IPSEC_LIB" || {
-        echo "[ss-plugins] bind-mount failed; falling back to symlinks" >&2
-        # Symlink fallback (still almost zero overlay use)
-        for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
-            [ -e "$SRC/$f" ] || continue
-            rm -rf "$IPSEC_LIB/$f"
-            ln -sf "$SRC/$f" "$IPSEC_LIB/$f"
-        done
-        mkdir -p "$IPSEC_LIB/plugins"
-        for so in "$SRC/plugins/"*.so; do
-            [ -f "$so" ] || continue
-            bn=$(basename "$so")
-            rm -rf "$IPSEC_LIB/plugins/$bn"
-            ln -sf "$so" "$IPSEC_LIB/plugins/$bn"
-        done
-    }
+    symlink_stack_into_system "$OPT"
     write_bind_helper "$OPT"
+    "$INIT_SCRIPT" start 2>/dev/null || true
     # Tiny conf snippets on overlay (few KB)
     mkdir -p /etc/strongswan.d/charon /etc/singbox
     if [ -d "$OPT/etc/strongswan.d/charon" ]; then
@@ -477,10 +539,8 @@ bind_deploy() {
 # ---- main ----
 echo "[ss-plugins] deploying matched strongSwan 5.9.2 stack (GitHub, large partition)..."
 
-# Drop failed/partial overlay copies that filled the rootfs
 echo "[ss-plugins] freeing overlay junk from earlier installs..."
 rm -rf /opt/sb-swan /tmp/sb_swan_dl /etc/singbox/ss-plugins
-# Old bak on overlay eats space — remove if we will re-bak onto large FS
 if [ -d /etc/singbox/ss-oem-ipsec-bak ]; then
     rm -rf /etc/singbox/ss-oem-ipsec-bak
 fi
@@ -517,13 +577,11 @@ ls -la "$IPSEC_LIB/charon" "$IPSEC_LIB/libstrongswan.so.0" \
        "$IPSEC_LIB/plugins/libstrongswan-openssl.so" 2>&1 || true
 df -h / /data /customer 2>/dev/null || df -h / || true
 
-if [ -s "$IPSEC_LIB/plugins/libstrongswan-x509.so" ] \
-    && [ -s "$IPSEC_LIB/libstrongswan.so.0" ] \
-    && [ -x "$IPSEC_LIB/charon" ]; then
+if verify_stack "$OPT"; then
     echo "[ss-plugins] credential stack ready (matched 5.9.2 @ $OPT)."
     exit 0
 fi
-echo "[ss-plugins] ERROR: stack deploy incomplete" >&2
+echo "[ss-plugins] ERROR: stack deploy incomplete — charon still not 5.9.2 or plugins missing" >&2
 exit 1
 SB_SSPLUG_EOF
 chmod +x /tmp/sb-install-ss-plugins
@@ -670,7 +728,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec16"
+SB_MANAGER_VERSION="2026.11.01-ipsec17"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1125,7 +1183,86 @@ get_server_ip() {
 }
 
 have_strongswan() {
+    prefer_matched_ss_bins
     command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1
+}
+
+# Resolve stack root written by sb-install-ss-plugins.
+ss_stack_root() {
+    _r=$(cat /etc/singbox/ss-stack.root 2>/dev/null || true)
+    [ -n "$_r" ] && [ -x "$_r/lib/ipsec/charon" ] && { echo "$_r"; return 0; }
+    [ -x /data/sb-swan/lib/ipsec/charon ] && { echo /data/sb-swan; return 0; }
+    [ -x /customer/sb-swan/lib/ipsec/charon ] && { echo /customer/sb-swan; return 0; }
+    return 1
+}
+
+# Put matched 5.9.2 swanctl/ipsec first on PATH.
+prefer_matched_ss_bins() {
+    _r=$(ss_stack_root 2>/dev/null || true)
+    [ -n "$_r" ] || return 0
+    case "$_r" in
+        /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+        /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+    esac
+    if [ -d "$_r/sbin" ]; then
+        case ":$PATH:" in
+            *":$_r/sbin:"*) ;;
+            *) export PATH="$_r/sbin:$PATH" ;;
+        esac
+    fi
+    mkdir -p /tmp/sb-ss-bin
+    [ -x "$_r/sbin/swanctl" ] && ln -sf "$_r/sbin/swanctl" /tmp/sb-ss-bin/swanctl
+    [ -x "$_r/sbin/ipsec" ] && ln -sf "$_r/sbin/ipsec" /tmp/sb-ss-bin/ipsec
+    case ":$PATH:" in
+        *":/tmp/sb-ss-bin:"*) ;;
+        *) export PATH="/tmp/sb-ss-bin:$PATH" ;;
+    esac
+}
+
+# 0 if /usr/lib/ipsec/charon is the matched 5.9.2 binary (not OEM 5.9.1).
+charon_is_matched() {
+    [ -e /usr/lib/ipsec/charon ] || return 1
+    grep -aq '5\.9\.2' /usr/lib/ipsec/charon 2>/dev/null
+}
+
+# Print a human check report (also used as sb-manager ss_check).
+ss_check() {
+    prefer_matched_ss_bins
+    echo "=== sb-manager ss_check ($SB_MANAGER_VERSION) ==="
+    echo "--- space ---"
+    df -h / /data /customer 2>/dev/null || df -h /
+    echo "--- stack markers ---"
+    echo "ss-stack.ver=$(cat /etc/singbox/ss-stack.ver 2>/dev/null || echo MISSING)"
+    echo "ss-stack.root=$(cat /etc/singbox/ss-stack.root 2>/dev/null || echo MISSING)"
+    _r=$(ss_stack_root 2>/dev/null || echo "")
+    echo "resolved_root=${_r:-NONE}"
+    if [ -n "$_r" ]; then
+        ls -la "$_r/lib/ipsec/charon" "$_r/lib/ipsec/plugins/libstrongswan-x509.so" 2>&1 || true
+    fi
+    echo "--- /usr/lib/ipsec (should be symlinks into stack) ---"
+    ls -la /usr/lib/ipsec/charon /usr/lib/ipsec/libstrongswan.so.0 \
+           /usr/lib/ipsec/plugins/libstrongswan-x509.so \
+           /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so \
+           /usr/lib/ipsec/plugins/libstrongswan-openssl.so 2>&1 || true
+    if charon_is_matched; then
+        echo "charon_version_tag: 5.9.2 OK"
+    else
+        echo "charon_version_tag: NOT 5.9.2 (OEM still active — certs WILL fail)"
+    fi
+    echo "--- tools ---"
+    echo "swanctl_path=$(command -v swanctl 2>/dev/null || echo missing)"
+    swanctl --version 2>&1 | head -n2 || true
+    echo "ipsec_path=$(command -v ipsec 2>/dev/null || echo missing)"
+    ipsec version 2>&1 | head -n2 || true
+    echo "--- running plugins ---"
+    ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' || echo "(charon not running)"
+    if charon_has_x509; then
+        echo "x509_loaded: YES"
+    else
+        echo "x509_loaded: NO  << this is why PEM/PKCS#12 parse fails"
+    fi
+    echo "=== end ss_check ==="
+    charon_is_matched && [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ]
 }
 
 clean_iptables() {
@@ -1444,23 +1581,30 @@ install_local_strongswan_plugins() {
     [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && _need_stack=1
     [ ! -s /usr/lib/ipsec/plugins/libstrongswan-openssl.so ] && _need_stack=1
     [ ! -s /usr/lib/ipsec/libstrongswan.so.0 ] && _need_stack=1
+    charon_is_matched || _need_stack=1
     # Marker written by sb-install-ss-plugins after full stack deploy
-    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec16" ] && _need_stack=1
+    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec17" ] && _need_stack=1
 
-    # Re-apply bind mount if stack lives on /data|/customer but mount was lost
-    _root=$(cat /etc/singbox/ss-stack.root 2>/dev/null || true)
-    [ -z "$_root" ] && [ -x /data/sb-swan/lib/ipsec/charon ] && _root=/data/sb-swan
-    [ -z "$_root" ] && [ -x /customer/sb-swan/lib/ipsec/charon ] && _root=/customer/sb-swan
+    # Re-apply symlinks/bind if stack lives on /data|/customer
+    _root=$(ss_stack_root 2>/dev/null || true)
     if [ -n "$_root" ] && [ -x "$_root/lib/ipsec/charon" ]; then
-        case "$_root" in
-            /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
-            /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
-        esac
-        if ! mount | grep -q ' on /usr/lib/ipsec '; then
-            echo "[System] bind-mount $_root/lib/ipsec -> /usr/lib/ipsec" >> "$LOG_FILE"
-            mount --bind "$_root/lib/ipsec" /usr/lib/ipsec 2>>"$LOG_FILE" || true
-        fi
         /etc/init.d/sb-swan-bind start 2>/dev/null || true
+        # Inline re-link if init script missing
+        if ! charon_is_matched; then
+            echo "[System] Re-linking $_root/lib/ipsec into /usr/lib/ipsec ..." >> "$LOG_FILE"
+            for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+                [ -e "$_root/lib/ipsec/$f" ] || continue
+                rm -rf "/usr/lib/ipsec/$f"
+                ln -sf "$_root/lib/ipsec/$f" "/usr/lib/ipsec/$f"
+            done
+            mkdir -p /usr/lib/ipsec/plugins
+            for so in "$_root/lib/ipsec/plugins/"*.so; do
+                [ -f "$so" ] || continue
+                bn=$(basename "$so")
+                rm -rf "/usr/lib/ipsec/plugins/$bn"
+                ln -sf "$so" "/usr/lib/ipsec/plugins/$bn"
+            done
+        fi
     fi
 
     if [ "$_need_stack" = "1" ]; then
@@ -1477,7 +1621,9 @@ install_local_strongswan_plugins() {
         echo "[System] Matched stack marker OK (ss-stack.ver)." >> "$LOG_FILE"
     fi
 
-    [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
+    prefer_matched_ss_bins
+    charon_is_matched \
+        && [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
         && [ -s /usr/lib/ipsec/libstrongswan.so.0 ]
 }
 
@@ -1974,9 +2120,23 @@ start_ipsec() {
         return 1
     fi
 
+    # MUST have matched 5.9.2 + x509 before any load — OEM 5.9.1 cannot parse PEM/P12.
+    if ! install_local_strongswan_plugins; then
+        echo "[System] ROOT CAUSE: matched strongSwan 5.9.2 stack not active." >> "$LOG_FILE"
+        echo "[System] OEM 5.9.1 has no usable x509/pkcs1 — cert parse will always fail." >> "$LOG_FILE"
+        echo "[System] Fix on router:" >> "$LOG_FILE"
+        echo "[System]   wget -O /tmp/sb-install-ss-plugins \\" >> "$LOG_FILE"
+        echo "[System]     'https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main/files/usr/bin/sb-install-ss-plugins'" >> "$LOG_FILE"
+        echo "[System]   chmod +x /tmp/sb-install-ss-plugins && /tmp/sb-install-ss-plugins" >> "$LOG_FILE"
+        echo "[System]   sb-manager ss_check" >> "$LOG_FILE"
+        ss_check >> "$LOG_FILE" 2>&1 || true
+        return 1
+    fi
+
     # MUST fix strongswan.conf before any swanctl/ipsec call — otherwise every
     # backend fails with identical "abort initialization due to invalid configuration".
     ensure_strongswan_conf || true
+    prefer_matched_ss_bins
 
     _id=$(cat "$ACTIVE_NODE_POINTER" 2>/dev/null)
     if [ -z "$_id" ]; then
@@ -2002,11 +2162,15 @@ start_ipsec() {
         echo "[System] strongswan.conf paths:" >> "$LOG_FILE"
         ls -la /etc/strongswan.conf /etc/strongswan/strongswan.conf >> "$LOG_FILE" 2>&1 || true
         ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' >> "$LOG_FILE" || true
-        if ! charon_has_x509; then
-            echo "[System] ROOT CAUSE: missing strongswan x509/pkcs1 .so on disk." >> "$LOG_FILE"
-            echo "[System] Fix: re-run install.sh $SB_MANAGER_VERSION OR scp repo plugins:" >> "$LOG_FILE"
-            echo "[System]   files/usr/lib/ipsec/plugins/libstrongswan-{x509,pkcs1,pkcs8,gcm}.so" >> "$LOG_FILE"
-            echo "[System]   -> /usr/lib/ipsec/plugins/  then restart IPsec" >> "$LOG_FILE"
+        ss_check >> "$LOG_FILE" 2>&1 || true
+        if ! charon_is_matched; then
+            echo "[System] ROOT CAUSE: still OEM charon 5.9.1 (matched stack not linked)." >> "$LOG_FILE"
+        elif ! charon_has_x509; then
+            if [ ! -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
+                echo "[System] ROOT CAUSE: libstrongswan-x509.so missing on disk." >> "$LOG_FILE"
+            else
+                echo "[System] ROOT CAUSE: x509.so present but not in loaded plugins (conf/ABI)." >> "$LOG_FILE"
+            fi
         fi
         swanctl --version >> "$LOG_FILE" 2>&1 || true
         ipsec version >> "$LOG_FILE" 2>&1 || true
@@ -2113,6 +2277,10 @@ case "$1" in
     start) start_sb; exit 0 ;;
     stop) stop_sb; exit 0 ;;
     restart) stop_sb; sleep 1; start_sb; exit 0 ;;
+    ss_check|check_ss)
+        ss_check
+        exit $?
+        ;;
     status)
         if [ "$(cat "$PROTO_POINTER" 2>/dev/null)" = "ipsec" ]; then
             if is_ipsec_running; then echo "Running (Amnezia IPsec)"; else echo "Stopped"; fi
@@ -2178,7 +2346,7 @@ case "$1" in
     led_status) cat "$WATCHDOG_STATUS_FILE" 2>/dev/null || echo "offline"; exit 0 ;;
     daemon_watchdog) daemon_watchdog; exit 0 ;;
     *)
-        echo "Usage: sb-manager {start|stop|restart|status|active|switch <id>|addnode <id> <linkfile>|delnode <id>|listnodes|nodetype [id]|mode_toggle <tunnel|proxy>|mode_status|watchdog_toggle <0|1>|watchdog_status|led_status}"
+        echo "Usage: sb-manager {start|stop|restart|status|ss_check|active|switch <id>|addnode <id> <linkfile>|delnode <id>|listnodes|nodetype [id]|mode_toggle <tunnel|proxy>|mode_status|watchdog_toggle <0|1>|watchdog_status|led_status}"
         exit 1
         ;;
 esac
