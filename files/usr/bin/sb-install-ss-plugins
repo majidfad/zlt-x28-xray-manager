@@ -13,7 +13,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec17"
+STACK_VER="5.9.2-ipsec18"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -247,6 +247,37 @@ verify_stack() {
     [ "$_ok" = "1" ]
 }
 
+free_ipsec_overlay_copies() {
+    # Real .so / binary copies on overlay fill the 23MB rootfs. Delete them so
+    # bind-mount or symlinks can take over. Stack on /data keeps the real files.
+    echo "[ss-plugins] removing overlay copies under $IPSEC_LIB (free space)..."
+    # Must not delete while bind-mounted over the stack itself
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    fi
+    rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
+          "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
+          "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
+    rm -f "$IPSEC_LIB"/plugins/*.so 2>/dev/null || true
+    df -h / 2>/dev/null | while read -r _l; do echo "[ss-plugins]   $_l"; done || true
+}
+
+overlay_free_kb() {
+    free_kb /
+}
+
+bind_mount_stack() {
+    OPT="$1"
+    SRC="$OPT/lib/ipsec"
+    [ -x "$SRC/charon" ] || return 1
+    mkdir -p "$IPSEC_LIB"
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    fi
+    echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (works even if overlay is full)"
+    mount --bind "$SRC" "$IPSEC_LIB"
+}
+
 bind_deploy() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
@@ -255,23 +286,96 @@ bind_deploy() {
     /etc/init.d/ipsec stop 2>/dev/null || true
     killall charon starter 2>/dev/null || true
     sleep 1
-    # Drop previous bind if any (we prefer symlinks — more reliable on OEM).
-    if mount | grep -q " on $IPSEC_LIB "; then
-        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+
+    free_ipsec_overlay_copies
+
+    _ov=$(overlay_free_kb)
+    [ -n "$_ov" ] || _ov=0
+    echo "[ss-plugins] overlay free ${_ov}K"
+
+    # Prefer bind-mount: no new overlay inodes needed (critical when / is 100%).
+    if bind_mount_stack "$OPT"; then
+        echo "[ss-plugins] bind-mount OK"
+    else
+        echo "[ss-plugins] bind-mount failed; trying symlinks (needs overlay free space)"
+        symlink_stack_into_system "$OPT"
     fi
-    symlink_stack_into_system "$OPT"
+
+    # swanctl/ipsec: always expose via /tmp (tmpfs) so PATH works without overlay.
+    mkdir -p /tmp/sb-ss-bin
+    [ -x "$OPT/sbin/swanctl" ] && ln -sf "$OPT/sbin/swanctl" /tmp/sb-ss-bin/swanctl
+    [ -x "$OPT/sbin/ipsec" ] && ln -sf "$OPT/sbin/ipsec" /tmp/sb-ss-bin/ipsec
+    # Best-effort system PATH links if overlay has room
+    if [ "$_ov" -gt 64 ] || [ "$(overlay_free_kb)" -gt 64 ]; then
+        for b in swanctl ipsec; do
+            [ -x "$OPT/sbin/$b" ] || continue
+            for d in /usr/sbin /usr/bin; do
+                [ -d "$d" ] || continue
+                if [ -e "$d/$b" ] && [ ! -L "$d/$b" ]; then
+                    mv -f "$d/$b" "$d/${b}.oem.bak" 2>/dev/null || true
+                fi
+                rm -rf "$d/$b" 2>/dev/null || true
+                ln -sf "$OPT/sbin/$b" "$d/$b" 2>/dev/null || true
+                break
+            done
+        done
+    fi
+
     write_bind_helper "$OPT"
+    # Rewrite init to re-bind (not only symlink) on boot
+    cat > "$INIT_SCRIPT" << EOF
+#!/bin/sh /etc/rc.common
+START=15
+STOP=85
+SRC="$SRC"
+DST="$IPSEC_LIB"
+OPT="$OPT"
+start() {
+    [ -x "\$SRC/charon" ] || return 1
+    case "\$SRC" in
+        /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+        /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+    esac
+    mkdir -p /tmp/sb-ss-bin
+    [ -x "\$OPT/sbin/swanctl" ] && ln -sf "\$OPT/sbin/swanctl" /tmp/sb-ss-bin/swanctl
+    [ -x "\$OPT/sbin/ipsec" ] && ln -sf "\$OPT/sbin/ipsec" /tmp/sb-ss-bin/ipsec
+    mkdir -p "\$DST"
+    if mount | grep -q " on \$DST "; then
+        return 0
+    fi
+    mount --bind "\$SRC" "\$DST" && return 0
+    # fallback symlinks
+    mkdir -p "\$DST/plugins"
+    for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+        [ -e "\$SRC/\$f" ] || continue
+        rm -rf "\$DST/\$f"; ln -sf "\$SRC/\$f" "\$DST/\$f"
+    done
+    for so in "\$SRC/plugins/"*.so; do
+        [ -f "\$so" ] || continue
+        bn=\$(basename "\$so")
+        rm -rf "\$DST/plugins/\$bn"; ln -sf "\$so" "\$DST/plugins/\$bn"
+    done
+}
+stop() {
+    if mount | grep -q " on \$DST "; then
+        umount "\$DST" 2>/dev/null || umount -l "\$DST" 2>/dev/null || true
+    fi
+}
+EOF
+    chmod +x "$INIT_SCRIPT"
+    "$INIT_SCRIPT" enable 2>/dev/null || true
     "$INIT_SCRIPT" start 2>/dev/null || true
-    # Tiny conf snippets on overlay (few KB)
-    mkdir -p /etc/strongswan.d/charon /etc/singbox
+
+    # Tiny conf snippets — skip if overlay still full
+    mkdir -p /etc/strongswan.d/charon /etc/singbox 2>/dev/null || true
     if [ -d "$OPT/etc/strongswan.d/charon" ]; then
         cp -f "$OPT/etc/strongswan.d/charon/"*.conf /etc/strongswan.d/charon/ 2>/dev/null || true
     fi
     for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
-        printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf"
+        printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
     done
-    echo "$STACK_VER" > "$MARKER"
-    echo "$OPT" > /etc/singbox/ss-stack.root
+    echo "$STACK_VER" > "$MARKER" 2>/dev/null || true
+    echo "$OPT" > /etc/singbox/ss-stack.root 2>/dev/null || echo "$OPT" > /tmp/ss-stack.root
 }
 
 # ---- main ----

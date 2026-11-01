@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec17"
+INSTALLER_VERSION="2026.11.01-ipsec18"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -275,7 +275,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec17"
+STACK_VER="5.9.2-ipsec18"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -509,6 +509,37 @@ verify_stack() {
     [ "$_ok" = "1" ]
 }
 
+free_ipsec_overlay_copies() {
+    # Real .so / binary copies on overlay fill the 23MB rootfs. Delete them so
+    # bind-mount or symlinks can take over. Stack on /data keeps the real files.
+    echo "[ss-plugins] removing overlay copies under $IPSEC_LIB (free space)..."
+    # Must not delete while bind-mounted over the stack itself
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    fi
+    rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
+          "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
+          "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
+    rm -f "$IPSEC_LIB"/plugins/*.so 2>/dev/null || true
+    df -h / 2>/dev/null | while read -r _l; do echo "[ss-plugins]   $_l"; done || true
+}
+
+overlay_free_kb() {
+    free_kb /
+}
+
+bind_mount_stack() {
+    OPT="$1"
+    SRC="$OPT/lib/ipsec"
+    [ -x "$SRC/charon" ] || return 1
+    mkdir -p "$IPSEC_LIB"
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    fi
+    echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (works even if overlay is full)"
+    mount --bind "$SRC" "$IPSEC_LIB"
+}
+
 bind_deploy() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
@@ -517,23 +548,96 @@ bind_deploy() {
     /etc/init.d/ipsec stop 2>/dev/null || true
     killall charon starter 2>/dev/null || true
     sleep 1
-    # Drop previous bind if any (we prefer symlinks — more reliable on OEM).
-    if mount | grep -q " on $IPSEC_LIB "; then
-        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+
+    free_ipsec_overlay_copies
+
+    _ov=$(overlay_free_kb)
+    [ -n "$_ov" ] || _ov=0
+    echo "[ss-plugins] overlay free ${_ov}K"
+
+    # Prefer bind-mount: no new overlay inodes needed (critical when / is 100%).
+    if bind_mount_stack "$OPT"; then
+        echo "[ss-plugins] bind-mount OK"
+    else
+        echo "[ss-plugins] bind-mount failed; trying symlinks (needs overlay free space)"
+        symlink_stack_into_system "$OPT"
     fi
-    symlink_stack_into_system "$OPT"
+
+    # swanctl/ipsec: always expose via /tmp (tmpfs) so PATH works without overlay.
+    mkdir -p /tmp/sb-ss-bin
+    [ -x "$OPT/sbin/swanctl" ] && ln -sf "$OPT/sbin/swanctl" /tmp/sb-ss-bin/swanctl
+    [ -x "$OPT/sbin/ipsec" ] && ln -sf "$OPT/sbin/ipsec" /tmp/sb-ss-bin/ipsec
+    # Best-effort system PATH links if overlay has room
+    if [ "$_ov" -gt 64 ] || [ "$(overlay_free_kb)" -gt 64 ]; then
+        for b in swanctl ipsec; do
+            [ -x "$OPT/sbin/$b" ] || continue
+            for d in /usr/sbin /usr/bin; do
+                [ -d "$d" ] || continue
+                if [ -e "$d/$b" ] && [ ! -L "$d/$b" ]; then
+                    mv -f "$d/$b" "$d/${b}.oem.bak" 2>/dev/null || true
+                fi
+                rm -rf "$d/$b" 2>/dev/null || true
+                ln -sf "$OPT/sbin/$b" "$d/$b" 2>/dev/null || true
+                break
+            done
+        done
+    fi
+
     write_bind_helper "$OPT"
+    # Rewrite init to re-bind (not only symlink) on boot
+    cat > "$INIT_SCRIPT" << EOF
+#!/bin/sh /etc/rc.common
+START=15
+STOP=85
+SRC="$SRC"
+DST="$IPSEC_LIB"
+OPT="$OPT"
+start() {
+    [ -x "\$SRC/charon" ] || return 1
+    case "\$SRC" in
+        /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+        /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+    esac
+    mkdir -p /tmp/sb-ss-bin
+    [ -x "\$OPT/sbin/swanctl" ] && ln -sf "\$OPT/sbin/swanctl" /tmp/sb-ss-bin/swanctl
+    [ -x "\$OPT/sbin/ipsec" ] && ln -sf "\$OPT/sbin/ipsec" /tmp/sb-ss-bin/ipsec
+    mkdir -p "\$DST"
+    if mount | grep -q " on \$DST "; then
+        return 0
+    fi
+    mount --bind "\$SRC" "\$DST" && return 0
+    # fallback symlinks
+    mkdir -p "\$DST/plugins"
+    for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+        [ -e "\$SRC/\$f" ] || continue
+        rm -rf "\$DST/\$f"; ln -sf "\$SRC/\$f" "\$DST/\$f"
+    done
+    for so in "\$SRC/plugins/"*.so; do
+        [ -f "\$so" ] || continue
+        bn=\$(basename "\$so")
+        rm -rf "\$DST/plugins/\$bn"; ln -sf "\$so" "\$DST/plugins/\$bn"
+    done
+}
+stop() {
+    if mount | grep -q " on \$DST "; then
+        umount "\$DST" 2>/dev/null || umount -l "\$DST" 2>/dev/null || true
+    fi
+}
+EOF
+    chmod +x "$INIT_SCRIPT"
+    "$INIT_SCRIPT" enable 2>/dev/null || true
     "$INIT_SCRIPT" start 2>/dev/null || true
-    # Tiny conf snippets on overlay (few KB)
-    mkdir -p /etc/strongswan.d/charon /etc/singbox
+
+    # Tiny conf snippets — skip if overlay still full
+    mkdir -p /etc/strongswan.d/charon /etc/singbox 2>/dev/null || true
     if [ -d "$OPT/etc/strongswan.d/charon" ]; then
         cp -f "$OPT/etc/strongswan.d/charon/"*.conf /etc/strongswan.d/charon/ 2>/dev/null || true
     fi
     for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
-        printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf"
+        printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
     done
-    echo "$STACK_VER" > "$MARKER"
-    echo "$OPT" > /etc/singbox/ss-stack.root
+    echo "$STACK_VER" > "$MARKER" 2>/dev/null || true
+    echo "$OPT" > /etc/singbox/ss-stack.root 2>/dev/null || echo "$OPT" > /tmp/ss-stack.root
 }
 
 # ---- main ----
@@ -728,7 +832,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec17"
+SB_MANAGER_VERSION="2026.11.01-ipsec18"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1239,7 +1343,8 @@ ss_check() {
     if [ -n "$_r" ]; then
         ls -la "$_r/lib/ipsec/charon" "$_r/lib/ipsec/plugins/libstrongswan-x509.so" 2>&1 || true
     fi
-    echo "--- /usr/lib/ipsec (should be symlinks into stack) ---"
+    echo "--- /usr/lib/ipsec (bind-mount or symlinks into stack) ---"
+    mount | grep ' on /usr/lib/ipsec ' || echo "(no bind-mount on /usr/lib/ipsec)"
     ls -la /usr/lib/ipsec/charon /usr/lib/ipsec/libstrongswan.so.0 \
            /usr/lib/ipsec/plugins/libstrongswan-x509.so \
            /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so \
@@ -1248,6 +1353,9 @@ ss_check() {
         echo "charon_version_tag: 5.9.2 OK"
     else
         echo "charon_version_tag: NOT 5.9.2 (OEM still active — certs WILL fail)"
+        echo "HINT: / is full? df -h /   then:"
+        echo "  rm -f /usr/lib/ipsec/plugins/*.so"
+        echo "  mount --bind /data/sb-swan/lib/ipsec /usr/lib/ipsec"
     fi
     echo "--- tools ---"
     echo "swanctl_path=$(command -v swanctl 2>/dev/null || echo missing)"
@@ -1583,27 +1691,42 @@ install_local_strongswan_plugins() {
     [ ! -s /usr/lib/ipsec/libstrongswan.so.0 ] && _need_stack=1
     charon_is_matched || _need_stack=1
     # Marker written by sb-install-ss-plugins after full stack deploy
-    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec17" ] && _need_stack=1
+    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec18" ] && _need_stack=1
 
-    # Re-apply symlinks/bind if stack lives on /data|/customer
+    # Re-apply bind/symlinks if stack lives on /data|/customer
     _root=$(ss_stack_root 2>/dev/null || true)
     if [ -n "$_root" ] && [ -x "$_root/lib/ipsec/charon" ]; then
+        case "$_root" in
+            /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+            /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+        esac
         /etc/init.d/sb-swan-bind start 2>/dev/null || true
-        # Inline re-link if init script missing
         if ! charon_is_matched; then
-            echo "[System] Re-linking $_root/lib/ipsec into /usr/lib/ipsec ..." >> "$LOG_FILE"
-            for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
-                [ -e "$_root/lib/ipsec/$f" ] || continue
-                rm -rf "/usr/lib/ipsec/$f"
-                ln -sf "$_root/lib/ipsec/$f" "/usr/lib/ipsec/$f"
-            done
-            mkdir -p /usr/lib/ipsec/plugins
-            for so in "$_root/lib/ipsec/plugins/"*.so; do
-                [ -f "$so" ] || continue
-                bn=$(basename "$so")
-                rm -rf "/usr/lib/ipsec/plugins/$bn"
-                ln -sf "$so" "/usr/lib/ipsec/plugins/$bn"
-            done
+            echo "[System] Activating $_root/lib/ipsec -> /usr/lib/ipsec ..." >> "$LOG_FILE"
+            # Free overlay copies that block / and prevent links
+            if ! mount | grep -q ' on /usr/lib/ipsec '; then
+                rm -f /usr/lib/ipsec/charon /usr/lib/ipsec/starter /usr/lib/ipsec/stroke \
+                      /usr/lib/ipsec/libstrongswan.so.0 /usr/lib/ipsec/libcharon.so.0 \
+                      /usr/lib/ipsec/libvici.so.0 /usr/lib/ipsec/plugins/*.so 2>/dev/null || true
+            fi
+            # Bind-mount needs NO free overlay space — prefer it
+            if ! mount | grep -q ' on /usr/lib/ipsec '; then
+                mount --bind "$_root/lib/ipsec" /usr/lib/ipsec 2>>"$LOG_FILE" || true
+            fi
+            if ! charon_is_matched; then
+                for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+                    [ -e "$_root/lib/ipsec/$f" ] || continue
+                    rm -rf "/usr/lib/ipsec/$f"
+                    ln -sf "$_root/lib/ipsec/$f" "/usr/lib/ipsec/$f"
+                done
+                mkdir -p /usr/lib/ipsec/plugins
+                for so in "$_root/lib/ipsec/plugins/"*.so; do
+                    [ -f "$so" ] || continue
+                    bn=$(basename "$so")
+                    rm -rf "/usr/lib/ipsec/plugins/$bn"
+                    ln -sf "$so" "/usr/lib/ipsec/plugins/$bn"
+                done
+            fi
         fi
     fi
 
