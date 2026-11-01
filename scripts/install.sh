@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec18"
+INSTALLER_VERSION="2026.11.01-ipsec19"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -275,7 +275,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec18"
+STACK_VER="5.9.2-ipsec19"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -323,8 +323,10 @@ http_get() {
     _out="$2"
     rm -f "$_out"
     echo "[ss-plugins] GET $_url"
+    # BusyBox wget has no -t/--tries
     if command -v wget >/dev/null 2>&1; then
-        wget -q -T 30 -t 3 -O "$_out" "$_url" && [ -s "$_out" ] && return 0
+        wget -q -T 60 -O "$_out" "$_url" && [ -s "$_out" ] && return 0
+        wget -q -T 60 --no-check-certificate -O "$_out" "$_url" && [ -s "$_out" ] && return 0
     fi
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --connect-timeout 15 --max-time 120 -o "$_out" "$_url" && [ -s "$_out" ] && return 0

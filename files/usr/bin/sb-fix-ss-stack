@@ -11,10 +11,9 @@ IPSEC_LIB=/usr/lib/ipsec
 echo "[fix-ss] === before ==="
 df -h / /data 2>/dev/null || df -h /
 echo "[fix-ss] overlay top users:"
-du -x -d1 / 2>/dev/null | sort -hr | head -n 15 || true
-du -x -d1 /usr 2>/dev/null | sort -hr | head -n 10 || true
-du -x -d1 /usr/lib 2>/dev/null | sort -hr | head -n 10 || true
-du -x -d1 /etc 2>/dev/null | sort -hr | head -n 10 || true
+du -x -d 1 / 2>/dev/null | sort -nr | head -n 15 || true
+du -x -d 1 /usr/lib 2>/dev/null | sort -nr | head -n 10 || true
+du -x -d 1 /etc 2>/dev/null | sort -nr | head -n 10 || true
 
 echo "[fix-ss] stopping strongSwan..."
 ipsec stop 2>/dev/null || true
@@ -77,8 +76,10 @@ if [ "$need_fetch" = "1" ]; then
     echo "[fix-ss] downloading full tarball..."
     rm -rf "$WORK"
     mkdir -p "$WORK"
+    # BusyBox wget: no -t/--tries; use -T timeout only.
     if command -v wget >/dev/null 2>&1; then
-        wget -q -T 30 -t 3 -O "$WORK/sb-swan.tgz" "$TGZ_URL"
+        wget -q -T 60 -O "$WORK/sb-swan.tgz" "$TGZ_URL" \
+            || wget -q -T 60 --no-check-certificate -O "$WORK/sb-swan.tgz" "$TGZ_URL"
     else
         curl -fsSL --connect-timeout 15 --max-time 120 -o "$WORK/sb-swan.tgz" "$TGZ_URL"
     fi
