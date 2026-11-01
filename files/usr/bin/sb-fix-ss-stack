@@ -26,10 +26,19 @@ if mount | grep -q " on $IPSEC_LIB "; then
 fi
 
 echo "[fix-ss] freeing overlay copies / junk..."
-rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
-      "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
-      "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
-rm -f "$IPSEC_LIB"/plugins/*.so 2>/dev/null || true
+# CRITICAL: never rm while bind-mounted — that wipes /data/sb-swan.
+if mount | grep -q " on $IPSEC_LIB "; then
+    umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    sleep 1
+fi
+if mount | grep -q " on $IPSEC_LIB "; then
+    echo "[fix-ss] WARN: still mounted $IPSEC_LIB — skip rm (protect /data stack)"
+else
+    rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
+          "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
+          "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
+    rm -f "$IPSEC_LIB"/plugins/*.so 2>/dev/null || true
+fi
 rm -rf /opt/sb-swan /etc/singbox/ss-plugins /etc/singbox/ss-oem-ipsec-bak \
        /tmp/sb_swan_dl /tmp/sb_ss_plugins.log 2>/dev/null || true
 # Truncate huge logs on overlay

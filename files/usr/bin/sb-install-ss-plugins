@@ -13,7 +13,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec20"
+STACK_VER="5.9.2-ipsec25"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -254,13 +254,28 @@ verify_stack() {
 }
 
 free_ipsec_overlay_copies() {
-    # Real .so / binary copies on overlay fill the 23MB rootfs. Delete them so
-    # bind-mount or symlinks can take over. Stack on /data keeps the real files.
-    echo "[ss-plugins] removing overlay copies under $IPSEC_LIB (free space)..."
-    # Must not delete while bind-mounted over the stack itself
+    # Real .so copies on overlay fill the 23MB rootfs. ONLY delete after the
+    # bind-mount is fully gone — otherwise rm wipes /data/sb-swan through the mount!
+    echo "[ss-plugins] freeing overlay copies under $IPSEC_LIB (safe)..."
+    killall charon starter 2>/dev/null || true
+    sleep 1
     if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[ss-plugins] umount $IPSEC_LIB before any delete"
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+        sleep 1
     fi
+    if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[ss-plugins] WARN: $IPSEC_LIB still mounted — SKIP delete (would wipe stack on /data)"
+        return 0
+    fi
+    # Refuse to delete if path resolves into our stack tree
+    _real=$(readlink -f "$IPSEC_LIB" 2>/dev/null || echo "$IPSEC_LIB")
+    case "$_real" in
+        /data/sb-swan/*|/customer/sb-swan/*)
+            echo "[ss-plugins] WARN: $IPSEC_LIB resolves to stack ($_real) — SKIP delete"
+            return 0
+            ;;
+    esac
     rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
           "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
           "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
@@ -275,15 +290,27 @@ overlay_free_kb() {
 bind_mount_stack() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
-    [ -f "$SRC/charon" ] || return 1
+    [ -f "$SRC/charon" ] || {
+        echo "[ss-plugins] bind_mount_stack: missing $SRC/charon" >&2
+        return 1
+    }
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    mount -o remount,rw,exec /customer 2>/dev/null || true
     chmod 755 "$SRC/charon" "$SRC/starter" "$SRC/stroke" 2>/dev/null || true
     chmod 755 "$SRC/"*.so* "$SRC/plugins/"*.so 2>/dev/null || true
-    mkdir -p "$IPSEC_LIB"
+    mkdir -p "$IPSEC_LIB" 2>/dev/null || true
     if mount | grep -q " on $IPSEC_LIB "; then
+        # Already bound to our stack? keep it
+        if [ -f "$IPSEC_LIB/charon" ] && grep -aq '5\.9\.2' "$IPSEC_LIB/charon" 2>/dev/null; then
+            echo "[ss-plugins] bind already active and looks like 5.9.2"
+            return 0
+        fi
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+        sleep 1
     fi
     echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (works even if overlay is full)"
-    mount --bind "$SRC" "$IPSEC_LIB"
+    mount --bind "$SRC" "$IPSEC_LIB" || return 1
+    [ -f "$IPSEC_LIB/charon" ] || return 1
 }
 
 bind_deploy() {
@@ -405,7 +432,9 @@ echo "[ss-plugins] stack root: $OPT (avail $(free_kb "$(dirname "$OPT")")K)"
 
 mkdir -p /etc/singbox "$IPSEC_LIB/plugins" /etc/strongswan.d/charon "$WORK"
 
-if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]; then
+# If a previous buggy run wiped the stack through a bind-mount, re-fetch.
+if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ] \
+    && [ -f "$OPT/sbin/swanctl" ] && grep -aq '5\.9\.2' "$OPT/lib/ipsec/charon" 2>/dev/null; then
     echo "[ss-plugins] using existing $OPT"
     chmod 755 "$OPT/lib/ipsec/charon" "$OPT/lib/ipsec/starter" \
               "$OPT/lib/ipsec/stroke" "$OPT/sbin/"* 2>/dev/null || true
@@ -416,6 +445,7 @@ else
     echo "[ss-plugins] ERROR: could not download stack from GitHub." >&2
     echo "[ss-plugins] Check WAN: ping -c1 raw.githubusercontent.com" >&2
     echo "[ss-plugins] URL: $SB_SWAN_TGZ_URL" >&2
+    echo "[ss-plugins] Also check: ls -la $OPT/lib/ipsec/" >&2
     exit 1
 fi
 

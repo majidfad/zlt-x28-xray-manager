@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec24"
+INSTALLER_VERSION="2026.11.01-ipsec25"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
@@ -275,7 +275,7 @@ INIT_SCRIPT=/etc/init.d/sb-swan-bind
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-STACK_VER="5.9.2-ipsec20"
+STACK_VER="5.9.2-ipsec25"
 
 free_kb() {
     df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
@@ -516,13 +516,28 @@ verify_stack() {
 }
 
 free_ipsec_overlay_copies() {
-    # Real .so / binary copies on overlay fill the 23MB rootfs. Delete them so
-    # bind-mount or symlinks can take over. Stack on /data keeps the real files.
-    echo "[ss-plugins] removing overlay copies under $IPSEC_LIB (free space)..."
-    # Must not delete while bind-mounted over the stack itself
+    # Real .so copies on overlay fill the 23MB rootfs. ONLY delete after the
+    # bind-mount is fully gone — otherwise rm wipes /data/sb-swan through the mount!
+    echo "[ss-plugins] freeing overlay copies under $IPSEC_LIB (safe)..."
+    killall charon starter 2>/dev/null || true
+    sleep 1
     if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[ss-plugins] umount $IPSEC_LIB before any delete"
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+        sleep 1
     fi
+    if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[ss-plugins] WARN: $IPSEC_LIB still mounted — SKIP delete (would wipe stack on /data)"
+        return 0
+    fi
+    # Refuse to delete if path resolves into our stack tree
+    _real=$(readlink -f "$IPSEC_LIB" 2>/dev/null || echo "$IPSEC_LIB")
+    case "$_real" in
+        /data/sb-swan/*|/customer/sb-swan/*)
+            echo "[ss-plugins] WARN: $IPSEC_LIB resolves to stack ($_real) — SKIP delete"
+            return 0
+            ;;
+    esac
     rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
           "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
           "$IPSEC_LIB"/libvici.so.0 2>/dev/null || true
@@ -537,15 +552,27 @@ overlay_free_kb() {
 bind_mount_stack() {
     OPT="$1"
     SRC="$OPT/lib/ipsec"
-    [ -f "$SRC/charon" ] || return 1
+    [ -f "$SRC/charon" ] || {
+        echo "[ss-plugins] bind_mount_stack: missing $SRC/charon" >&2
+        return 1
+    }
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    mount -o remount,rw,exec /customer 2>/dev/null || true
     chmod 755 "$SRC/charon" "$SRC/starter" "$SRC/stroke" 2>/dev/null || true
     chmod 755 "$SRC/"*.so* "$SRC/plugins/"*.so 2>/dev/null || true
-    mkdir -p "$IPSEC_LIB"
+    mkdir -p "$IPSEC_LIB" 2>/dev/null || true
     if mount | grep -q " on $IPSEC_LIB "; then
+        # Already bound to our stack? keep it
+        if [ -f "$IPSEC_LIB/charon" ] && grep -aq '5\.9\.2' "$IPSEC_LIB/charon" 2>/dev/null; then
+            echo "[ss-plugins] bind already active and looks like 5.9.2"
+            return 0
+        fi
         umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+        sleep 1
     fi
     echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (works even if overlay is full)"
-    mount --bind "$SRC" "$IPSEC_LIB"
+    mount --bind "$SRC" "$IPSEC_LIB" || return 1
+    [ -f "$IPSEC_LIB/charon" ] || return 1
 }
 
 bind_deploy() {
@@ -667,7 +694,9 @@ echo "[ss-plugins] stack root: $OPT (avail $(free_kb "$(dirname "$OPT")")K)"
 
 mkdir -p /etc/singbox "$IPSEC_LIB/plugins" /etc/strongswan.d/charon "$WORK"
 
-if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]; then
+# If a previous buggy run wiped the stack through a bind-mount, re-fetch.
+if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ] \
+    && [ -f "$OPT/sbin/swanctl" ] && grep -aq '5\.9\.2' "$OPT/lib/ipsec/charon" 2>/dev/null; then
     echo "[ss-plugins] using existing $OPT"
     chmod 755 "$OPT/lib/ipsec/charon" "$OPT/lib/ipsec/starter" \
               "$OPT/lib/ipsec/stroke" "$OPT/sbin/"* 2>/dev/null || true
@@ -678,6 +707,7 @@ else
     echo "[ss-plugins] ERROR: could not download stack from GitHub." >&2
     echo "[ss-plugins] Check WAN: ping -c1 raw.githubusercontent.com" >&2
     echo "[ss-plugins] URL: $SB_SWAN_TGZ_URL" >&2
+    echo "[ss-plugins] Also check: ls -la $OPT/lib/ipsec/" >&2
     exit 1
 fi
 
@@ -845,7 +875,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec24"
+SB_MANAGER_VERSION="2026.11.01-ipsec25"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1306,10 +1336,19 @@ have_strongswan() {
 
 # Resolve stack root written by sb-install-ss-plugins.
 ss_stack_root() {
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    mount -o remount,rw,exec /customer 2>/dev/null || true
     _r=$(cat /etc/singbox/ss-stack.root 2>/dev/null || true)
-    [ -n "$_r" ] && [ -x "$_r/lib/ipsec/charon" ] && { echo "$_r"; return 0; }
-    [ -x /data/sb-swan/lib/ipsec/charon ] && { echo /data/sb-swan; return 0; }
-    [ -x /customer/sb-swan/lib/ipsec/charon ] && { echo /customer/sb-swan; return 0; }
+    [ -z "$_r" ] && _r=$(cat /tmp/ss-stack.root 2>/dev/null || true)
+    for _cand in "$_r" /data/sb-swan /customer/sb-swan; do
+        [ -n "$_cand" ] || continue
+        [ -f "$_cand/lib/ipsec/charon" ] || continue
+        chmod 755 "$_cand/lib/ipsec/charon" 2>/dev/null || true
+        if [ -x "$_cand/lib/ipsec/charon" ] || [ -f "$_cand/lib/ipsec/charon" ]; then
+            echo "$_cand"
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -1720,54 +1759,54 @@ install_local_strongswan_plugins() {
     [ ! -s /usr/lib/ipsec/libstrongswan.so.0 ] && _need_stack=1
     charon_is_matched || _need_stack=1
     # Marker written by sb-install-ss-plugins after full stack deploy
-    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec18" ] && _need_stack=1
+    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec25" ] && _need_stack=1
 
-    # Re-apply bind/symlinks if stack lives on /data|/customer
+    # Re-apply bind if stack lives on /data|/customer (lost after reboot).
+    # NEVER rm through a live bind — that deletes /data/sb-swan.
     _root=$(ss_stack_root 2>/dev/null || true)
-    if [ -n "$_root" ] && [ -x "$_root/lib/ipsec/charon" ]; then
+    if [ -n "$_root" ] && [ -f "$_root/lib/ipsec/charon" ]; then
         case "$_root" in
             /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
             /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
         esac
+        chmod 755 "$_root/lib/ipsec/charon" "$_root/lib/ipsec/"*.so* \
+                  "$_root/lib/ipsec/plugins/"*.so 2>/dev/null || true
         /etc/init.d/sb-swan-bind start 2>/dev/null || true
         if ! charon_is_matched; then
             echo "[System] Activating $_root/lib/ipsec -> /usr/lib/ipsec ..." >> "$LOG_FILE"
-            # Free overlay copies that block / and prevent links
+            if mount | grep -q ' on /usr/lib/ipsec '; then
+                # Wrong/empty bind (e.g. wiped tree) — replace
+                if [ ! -f /usr/lib/ipsec/charon ]; then
+                    umount /usr/lib/ipsec 2>/dev/null || umount -l /usr/lib/ipsec 2>/dev/null || true
+                fi
+            fi
             if ! mount | grep -q ' on /usr/lib/ipsec '; then
+                # Only delete overlay copies when NOT bind-mounted
                 rm -f /usr/lib/ipsec/charon /usr/lib/ipsec/starter /usr/lib/ipsec/stroke \
                       /usr/lib/ipsec/libstrongswan.so.0 /usr/lib/ipsec/libcharon.so.0 \
                       /usr/lib/ipsec/libvici.so.0 /usr/lib/ipsec/plugins/*.so 2>/dev/null || true
-            fi
-            # Bind-mount needs NO free overlay space — prefer it
-            if ! mount | grep -q ' on /usr/lib/ipsec '; then
                 mount --bind "$_root/lib/ipsec" /usr/lib/ipsec 2>>"$LOG_FILE" || true
-            fi
-            if ! charon_is_matched; then
-                for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
-                    [ -e "$_root/lib/ipsec/$f" ] || continue
-                    rm -rf "/usr/lib/ipsec/$f"
-                    ln -sf "$_root/lib/ipsec/$f" "/usr/lib/ipsec/$f"
-                done
-                mkdir -p /usr/lib/ipsec/plugins
-                for so in "$_root/lib/ipsec/plugins/"*.so; do
-                    [ -f "$so" ] || continue
-                    bn=$(basename "$so")
-                    rm -rf "/usr/lib/ipsec/plugins/$bn"
-                    ln -sf "$so" "/usr/lib/ipsec/plugins/$bn"
-                done
+            elif [ ! -f /usr/lib/ipsec/charon ]; then
+                umount /usr/lib/ipsec 2>/dev/null || umount -l /usr/lib/ipsec 2>/dev/null || true
+                mount --bind "$_root/lib/ipsec" /usr/lib/ipsec 2>>"$LOG_FILE" || true
             fi
         fi
     fi
 
     if [ "$_need_stack" = "1" ]; then
-        if [ -x /usr/bin/sb-install-ss-plugins ]; then
+        if [ -x /tmp/sb-fix-ss-stack ]; then
+            echo "[System] Running /tmp/sb-fix-ss-stack ..." >> "$LOG_FILE"
+            /tmp/sb-fix-ss-stack >>"$LOG_FILE" 2>&1 || true
+        elif [ -x /usr/bin/sb-install-ss-plugins ]; then
             echo "[System] Running /usr/bin/sb-install-ss-plugins (full 5.9.2 stack)..." >> "$LOG_FILE"
             /usr/bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
         elif [ -x /tmp/sb-install-ss-plugins ]; then
             echo "[System] Running /tmp/sb-install-ss-plugins ..." >> "$LOG_FILE"
             /tmp/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
+        elif [ -x /data/sb-bin/sb-install-ss-plugins ]; then
+            /data/sb-bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
         else
-            echo "[System] ERROR: run sb-install-ss-plugins (downloads sb-swan.tgz from GitHub)." >> "$LOG_FILE"
+            echo "[System] ERROR: run sb-fix-ss-stack (re-downloads stack + bind-mount)." >> "$LOG_FILE"
         fi
     else
         echo "[System] Matched stack marker OK (ss-stack.ver)." >> "$LOG_FILE"
