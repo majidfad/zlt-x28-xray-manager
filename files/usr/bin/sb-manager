@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec15"
+SB_MANAGER_VERSION="2026.11.01-ipsec16"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -799,20 +799,31 @@ install_local_strongswan_plugins() {
     [ ! -s /usr/lib/ipsec/plugins/libstrongswan-openssl.so ] && _need_stack=1
     [ ! -s /usr/lib/ipsec/libstrongswan.so.0 ] && _need_stack=1
     # Marker written by sb-install-ss-plugins after full stack deploy
-    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec15" ] && _need_stack=1
+    [ "$(cat /etc/singbox/ss-stack.ver 2>/dev/null)" != "5.9.2-ipsec16" ] && _need_stack=1
+
+    # Re-apply bind mount if stack lives on /data|/customer but mount was lost
+    _root=$(cat /etc/singbox/ss-stack.root 2>/dev/null || true)
+    [ -z "$_root" ] && [ -x /data/sb-swan/lib/ipsec/charon ] && _root=/data/sb-swan
+    [ -z "$_root" ] && [ -x /customer/sb-swan/lib/ipsec/charon ] && _root=/customer/sb-swan
+    if [ -n "$_root" ] && [ -x "$_root/lib/ipsec/charon" ]; then
+        case "$_root" in
+            /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+            /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+        esac
+        if ! mount | grep -q ' on /usr/lib/ipsec '; then
+            echo "[System] bind-mount $_root/lib/ipsec -> /usr/lib/ipsec" >> "$LOG_FILE"
+            mount --bind "$_root/lib/ipsec" /usr/lib/ipsec 2>>"$LOG_FILE" || true
+        fi
+        /etc/init.d/sb-swan-bind start 2>/dev/null || true
+    fi
 
     if [ "$_need_stack" = "1" ]; then
         if [ -x /usr/bin/sb-install-ss-plugins ]; then
             echo "[System] Running /usr/bin/sb-install-ss-plugins (full 5.9.2 stack)..." >> "$LOG_FILE"
             /usr/bin/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
-            echo "5.9.2-ipsec15" > /etc/singbox/ss-stack.ver 2>/dev/null || true
-        elif [ -x /opt/sb-swan/lib/ipsec/charon ]; then
-            echo "[System] Deploying /opt/sb-swan into /usr/lib/ipsec ..." >> "$LOG_FILE"
-            cp -f /opt/sb-swan/lib/ipsec/charon /usr/lib/ipsec/charon
-            cp -f /opt/sb-swan/lib/ipsec/libstrongswan.so.0 /usr/lib/ipsec/libstrongswan.so.0
-            cp -f /opt/sb-swan/lib/ipsec/libcharon.so.0 /usr/lib/ipsec/libcharon.so.0
-            cp -f /opt/sb-swan/lib/ipsec/plugins/*.so /usr/lib/ipsec/plugins/
-            echo "5.9.2-ipsec15" > /etc/singbox/ss-stack.ver
+        elif [ -x /tmp/sb-install-ss-plugins ]; then
+            echo "[System] Running /tmp/sb-install-ss-plugins ..." >> "$LOG_FILE"
+            /tmp/sb-install-ss-plugins >>"$LOG_FILE" 2>&1 || true
         else
             echo "[System] ERROR: run sb-install-ss-plugins (downloads sb-swan.tgz from GitHub)." >> "$LOG_FILE"
         fi

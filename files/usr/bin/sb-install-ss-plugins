@@ -1,17 +1,63 @@
 #!/bin/sh
 # Install matched strongSwan 5.9.2 stack for Amnezia on OEM ZLT.
 # Fetches ONLY sb-swan.tgz from GitHub (no full git clone, no OpenWrt CDN).
+# Stores binaries on /data or /customer (large), bind-mounts into /usr/lib/ipsec
+# so the tiny root overlay is not filled.
 set -e
-OPT=/opt/sb-swan
 IPSEC_LIB=/usr/lib/ipsec
-BAK=/etc/singbox/ss-oem-ipsec-bak
-STASH=/etc/singbox/ss-plugins
 WORK=/tmp/sb_swan_dl
+MARKER=/etc/singbox/ss-stack.ver
+BIND_FLAG=/etc/singbox/ss-stack.bind
+INIT_SCRIPT=/etc/init.d/sb-swan-bind
 # Single-file download from this repo (override if you fork):
 SB_REPO_RAW="${SB_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
 SB_SWAN_TGZ_URL="${SB_SWAN_TGZ_URL:-${SB_REPO_RAW}/files/opt/sb-swan.tgz}"
 
-mkdir -p "$OPT" "$IPSEC_LIB/plugins" "$BAK" "$STASH" /etc/strongswan.d/charon "$WORK" /etc/singbox
+STACK_VER="5.9.2-ipsec16"
+
+free_kb() {
+    # Available KiB on the filesystem containing $1 (BusyBox df -k).
+    df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'
+}
+
+try_exec() {
+    _dir="$1"
+    mkdir -p "$_dir" 2>/dev/null || return 1
+    _t="$_dir/.sb_exec_test"
+    printf '#!/bin/sh\nexit 0\n' > "$_t" 2>/dev/null || return 1
+    chmod +x "$_t" 2>/dev/null || { rm -f "$_t"; return 1; }
+    if "$_t" 2>/dev/null; then
+        rm -f "$_t"
+        return 0
+    fi
+    rm -f "$_t"
+    return 1
+}
+
+pick_stack_root() {
+    # Prefer large partitions. Remount exec if needed (/data is often noexec).
+    for _base in /data /customer /opt; do
+        [ -d "$_base" ] || continue
+        _avail=$(free_kb "$_base")
+        [ -n "$_avail" ] || _avail=0
+        [ "$_avail" -ge 4096 ] || {
+            echo "[ss-plugins] skip $_base (only ${_avail}K free)"
+            continue
+        }
+        if try_exec "$_base/sb-swan"; then
+            echo "$_base/sb-swan"
+            return 0
+        fi
+        # Try remount with exec (common on ZLT /data).
+        mount -o remount,rw,exec "$_base" 2>/dev/null || true
+        if try_exec "$_base/sb-swan"; then
+            echo "$_base/sb-swan"
+            return 0
+        fi
+        echo "[ss-plugins] skip $_base (noexec / cannot run binaries)"
+    done
+    return 1
+}
 
 http_get() {
     _url="$1"
@@ -29,7 +75,9 @@ http_get() {
 }
 
 fetch_github_tgz() {
+    OPT="$1"
     echo "[ss-plugins] downloading stack tarball from GitHub..."
+    mkdir -p "$WORK"
     if ! http_get "$SB_SWAN_TGZ_URL" "$WORK/sb-swan.tgz"; then
         echo "[ss-plugins] FAIL: cannot download $SB_SWAN_TGZ_URL" >&2
         return 1
@@ -45,6 +93,7 @@ fetch_github_tgz() {
     mkdir -p "$WORK/out"
     tar -xzf "$WORK/sb-swan.tgz" -C "$WORK/out" || return 1
     rm -rf "$OPT"
+    mkdir -p "$(dirname "$OPT")"
     if [ -d "$WORK/out/sb-swan" ]; then
         mv "$WORK/out/sb-swan" "$OPT"
     else
@@ -57,40 +106,136 @@ fetch_github_tgz() {
     return 0
 }
 
-deploy_to_system() {
-    echo "[ss-plugins] deploying $OPT -> $IPSEC_LIB"
-    if [ ! -d "$BAK/done" ]; then
-        mkdir -p "$BAK/plugins"
-        for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
-            [ -e "$IPSEC_LIB/$f" ] && cp -a "$IPSEC_LIB/$f" "$BAK/" 2>/dev/null || true
-        done
-        cp -a "$IPSEC_LIB/plugins/"*.so "$BAK/plugins/" 2>/dev/null || true
-        mkdir -p "$BAK/done"
-        echo "[ss-plugins] OEM backup -> $BAK"
+backup_oem() {
+    OPT="$1"
+    BAK="$OPT/oem-bak"
+    if [ -d "$BAK/done" ]; then
+        return 0
     fi
-    cp -f "$OPT/lib/ipsec/charon" "$IPSEC_LIB/charon"
-    cp -f "$OPT/lib/ipsec/starter" "$IPSEC_LIB/starter" 2>/dev/null || true
-    cp -f "$OPT/lib/ipsec/stroke" "$IPSEC_LIB/stroke" 2>/dev/null || true
-    cp -f "$OPT/lib/ipsec/libstrongswan.so.0" "$IPSEC_LIB/libstrongswan.so.0"
-    cp -f "$OPT/lib/ipsec/libcharon.so.0" "$IPSEC_LIB/libcharon.so.0"
-    cp -f "$OPT/lib/ipsec/libvici.so.0" "$IPSEC_LIB/libvici.so.0" 2>/dev/null || true
-    cp -f "$OPT/lib/ipsec/plugins/"*.so "$IPSEC_LIB/plugins/"
-    cp -f "$OPT/lib/ipsec/plugins/"*.so "$STASH/" 2>/dev/null || true
-    chmod 755 "$IPSEC_LIB/charon" "$IPSEC_LIB/plugins/"*.so
+    # Only backup if /usr/lib/ipsec is not already our bind mount.
+    if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[ss-plugins] $IPSEC_LIB already bind-mounted; skip OEM bak"
+        return 0
+    fi
+    mkdir -p "$BAK/plugins"
+    for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+        [ -e "$IPSEC_LIB/$f" ] && cp -a "$IPSEC_LIB/$f" "$BAK/" 2>/dev/null || true
+    done
+    cp -a "$IPSEC_LIB/plugins/"*.so "$BAK/plugins/" 2>/dev/null || true
+    mkdir -p "$BAK/done"
+    echo "[ss-plugins] OEM backup -> $BAK"
+}
+
+write_bind_helper() {
+    OPT="$1"
+    SRC="$OPT/lib/ipsec"
+    mkdir -p /etc/singbox
+    echo "$SRC" > "$BIND_FLAG"
+    cat > "$INIT_SCRIPT" << EOF
+#!/bin/sh /etc/rc.common
+# Remount matched strongSwan stack from large partition into $IPSEC_LIB
+START=15
+STOP=85
+SRC="$SRC"
+DST="$IPSEC_LIB"
+start() {
+    [ -x "\$SRC/charon" ] || return 1
+    # Ensure parent allows exec (ZLT /data often noexec).
+    case "\$SRC" in
+        /data/*) mount -o remount,rw,exec /data 2>/dev/null || true ;;
+        /customer/*) mount -o remount,rw,exec /customer 2>/dev/null || true ;;
+    esac
+    mkdir -p "\$DST"
+    if mount | grep -q " on \$DST "; then
+        return 0
+    fi
+    mount --bind "\$SRC" "\$DST" || return 1
+}
+stop() {
+    if mount | grep -q " on \$DST "; then
+        umount "\$DST" 2>/dev/null || umount -l "\$DST" 2>/dev/null || true
+    fi
+}
+EOF
+    chmod +x "$INIT_SCRIPT"
+    # Enable at boot (OpenWrt). Ignore failures on non-procd systems.
+    if [ -x /etc/rc.common ] || [ -d /etc/rc.d ]; then
+        "$INIT_SCRIPT" enable 2>/dev/null || ln -sf "../init.d/sb-swan-bind" /etc/rc.d/S15sb-swan-bind 2>/dev/null || true
+    fi
+    # Also hook rc.local as fallback
+    if [ -f /etc/rc.local ]; then
+        grep -q 'sb-swan-bind\|sb-swan/lib/ipsec' /etc/rc.local 2>/dev/null || \
+            sed -i 's|^exit 0|/etc/init.d/sb-swan-bind start 2>/dev/null || true\nexit 0|' /etc/rc.local 2>/dev/null || true
+    fi
+}
+
+bind_deploy() {
+    OPT="$1"
+    SRC="$OPT/lib/ipsec"
+    echo "[ss-plugins] bind-mount $SRC -> $IPSEC_LIB (no copy onto overlay)"
+    # Stop strongSwan so files are not busy
+    ipsec stop 2>/dev/null || true
+    /etc/init.d/ipsec stop 2>/dev/null || true
+    killall charon 2>/dev/null || true
+    sleep 1
+    # Drop previous bind
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+    fi
+    mkdir -p "$IPSEC_LIB"
+    mount --bind "$SRC" "$IPSEC_LIB" || {
+        echo "[ss-plugins] bind-mount failed; falling back to symlinks" >&2
+        # Symlink fallback (still almost zero overlay use)
+        for f in charon starter stroke libstrongswan.so.0 libcharon.so.0 libvici.so.0; do
+            [ -e "$SRC/$f" ] || continue
+            rm -rf "$IPSEC_LIB/$f"
+            ln -sf "$SRC/$f" "$IPSEC_LIB/$f"
+        done
+        mkdir -p "$IPSEC_LIB/plugins"
+        for so in "$SRC/plugins/"*.so; do
+            [ -f "$so" ] || continue
+            bn=$(basename "$so")
+            rm -rf "$IPSEC_LIB/plugins/$bn"
+            ln -sf "$so" "$IPSEC_LIB/plugins/$bn"
+        done
+    }
+    write_bind_helper "$OPT"
+    # Tiny conf snippets on overlay (few KB)
+    mkdir -p /etc/strongswan.d/charon /etc/singbox
     if [ -d "$OPT/etc/strongswan.d/charon" ]; then
         cp -f "$OPT/etc/strongswan.d/charon/"*.conf /etc/strongswan.d/charon/ 2>/dev/null || true
     fi
     for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
         printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf"
     done
-    echo "5.9.2-ipsec15" > /etc/singbox/ss-stack.ver
+    echo "$STACK_VER" > "$MARKER"
+    echo "$OPT" > /etc/singbox/ss-stack.root
 }
 
-echo "[ss-plugins] deploying matched strongSwan 5.9.2 stack (GitHub)..."
+# ---- main ----
+echo "[ss-plugins] deploying matched strongSwan 5.9.2 stack (GitHub, large partition)..."
+
+# Drop failed/partial overlay copies that filled the rootfs
+echo "[ss-plugins] freeing overlay junk from earlier installs..."
+rm -rf /opt/sb-swan /tmp/sb_swan_dl /etc/singbox/ss-plugins
+# Old bak on overlay eats space — remove if we will re-bak onto large FS
+if [ -d /etc/singbox/ss-oem-ipsec-bak ]; then
+    rm -rf /etc/singbox/ss-oem-ipsec-bak
+fi
+
+OPT="$(pick_stack_root)" || {
+    echo "[ss-plugins] ERROR: no writable+executable partition with >=4MB free." >&2
+    echo "[ss-plugins] df:" >&2
+    df -h >&2 || true
+    exit 1
+}
+echo "[ss-plugins] stack root: $OPT (avail $(free_kb "$(dirname "$OPT")")K)"
+
+mkdir -p /etc/singbox "$IPSEC_LIB/plugins" /etc/strongswan.d/charon "$WORK"
 
 if [ -x "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]; then
     echo "[ss-plugins] using existing $OPT"
-elif fetch_github_tgz; then
+elif fetch_github_tgz "$OPT"; then
     :
 else
     echo "[ss-plugins] ERROR: could not download stack from GitHub." >&2
@@ -99,7 +244,8 @@ else
     exit 1
 fi
 
-deploy_to_system
+backup_oem "$OPT"
+bind_deploy "$OPT"
 rm -rf "$WORK"
 
 echo "[ss-plugins] installed:"
@@ -107,11 +253,12 @@ ls -la "$IPSEC_LIB/charon" "$IPSEC_LIB/libstrongswan.so.0" \
        "$IPSEC_LIB/plugins/libstrongswan-x509.so" \
        "$IPSEC_LIB/plugins/libstrongswan-pkcs1.so" \
        "$IPSEC_LIB/plugins/libstrongswan-openssl.so" 2>&1 || true
+df -h / /data /customer 2>/dev/null || df -h / || true
 
 if [ -s "$IPSEC_LIB/plugins/libstrongswan-x509.so" ] \
     && [ -s "$IPSEC_LIB/libstrongswan.so.0" ] \
     && [ -x "$IPSEC_LIB/charon" ]; then
-    echo "[ss-plugins] credential stack ready (matched 5.9.2)."
+    echo "[ss-plugins] credential stack ready (matched 5.9.2 @ $OPT)."
     exit 0
 fi
 echo "[ss-plugins] ERROR: stack deploy incomplete" >&2
