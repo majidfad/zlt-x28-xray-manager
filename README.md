@@ -60,7 +60,9 @@ sb-manager switch home1
 sb-manager start
 ```
 
-Or paste an Amnezia-style **IKEv2/IPsec** JSON config (certificate auth):
+### Amnezia IPsec (IKEv2)
+
+Paste an Amnezia client export (certificate auth):
 
 ```json
 {
@@ -71,18 +73,21 @@ Or paste an Amnezia-style **IKEv2/IPsec** JSON config (certificate auth):
 }
 ```
 
+Also accepts Amnezia `strongswan.profile` / `.sswan` JSON (`type: ikev2-cert`,
+`remote.addr`, `local.p12`).
+
 ```sh
 # Save the JSON to a file, then:
 sb-manager addnode ike1 /tmp/ipsec.json
 sb-manager switch ike1
 sb-manager start
+# status should show: Running (Amnezia IPsec)
 ```
 
-IPsec requires **strongSwan** + **openssl** on the router (`swanctl` or `ipsec`).
-The installer tries `opkg install strongswan-full swanctl openssl-util` when
-possible; on locked-down firmware you may need to install those packages
-yourself. Switching between VLESS and IPsec nodes stops the other engine
-automatically. Proxy-only mode applies to sing-box (VLESS); IPsec always uses
+Requires **strongSwan** + **openssl** (`swanctl` or `ipsec`). The installer
+tries `opkg install strongswan-full swanctl openssl-util` when possible.
+Switching between VLESS and Amnezia IPsec stops the other engine automatically.
+Proxy-only mode is for sing-box (VLESS); Amnezia IPsec always uses a
 policy-based tunnel + LAN SNAT.
 
 Common commands:

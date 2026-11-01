@@ -106,7 +106,7 @@ function action_addnode()
         -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
         luci.http.write_json({
             ok = false,
-            error = "paste a vless:// URL or IPsec JSON ({cert, hostName, userName, password})"
+            error = "paste a vless:// URL or Amnezia IPsec JSON ({cert, hostName, userName, password})"
         })
         return
     end

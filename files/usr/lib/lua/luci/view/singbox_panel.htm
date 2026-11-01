@@ -47,10 +47,10 @@
 			</table>
 			<div class="cbi-page-actions">
 				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
-				<textarea id="sb_new_node_link" placeholder="vless://...  OR  IPsec JSON {&quot;cert&quot;:&quot;...&quot;,&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;password&quot;:&quot;&quot;}" rows="4" style="width:60%"></textarea>
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  Amnezia IPsec JSON {&quot;cert&quot;,&quot;hostName&quot;,&quot;userName&quot;,&quot;password&quot;}" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
-			<p style="opacity:0.75;margin-top:4px">Accepts <code>vless://</code> share links (sing-box) or Amnezia-style IKEv2/IPsec JSON (<code>cert</code> + <code>hostName</code>). IPsec needs strongSwan on the router.</p>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> share link &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: paste export JSON (<code>cert</code> + <code>hostName</code> + <code>userName</code> + <code>password</code>) or <code>.sswan</code> profile. Needs strongSwan on the router.</p>
 		</div>
 	</div>
 
@@ -186,13 +186,13 @@
 			return;
 		}
 		if (!link) {
-			alert("Paste a vless:// link or IPsec JSON config first.");
+			alert("Paste a vless:// link or Amnezia IPsec JSON first.");
 			return;
 		}
 		var isJson = link.charAt(0) === "{";
 		var isVless = link.indexOf("vless://") === 0;
 		if (!isJson && !isVless) {
-			alert("Config must be a vless:// URL or IPsec JSON starting with {");
+			alert("Config must be a vless:// URL or Amnezia IPsec JSON starting with {");
 			return;
 		}
 		// POST: payloads are too long/fragile for GET query strings.

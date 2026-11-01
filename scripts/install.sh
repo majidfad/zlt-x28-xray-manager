@@ -418,9 +418,14 @@ node_proto() {
     [ -f "$_n" ] || { echo "none"; return; }
     if grep -q '"type"[[:space:]]*:[[:space:]]*"ipsec"' "$_n" 2>/dev/null; then
         echo "ipsec"
+    elif grep -q '"type"[[:space:]]*:[[:space:]]*"ikev2-cert"' "$_n" 2>/dev/null; then
+        echo "ipsec"
     elif grep -q '"type"[[:space:]]*:[[:space:]]*"vless"' "$_n" 2>/dev/null; then
         echo "vless"
     elif grep -q '"hostName"' "$_n" 2>/dev/null && grep -q '"cert"' "$_n" 2>/dev/null; then
+        echo "ipsec"
+    elif grep -q '"p12"' "$_n" 2>/dev/null && grep -q '"addr"' "$_n" 2>/dev/null; then
+        # Amnezia strongswan.profile / .sswan style
         echo "ipsec"
     else
         echo "vless"
@@ -498,27 +503,39 @@ extract_json_str() {
 parse_ipsec_json() {
     FILE="$1"
     OUT="$2"
+    # Amnezia client export: { cert, hostName, userName, password }
+    # Amnezia strongswan.profile / .sswan: { type:ikev2-cert, remote.addr, local.p12, ... }
     host=$(extract_json_str "$FILE" hostName)
+    [ -z "$host" ] && host=$(extract_json_str "$FILE" addr)
     user=$(extract_json_str "$FILE" userName)
+    [ -z "$user" ] && user=$(extract_json_str "$FILE" clientId)
     pass=$(extract_json_str "$FILE" password)
     cert=$(extract_json_str "$FILE" cert)
+    [ -z "$cert" ] && cert=$(extract_json_str "$FILE" p12)
     if [ -z "$host" ] || [ -z "$cert" ]; then
         return 1
     fi
-    [ -z "$user" ] && user=$(extract_json_str "$FILE" clientId)
+    ike_prop=$(extract_json_str "$FILE" ike-proposal)
+    esp_prop=$(extract_json_str "$FILE" esp-proposal)
+    [ -z "$ike_prop" ] && ike_prop="aes256-sha256-modp2048"
+    [ -z "$esp_prop" ] && esp_prop="aes128gcm16"
     host_e=$(json_escape "$host")
     user_e=$(json_escape "$user")
     pass_e=$(json_escape "$pass")
-    # Cert is base64; escape for JSON just in case
     cert_e=$(json_escape "$cert")
+    ike_e=$(json_escape "$ike_prop")
+    esp_e=$(json_escape "$esp_prop")
     cat > "$OUT" << EOF
 {
   "type": "ipsec",
   "tag": "proxy",
+  "protocol": "amnezia-ikev2",
   "hostName": "$host_e",
   "userName": "$user_e",
   "password": "$pass_e",
-  "cert": "$cert_e"
+  "cert": "$cert_e",
+  "ikeProposal": "$ike_e",
+  "espProposal": "$esp_e"
 }
 EOF
     return 0
@@ -526,11 +543,12 @@ EOF
 
 parse_link_to_json() {
     FILE="$1"
-    # Detect Amnezia-style IKEv2 JSON ({ "cert": "...", "hostName": ... })
+    # Detect Amnezia IKEv2/IPsec JSON (export or strongswan.profile / .sswan)
     _head=$(head -c 256 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
     case "$_head" in
         \{*)
-            if grep -q '"hostName"' "$FILE" 2>/dev/null && grep -q '"cert"' "$FILE" 2>/dev/null; then
+            if grep -qE '"hostName"|"addr"|"ikev2-cert"|"p12"' "$FILE" 2>/dev/null \
+                && grep -qE '"cert"|"p12"' "$FILE" 2>/dev/null; then
                 parse_ipsec_json "$FILE" /tmp/sb_parse_out.json && cat /tmp/sb_parse_out.json
                 rm -f /tmp/sb_parse_out.json
                 return
@@ -800,29 +818,47 @@ prepare_ipsec_material() {
 write_swanctl_conn() {
     _id="$1"
     _dir="$IPSEC_DIR/$_id"
+    _node="$DIR_SB/node_${_id}.json"
     _host=$(cat "$_dir/host")
     _user=$(cat "$_dir/user")
-    mkdir -p /etc/swanctl/conf.d /etc/swanctl/x509 /etc/swanctl/private /etc/swanctl/x509ca
+    _pass=$(cat "$_dir/pass" 2>/dev/null)
+    _ike=$(extract_json_str "$_node" ikeProposal)
+    _esp=$(extract_json_str "$_node" espProposal)
+    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
+    [ -z "$_esp" ] && _esp="aes128gcm16"
 
+    # Amnezia Android profile loads PKCS#12 directly; prefer that when swanctl supports it.
+    mkdir -p /etc/swanctl/conf.d /etc/swanctl/x509 /etc/swanctl/private \
+             /etc/swanctl/x509ca /etc/swanctl/pkcs12
+    cp -f "$_dir/client.p12" "/etc/swanctl/pkcs12/sbvpn_client.p12"
     cp -f "$_dir/client.pem" "/etc/swanctl/x509/sbvpn_client.pem"
     cp -f "$_dir/client.key" "/etc/swanctl/private/sbvpn_client.key"
     if [ -s "$_dir/ca.pem" ]; then
         cp -f "$_dir/ca.pem" "/etc/swanctl/x509ca/sbvpn_ca.pem"
     fi
-    chmod 600 /etc/swanctl/private/sbvpn_client.key
+    chmod 600 /etc/swanctl/private/sbvpn_client.key /etc/swanctl/pkcs12/sbvpn_client.p12
 
     _local_id=""
     if [ -n "$_user" ]; then
         _local_id="id = $_user"
     fi
+    _p12_secret=""
+    if [ -n "$_pass" ]; then
+        _p12_secret="secret = \"$_pass\""
+    fi
+    _ca_line=""
+    if [ -s "$_dir/ca.pem" ]; then
+        _ca_line="cacerts = sbvpn_ca.pem"
+    fi
 
+    # Match Amnezia strongswan.profile: ikev2-cert + rsa-pss + fixed proposals.
     cat > "$IPSEC_SWANCTL" << EOF
 connections {
     $IPSEC_CONN {
         version = 2
         remote_addrs = $_host
         vips = 0.0.0.0
-        proposals = aes256-sha256-modp2048,aes256-sha256-ecp256,aes128-sha256-modp2048,default
+        proposals = $_ike,aes256-sha256-modp2048,default
         local {
             auth = pubkey
             certs = sbvpn_client.pem
@@ -831,11 +867,12 @@ connections {
         }
         remote {
             auth = pubkey
+            $_ca_line
         }
         children {
             net {
                 remote_ts = 0.0.0.0/0
-                esp_proposals = aes128gcm16,aes256gcm16,aes128-sha256,default
+                esp_proposals = $_esp,aes128gcm16,aes256gcm16,default
                 start_action = start
                 dpd_action = restart
                 hostaccess = yes
@@ -847,6 +884,10 @@ connections {
 secrets {
     private-sbvpn {
         file = sbvpn_client.key
+    }
+    pkcs12-sbvpn {
+        file = sbvpn_client.p12
+        $_p12_secret
     }
 }
 EOF
@@ -1014,7 +1055,7 @@ start_ipsec() {
     if [ "$(get_mode)" = "tunnel" ]; then
         setup_ipsec_lan_nat
     fi
-    echo "[System] IPsec/IKEv2 connected to $(cat "$IPSEC_DIR/$_id/host")." >> "$LOG_FILE"
+    echo "[System] Amnezia IPsec/IKEv2 connected to $(cat "$IPSEC_DIR/$_id/host")." >> "$LOG_FILE"
     start_watchdog
     return 0
 }
@@ -1111,7 +1152,7 @@ case "$1" in
     restart) stop_sb; sleep 1; start_sb; exit 0 ;;
     status)
         if [ "$(cat "$PROTO_POINTER" 2>/dev/null)" = "ipsec" ]; then
-            if is_ipsec_running; then echo "Running (IPsec)"; else echo "Stopped"; fi
+            if is_ipsec_running; then echo "Running (Amnezia IPsec)"; else echo "Stopped"; fi
         else
             if is_sb_running; then echo "Running"; else echo "Stopped"; fi
         fi
@@ -1128,7 +1169,7 @@ case "$1" in
         parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
         if [ ! -s "$DIR_SB/node_$2.json" ]; then
             rm -f "$DIR_SB/node_$2.json"
-            echo "Failed to parse config (expected vless:// URL or IPsec JSON with cert/hostName)" >&2
+            echo "Failed to parse config (expected vless:// or Amnezia IPsec JSON: cert/hostName or .sswan)" >&2
             exit 1
         fi
         exit 0
@@ -1282,7 +1323,7 @@ function action_addnode()
         -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
         luci.http.write_json({
             ok = false,
-            error = "paste a vless:// URL or IPsec JSON ({cert, hostName, userName, password})"
+            error = "paste a vless:// URL or Amnezia IPsec JSON ({cert, hostName, userName, password})"
         })
         return
     end
@@ -1431,10 +1472,10 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			</table>
 			<div class="cbi-page-actions">
 				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
-				<textarea id="sb_new_node_link" placeholder="vless://...  OR  IPsec JSON {&quot;cert&quot;:&quot;...&quot;,&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;password&quot;:&quot;&quot;}" rows="4" style="width:60%"></textarea>
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  Amnezia IPsec JSON {&quot;cert&quot;,&quot;hostName&quot;,&quot;userName&quot;,&quot;password&quot;}" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
-			<p style="opacity:0.75;margin-top:4px">Accepts <code>vless://</code> share links (sing-box) or Amnezia-style IKEv2/IPsec JSON (<code>cert</code> + <code>hostName</code>). IPsec needs strongSwan on the router.</p>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> share link &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: paste export JSON (<code>cert</code> + <code>hostName</code> + <code>userName</code> + <code>password</code>) or <code>.sswan</code> profile. Needs strongSwan on the router.</p>
 		</div>
 	</div>
 
@@ -1570,13 +1611,13 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			return;
 		}
 		if (!link) {
-			alert("Paste a vless:// link or IPsec JSON config first.");
+			alert("Paste a vless:// link or Amnezia IPsec JSON first.");
 			return;
 		}
 		var isJson = link.charAt(0) === "{";
 		var isVless = link.indexOf("vless://") === 0;
 		if (!isJson && !isVless) {
-			alert("Config must be a vless:// URL or IPsec JSON starting with {");
+			alert("Config must be a vless:// URL or Amnezia IPsec JSON starting with {");
 			return;
 		}
 		// POST: payloads are too long/fragile for GET query strings.
