@@ -238,7 +238,7 @@ elif command -v opkg >/dev/null 2>&1; then
         opkg install "$_pkg" >/tmp/sb_opkg_ss.log 2>&1 && log "Installed $_pkg" || true
     done
     if command -v swanctl >/dev/null 2>&1 || command -v ipsec >/dev/null 2>&1; then
-        log "strongSwan ready for Amnezia IPsec nodes."
+        log "strongSwan binary present."
     else
         log "NOTE: strongSwan packages are not in this firmware's opkg feeds."
         log "      Common on OEM ZLT-X28 builds. VLESS (sing-box) still works."
@@ -247,6 +247,35 @@ elif command -v opkg >/dev/null 2>&1; then
     fi
 else
     log "NOTE: no opkg — install strongSwan manually if you need IPsec."
+fi
+
+# OEM feeds often lack strongswan-mod-x509/pkcs1 — pull .ipk from OpenWrt CDN.
+if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && command -v wget >/dev/null 2>&1; then
+    log "2b+. Fetching strongSwan x509/pkcs1/gcm plugins from OpenWrt CDN..."
+    _sb_arch="$(opkg print-architecture 2>/dev/null | awk '$1=="arch" && $2!="all" && $2!="noarch"{print $2; exit}')"
+    [ -z "$_sb_arch" ] && _sb_arch="aarch64_cortex-a53"
+    for _sb_arch_try in "$_sb_arch" aarch64_cortex-a53 aarch64_generic; do
+        for _sb_mod in x509 pkcs1 pkcs8 gcm; do
+            [ -f "/usr/lib/ipsec/plugins/libstrongswan-${_sb_mod}.so" ] && continue
+            _sb_fn="strongswan-mod-${_sb_mod}_5.9.2-3_${_sb_arch_try}.ipk"
+            _sb_url="https://downloads.openwrt.org/releases/21.02.7/packages/${_sb_arch_try}/packages/${_sb_fn}"
+            _sb_dst="/tmp/${_sb_fn}"
+            if wget -q -O "$_sb_dst" "$_sb_url" && [ -s "$_sb_dst" ]; then
+                if opkg install --force-depends --force-overwrite "$_sb_dst" >/tmp/sb_cdn_ipk.log 2>&1 \
+                    || ( mkdir -p /tmp/sb_ipk_x && tar -xf "$_sb_dst" -C /tmp/sb_ipk_x \
+                         && tar -xzf /tmp/sb_ipk_x/data.tar.gz -C / && rm -rf /tmp/sb_ipk_x ); then
+                    log "Installed $_sb_fn"
+                fi
+            fi
+        done
+        [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ] && break
+    done
+    if [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
+        log "strongSwan x509 plugin OK."
+    else
+        log "NOTE: could not fetch x509 plugin (Amnezia IPsec needs it)."
+        log "      Device must reach downloads.openwrt.org, or copy libstrongswan-x509.so manually."
+    fi
 fi
 
 # python3 optional: CLI vpn:// decode. LuCI decodes vpn:// in the browser.
@@ -379,7 +408,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec7"
+SB_MANAGER_VERSION="2026.11.01-ipsec8"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -1159,39 +1188,159 @@ enable_charon_plugin() {
     fi
 }
 
+# Detect opkg arch (OEM ZLT often aarch64_cortex-a53 / aarch64_generic).
+sb_opkg_arch() {
+    if command -v opkg >/dev/null 2>&1; then
+        opkg print-architecture 2>/dev/null | awk '
+            $1=="arch" && $2!="all" && $2!="noarch" { print $2; exit }
+        '
+    fi
+}
+
+sb_http_get() {
+    _url="$1"
+    _out="$2"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$_out" "$_url" 2>/dev/null && [ -s "$_out" ] && return 0
+    fi
+    return 1
+}
+
+# Extract an OpenWrt .ipk straight into / (bypass empty OEM feeds).
+sb_install_ipk_file() {
+    _ipk="$1"
+    [ -s "$_ipk" ] || return 1
+    _work="/tmp/sb_ipk_$$"
+    rm -rf "$_work"
+    mkdir -p "$_work"
+    # Prefer opkg when it works (registers package).
+    if command -v opkg >/dev/null 2>&1; then
+        if opkg install --force-depends --force-checksum --force-overwrite "$_ipk" \
+                >/tmp/sb_ipk_install.log 2>&1; then
+            rm -rf "$_work"
+            return 0
+        fi
+    fi
+    # Manual extract: ipk = tar of debian-binary + control.tar.gz + data.tar.gz
+    ( cd "$_work" && tar -xf "$_ipk" 2>/dev/null ) || {
+        rm -rf "$_work"
+        return 1
+    }
+    if [ -f "$_work/data.tar.gz" ]; then
+        tar -xzf "$_work/data.tar.gz" -C / >/tmp/sb_ipk_untar.log 2>&1 || {
+            rm -rf "$_work"
+            return 1
+        }
+    elif [ -f "$_work/data.tar.xz" ]; then
+        tar -xJf "$_work/data.tar.xz" -C / >/tmp/sb_ipk_untar.log 2>&1 || {
+            rm -rf "$_work"
+            return 1
+        }
+    else
+        rm -rf "$_work"
+        return 1
+    fi
+    rm -rf "$_work"
+    return 0
+}
+
+# OEM ZLT feeds often omit strongswan-mod-* — fetch OpenWrt official ipks that match
+# strongSwan 5.9.x (device reports 5.9.1; closest public build is 5.9.2).
+fetch_strongswan_plugins_ipk() {
+    _need=""
+    for _m in x509 pkcs1; do
+        if [ ! -f "/usr/lib/ipsec/plugins/libstrongswan-${_m}.so" ] \
+            && [ ! -f "/usr/lib/ipsec/libstrongswan-${_m}.so" ]; then
+            _need="$_need $_m"
+        fi
+    done
+    # gcm needed for Amnezia esp=aes128gcm16
+    if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-gcm.so ] \
+        && [ ! -f /usr/lib/ipsec/libstrongswan-gcm.so ]; then
+        _need="$_need gcm"
+    fi
+    if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-pkcs8.so ] \
+        && [ ! -f /usr/lib/ipsec/libstrongswan-pkcs8.so ]; then
+        _need="$_need pkcs8"
+    fi
+    [ -n "$_need" ] || {
+        echo "[System] Required plugin .so files already on disk." >> "$LOG_FILE"
+        return 0
+    }
+    echo "[System] Missing plugin .so — fetching from OpenWrt CDN:$_need" >> "$LOG_FILE"
+
+    _native=$(sb_opkg_arch)
+    _arches="$_native aarch64_cortex-a53 aarch64_generic"
+    _vers="5.9.2-3 5.9.2-2 5.9.2-1 5.9.5-1 5.9.8-1"
+    _mirrors="
+https://downloads.openwrt.org/releases/21.02.7/packages
+https://archive.openwrt.org/releases/21.02.7/packages
+https://downloads.openwrt.org/releases/22.03.5/packages
+https://archive.openwrt.org/releases/packages-21.02
+"
+    _got=0
+    for _mod in $_need; do
+        _okmod=0
+        for _arch in $_arches; do
+            [ -n "$_arch" ] || continue
+            for _ver in $_vers; do
+                _fn="strongswan-mod-${_mod}_${_ver}_${_arch}.ipk"
+                for _mir in $_mirrors; do
+                    [ -n "$_mir" ] || continue
+                    _url="${_mir}/${_arch}/packages/${_fn}"
+                    _dst="/tmp/${_fn}"
+                    echo "[System] try $_url" >> "$LOG_FILE"
+                    if sb_http_get "$_url" "$_dst"; then
+                        if sb_install_ipk_file "$_dst"; then
+                            echo "[System] Installed $_fn" >> "$LOG_FILE"
+                            _okmod=1
+                            _got=1
+                            break 3
+                        fi
+                        echo "[System] extract/install failed for $_fn" >> "$LOG_FILE"
+                    fi
+                done
+            done
+        done
+        [ "$_okmod" = "1" ] || echo "[System] WARNING: could not fetch strongswan-mod-$_mod" >> "$LOG_FILE"
+    done
+    [ "$_got" = "1" ]
+}
+
 # charon needs x509 + pkcs1 (or openssl) to parse PEM certs/keys. Without them:
 #   "parsing X509 certificate failed" / "no private key found for 'CN'"
 ensure_strongswan_plugins() {
     echo "[System] Checking strongSwan credential plugins..." >> "$LOG_FILE"
 
-    # Always try to install the critical mods (no-op if absent from feeds).
+    # 1) Local feeds (usually empty on OEM ZLT).
     if command -v opkg >/dev/null 2>&1; then
         for _pkg in \
             strongswan-mod-x509 \
             strongswan-mod-pkcs1 \
             strongswan-mod-pkcs8 \
-            strongswan-mod-pkcs12 \
+            strongswan-mod-gcm \
             strongswan-mod-pem \
             strongswan-mod-openssl \
-            strongswan-mod-pubkey \
-            strongswan-mod-gcm \
-            strongswan-mod-gmp \
-            strongswan-mod-hmac \
-            strongswan-mod-sha2 \
-            strongswan-mod-constraints \
-            strongswan-mod-revocation \
-            strongswan-mod-vici \
-            strongswan-mod-stroke \
-            strongswan-mod-kernel-netlink \
-            strongswan-mod-socket-default \
             strongswan-default
         do
             if ! opkg list-installed "$_pkg" 2>/dev/null | grep -q .; then
                 opkg install "$_pkg" >/tmp/sb_opkg_plug.log 2>&1 \
-                    && echo "[System] Installed $_pkg" >> "$LOG_FILE" \
+                    && echo "[System] Installed $_pkg from feed" >> "$LOG_FILE" \
                     || true
             fi
         done
+    fi
+
+    # 2) Direct .ipk download when feeds lack mods (common on ZLT-X28).
+    if [ ! -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ] \
+        && [ ! -f /usr/lib/ipsec/libstrongswan-x509.so ]; then
+        fetch_strongswan_plugins_ipk || true
+    elif [ ! -f /usr/lib/ipsec/plugins/libstrongswan-pkcs1.so ] \
+        && [ ! -f /usr/lib/ipsec/libstrongswan-pkcs1.so ]; then
+        fetch_strongswan_plugins_ipk || true
     fi
 
     # Enable drop-ins for every credential/crypto plugin we care about.
@@ -1692,7 +1841,8 @@ start_ipsec() {
         ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' >> "$LOG_FILE" || true
         if ! charon_has_x509; then
             echo "[System] ROOT CAUSE: missing strongswan x509/pkcs1 plugins." >> "$LOG_FILE"
-            echo "[System] Fix: opkg update && opkg install strongswan-default strongswan-mod-x509 strongswan-mod-pkcs1" >> "$LOG_FILE"
+            echo "[System] Auto-fetch from OpenWrt CDN failed — check WAN to downloads.openwrt.org" >> "$LOG_FILE"
+            echo "[System] Manual: wget OpenWrt strongswan-mod-x509/pkcs1 5.9.2 ipk and opkg install --force-depends" >> "$LOG_FILE"
         fi
         swanctl --version >> "$LOG_FILE" 2>&1 || true
         ipsec version >> "$LOG_FILE" 2>&1 || true
