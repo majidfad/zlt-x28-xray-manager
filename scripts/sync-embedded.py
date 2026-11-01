@@ -40,7 +40,8 @@ def main() -> None:
     path = ROOT / "scripts/install.sh"
     text = path.read_text(encoding="utf-8")
     # Sanity: installer must already have a post-manager tail
-    if "chmod +x /usr/bin/sb-manager" not in text.split("\nSB_MGR_EOF\n", 1)[-1]:
+    _after = text.split("\nSB_MGR_EOF\n", 1)[-1]
+    if "chmod +x /usr/bin/sb-manager" not in _after and "chmod +x /data/sb-bin/sb-manager" not in _after:
         raise SystemExit(
             "install.sh is truncated after SB_MGR_EOF — restore from git before syncing"
         )
