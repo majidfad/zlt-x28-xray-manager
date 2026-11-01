@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec18"
+SB_MANAGER_VERSION="2026.11.01-ipsec20"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -554,12 +554,25 @@ ss_check() {
     swanctl --version 2>&1 | head -n2 || true
     echo "ipsec_path=$(command -v ipsec 2>/dev/null || echo missing)"
     ipsec version 2>&1 | head -n2 || true
+    echo "--- running daemon ---"
+    if pidof charon >/dev/null 2>&1; then
+        echo "charon_pid: $(pidof charon)"
+    else
+        echo "charon_pid: NOT RUNNING  << swanctl will get Connection refused"
+    fi
+    ls -la /var/run/charon.vici /var/run/charon.ctl 2>&1 || true
+    echo "libcrypto:"
+    ls -la /usr/lib/libcrypto.so* /lib/libcrypto.so* 2>&1 | head -n 10 || true
     echo "--- running plugins ---"
     ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' || echo "(charon not running)"
-    if charon_has_x509; then
+    if ! pidof charon >/dev/null 2>&1; then
+        echo "x509_loaded: N/A (start charon first)"
+        echo "Try: STRONGSWAN_CONF=/etc/singbox/strongswan.conf LD_LIBRARY_PATH=/usr/lib/ipsec /usr/lib/ipsec/charon"
+        echo "Then: cat /tmp/sb_charon.log"
+    elif charon_has_x509; then
         echo "x509_loaded: YES"
     else
-        echo "x509_loaded: NO  << this is why PEM/PKCS#12 parse fails"
+        echo "x509_loaded: NO  << plugins present but not in charon load list"
     fi
     echo "=== end ss_check ==="
     charon_is_matched && [ -s /usr/lib/ipsec/plugins/libstrongswan-x509.so ]
@@ -1015,43 +1028,89 @@ diagnose_x509_plugin_load() {
     fi
 }
 
+# Matched stack libs live beside charon; openssl plugin needs libcrypto.so.1.1.
+export_ss_lib_path() {
+    export LD_LIBRARY_PATH="/usr/lib/ipsec:/data/sb-swan/lib/ipsec:${LD_LIBRARY_PATH:-}"
+    # Common OpenWrt openssl 1.1 locations
+    for _d in /usr/lib /lib /usr/local/lib; do
+        [ -e "$_d/libcrypto.so.1.1" ] || [ -e "$_d/libcrypto.so.1.0.0" ] || continue
+        case ":$LD_LIBRARY_PATH:" in
+            *":$_d:"*) ;;
+            *) export LD_LIBRARY_PATH="$_d:$LD_LIBRARY_PATH" ;;
+        esac
+    done
+}
+
+wait_charon_socket() {
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        if [ -S /var/run/charon.vici ] || [ -S /var/run/charon.ctl ]; then
+            return 0
+        fi
+        # still alive?
+        pidof charon >/dev/null 2>&1 || return 1
+        sleep 1
+        _i=$((_i + 1))
+    done
+    [ -S /var/run/charon.vici ] || [ -S /var/run/charon.ctl ]
+}
+
 # Start charon with OUR conf only — never trust OEM init.d UCI regeneration.
 start_charon_daemon() {
+    prefer_matched_ss_bins
     ensure_strongswan_plugins
     ensure_strongswan_conf
     export_ss_env
+    export_ss_lib_path
 
     echo "[System] Stopping OEM strongSwan, starting with STRONGSWAN_CONF=$SB_SS_CONF" >> "$LOG_FILE"
+    echo "[System] LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$LOG_FILE"
     stop_strongswan_daemons
-    # Re-write after stop — init.d stop scripts sometimes regenerate conf.
+    rm -f /var/run/charon.vici /var/run/charon.ctl /var/run/charon.pid 2>/dev/null || true
     ensure_strongswan_conf
     export_ss_env
+    export_ss_lib_path
+
+    # Dependency hint for openssl plugin (PKCS#12 / many crypto ops)
+    if [ ! -e /usr/lib/libcrypto.so.1.1 ] && [ ! -e /lib/libcrypto.so.1.1 ] \
+        && [ ! -e /usr/lib/libcrypto.so.1.0.0 ] && [ ! -e /lib/libcrypto.so.1.0.0 ]; then
+        echo "[System] WARN: libcrypto.so.1.1 not found — openssl plugin may fail to load." >> "$LOG_FILE"
+        echo "[System] ls libcrypto:" >> "$LOG_FILE"
+        ls -la /usr/lib/libcrypto* /lib/libcrypto* 2>>"$LOG_FILE" || true
+    fi
 
     _charon=""
-    for _c in /usr/lib/ipsec/charon /usr/libexec/ipsec/charon /usr/sbin/charon; do
+    for _c in /usr/lib/ipsec/charon /data/sb-swan/lib/ipsec/charon /usr/libexec/ipsec/charon; do
         [ -x "$_c" ] && _charon="$_c" && break
     done
-    if [ -n "$_charon" ]; then
-        echo "[System] Starting $_charon ..." >> "$LOG_FILE"
-        STRONGSWAN_CONF="$SB_SS_CONF" "$_charon" >>"$LOG_FILE" 2>&1 &
-        sleep 2
+    if [ -z "$_charon" ]; then
+        echo "[System] ERROR: no charon binary found" >> "$LOG_FILE"
+        return 1
     fi
-    # starter for stroke (`ipsec up`) — also forced to our conf
-    STRONGSWAN_CONF="$SB_SS_CONF" ipsec start >>"$LOG_FILE" 2>&1 || true
+
+    # Probe: can the binary even start? (captures "not found" linker errors)
+    echo "[System] Probing $_charon ..." >> "$LOG_FILE"
+    if command -v ldd >/dev/null 2>&1; then
+        ldd "$_charon" >> "$LOG_FILE" 2>&1 || true
+        ldd /usr/lib/ipsec/plugins/libstrongswan-openssl.so >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    : > /tmp/sb_charon.log
+    echo "[System] Starting $_charon (log: /tmp/sb_charon.log) ..." >> "$LOG_FILE"
+    # Do NOT also run `ipsec start` in parallel — starter fights a hand-started charon.
+    STRONGSWAN_CONF="$SB_SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+        "$_charon" --use-syslog=0 >>/tmp/sb_charon.log 2>&1 &
+    echo $! > /tmp/sb_charon.pid
     sleep 1
-    # init.d may have raced — rewrite conf again and ensure plugins still forced
-    ensure_strongswan_conf
-    if ! charon_has_x509; then
-        echo "[System] x509 still not loaded — full restart with forced conf..." >> "$LOG_FILE"
-        stop_strongswan_daemons
-        ensure_strongswan_conf
-        export_ss_env
-        if [ -n "$_charon" ]; then
-            STRONGSWAN_CONF="$SB_SS_CONF" "$_charon" >>"$LOG_FILE" 2>&1 &
-            sleep 2
-        fi
-        STRONGSWAN_CONF="$SB_SS_CONF" ipsec start >>"$LOG_FILE" 2>&1 || true
+
+    if ! wait_charon_socket; then
+        echo "[System] charon did not create vici socket; trying ipsec start..." >> "$LOG_FILE"
+        killall charon 2>/dev/null || true
         sleep 1
+        STRONGSWAN_CONF="$SB_SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+            ipsec start >>/tmp/sb_charon.log 2>&1 || true
+        sleep 2
+        wait_charon_socket || true
     fi
 
     if [ -S /var/run/charon.vici ] || [ -S /var/run/charon.ctl ]; then
@@ -1060,16 +1119,20 @@ start_charon_daemon() {
             | sed -n 's/.*loaded plugins: //p' | head -n1)
         echo "[System] loaded plugins: $_plist" >> "$LOG_FILE"
         if ! charon_has_x509; then
-            echo "[System] ERROR: .so on disk but charon did not load x509/pkcs1." >> "$LOG_FILE"
+            echo "[System] ERROR: charon up but x509/pkcs1 not loaded." >> "$LOG_FILE"
             diagnose_x509_plugin_load
+            cat /tmp/sb_charon.log >> "$LOG_FILE" 2>/dev/null || true
             return 1
         fi
         echo "[System] x509 plugin loaded OK." >> "$LOG_FILE"
         return 0
     fi
-    echo "[System] WARNING: no charon vici socket after start attempts." >> "$LOG_FILE"
+
+    echo "[System] ERROR: charon failed to start (no vici socket)." >> "$LOG_FILE"
+    echo "[System] ps:"; ps w 2>/dev/null | grep -E '[c]haron|[s]tarter' >> "$LOG_FILE" || true
+    echo "[System] /tmp/sb_charon.log:" >> "$LOG_FILE"
+    cat /tmp/sb_charon.log >> "$LOG_FILE" 2>/dev/null || true
     ls -la /var/run/charon* >> "$LOG_FILE" 2>&1 || true
-    diagnose_x509_plugin_load
     return 1
 }
 
@@ -1321,10 +1384,13 @@ try_start_ipsec_stroke() {
     write_ipsec_conf_conn "$_id"
     : > /tmp/sb_ipsec.err
     export_ss_env
-    start_charon_daemon >>/tmp/sb_ipsec.err 2>&1 || true
-    # Do NOT call OEM /etc/init.d/ipsec — it regenerates conf without x509.
-    STRONGSWAN_CONF="$SB_SS_CONF" ipsec start >>/tmp/sb_ipsec.err 2>&1 || true
-    sleep 1
+    export_ss_lib_path
+    if ! start_charon_daemon >>/tmp/sb_ipsec.err 2>&1; then
+        echo "[System] ipsec/stroke aborted: charon did not start" >> "$LOG_FILE"
+        cat /tmp/sb_ipsec.err >> "$LOG_FILE" 2>/dev/null
+        cat /tmp/sb_charon.log >> "$LOG_FILE" 2>/dev/null || true
+        return 1
+    fi
     ensure_strongswan_conf
     STRONGSWAN_CONF="$SB_SS_CONF" ipsec rereadall >>/tmp/sb_ipsec.err 2>&1 || true
     STRONGSWAN_CONF="$SB_SS_CONF" ipsec reload >>/tmp/sb_ipsec.err 2>&1 || true
@@ -1346,7 +1412,11 @@ try_start_ipsec_swanctl() {
     echo "[System] Trying swanctl backend (isolated SWANCTL_DIR=$IPSEC_SWANCTL_DIR)..." >> "$LOG_FILE"
 
     stop_strongswan_daemons
-    start_charon_daemon || true
+    if ! start_charon_daemon; then
+        echo "[System] swanctl aborted: charon did not start (see /tmp/sb_charon.log)" >> "$LOG_FILE"
+        cat /tmp/sb_charon.log >> "$LOG_FILE" 2>/dev/null || true
+        return 1
+    fi
 
     # Validate PEMs before load.
     if ! openssl x509 -in "$IPSEC_DIR/$_id/client.pem" -noout >/tmp/sb_pem.err 2>&1; then
