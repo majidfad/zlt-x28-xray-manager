@@ -1652,3 +1652,792 @@ case "$1" in
         ;;
 esac
 SB_MGR_EOF
+chmod +x /usr/bin/sb-manager
+log "sb-manager installed: $(/usr/bin/sb-manager version 2>/dev/null || echo unknown)"
+
+log "5b. Installing sb-vpn-decode (Amnezia vpn:// decoder)..."
+cat << 'SB_VPNDEC_EOF' > /usr/bin/sb-vpn-decode
+#!/usr/bin/env python3
+"""Decode Amnezia vpn:// share links (qCompress + Base64URL) to JSON on stdout.
+
+Usage:
+  sb-vpn-decode 'vpn://AAA...'
+  sb-vpn-decode /path/to/file.txt
+  echo 'vpn://...' | sb-vpn-decode
+"""
+from __future__ import print_function
+
+import base64
+import json
+import sys
+import zlib
+
+
+def read_input(argv):
+    if len(argv) >= 2:
+        arg = argv[1]
+        if arg.startswith("vpn://") or arg.startswith("VPN://"):
+            return ("vpn", arg.strip())
+        try:
+            with open(arg, "r") as fh:
+                data = fh.read().strip()
+        except IOError as exc:
+            sys.stderr.write("cannot read %s: %s\n" % (arg, exc))
+            sys.exit(2)
+        if data.lower().startswith("vpn://"):
+            return ("vpn", data)
+        return ("json", data)
+    data = sys.stdin.read().strip()
+    if not data:
+        sys.stderr.write("usage: sb-vpn-decode <vpn://...|file>\n")
+        sys.exit(2)
+    if data.lower().startswith("vpn://"):
+        return ("vpn", data)
+    return ("json", data)
+
+
+def b64url_decode(s):
+    s = s.replace("-", "+").replace("_", "/")
+    pad = (-len(s)) % 4
+    if pad:
+        s += "=" * pad
+    return base64.b64decode(s)
+
+
+def quncompress(blob):
+    """Qt qUncompress: 4-byte big-endian size + zlib payload."""
+    if len(blob) < 6:
+        raise ValueError("payload too short")
+    # Prefer Qt layout; fall back to raw zlib / plain JSON.
+    try:
+        return zlib.decompress(blob[4:])
+    except zlib.error:
+        try:
+            return zlib.decompress(blob)
+        except zlib.error:
+            return blob
+
+
+def extract_ipsec_payload(obj):
+    """Prefer IKEv2 last_config / nested config from Amnezia server JSON."""
+    if not isinstance(obj, dict):
+        return obj
+
+    # Already a flat IPsec export
+    if "cert" in obj and ("hostName" in obj or "addr" in obj):
+        return obj
+
+    containers = obj.get("containers") or []
+    default = obj.get("defaultContainer") or ""
+
+    def from_container(c):
+        if not isinstance(c, dict):
+            return None
+        ike = c.get("ikev2") or c.get("ipsec") or {}
+        if not isinstance(ike, dict):
+            return None
+        last = ike.get("last_config")
+        if not last:
+            return None
+        if isinstance(last, str):
+            try:
+                last_obj = json.loads(last)
+            except ValueError:
+                return None
+        elif isinstance(last, dict):
+            last_obj = last
+        else:
+            return None
+        # Nested "config" string is the canonical Amnezia client export.
+        nested = last_obj.get("config")
+        if isinstance(nested, str) and nested.strip().startswith("{"):
+            try:
+                return json.loads(nested)
+            except ValueError:
+                pass
+        # Promote top-level fields; fill host from server if missing.
+        out = dict(last_obj)
+        if "hostName" not in out and obj.get("hostName"):
+            out["hostName"] = obj["hostName"]
+        if "password" not in out:
+            out["password"] = ""
+        if "userName" not in out and out.get("clientId"):
+            out["userName"] = out["clientId"]
+        return out
+
+    # Prefer defaultContainer match
+    preferred = None
+    for c in containers:
+        name = (c or {}).get("container") or ""
+        if default and name == default:
+            preferred = from_container(c)
+            if preferred:
+                return preferred
+        if name in ("amnezia-ipsec", "amnezia-ikev2", "ipsec"):
+            preferred = preferred or from_container(c)
+
+    if preferred:
+        return preferred
+
+    for c in containers:
+        got = from_container(c)
+        if got:
+            return got
+
+    return obj
+
+
+def main():
+    kind, raw = read_input(sys.argv)
+    try:
+        if kind == "vpn":
+            if raw.lower().startswith("vpn://"):
+                raw = raw[6:]
+            blob = b64url_decode(raw)
+            plain = quncompress(blob)
+            if isinstance(plain, bytes):
+                text = plain.decode("utf-8")
+            else:
+                text = plain
+            obj = json.loads(text)
+        else:
+            obj = json.loads(raw)
+    except Exception as exc:
+        sys.stderr.write("failed to decode Amnezia config: %s\n" % exc)
+        sys.exit(1)
+
+    payload = extract_ipsec_payload(obj)
+    if not isinstance(payload, dict) or not payload.get("cert"):
+        sys.stderr.write("no IPsec/IKEv2 cert found in Amnezia config\n")
+        sys.exit(1)
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()
+SB_VPNDEC_EOF
+chmod +x /usr/bin/sb-vpn-decode
+
+log "6. Installing LuCI UI..."
+cat << 'SB_LUA_EOF' > /usr/lib/lua/luci/controller/singbox.lua
+-- LuCI controller for Sing-Box VPN Manager
+-- api_version bumped when breaking UI/controller fixes ship (check status JSON).
+module("luci.controller.singbox", package.seeall)
+
+local SB_API_VERSION = 4
+
+function index()
+    if not nixio.fs.access("/usr/bin/sb-manager") then
+        return
+    end
+
+    entry({"admin", "services", "singbox"}, template("singbox_panel"), _("Sing-Box VPN"), 60).dependent = false
+
+    entry({"admin", "services", "singbox", "status"}, call("action_status")).leaf = true
+    entry({"admin", "services", "singbox", "start"}, call("action_start")).leaf = true
+    entry({"admin", "services", "singbox", "stop"}, call("action_stop")).leaf = true
+    entry({"admin", "services", "singbox", "restart"}, call("action_restart")).leaf = true
+    entry({"admin", "services", "singbox", "switch"}, call("action_switch")).leaf = true
+    entry({"admin", "services", "singbox", "addnode"}, call("action_addnode")).leaf = true
+    entry({"admin", "services", "singbox", "delnode"}, call("action_delnode")).leaf = true
+    entry({"admin", "services", "singbox", "listnodes"}, call("action_listnodes")).leaf = true
+    entry({"admin", "services", "singbox", "mode"}, call("action_mode")).leaf = true
+    entry({"admin", "services", "singbox", "watchdog"}, call("action_watchdog")).leaf = true
+    entry({"admin", "services", "singbox", "log"}, call("action_log")).leaf = true
+end
+
+-- Run a shell command; return trimmed stdout as a SINGLE string.
+-- IMPORTANT: never return string.gsub(...) directly — gsub returns
+-- (result, nsubs), and callers like tonumber(run(...)) would treat nsubs
+-- as the numeric base (e.g. tonumber("0", 1) → "base out of range").
+local function run(cmd)
+    local f = io.popen(cmd)
+    local out = f and f:read("*a") or ""
+    if f then f:close() end
+    out = tostring(out or "")
+    out = out:gsub("%s+$", "")
+    return out
+end
+
+local function read_file(path)
+    local f = io.open(path, "r")
+    if not f then return "" end
+    local data = f:read("*a") or ""
+    f:close()
+    data = data:gsub("%s+$", "")
+    return data
+end
+
+local function write_file(path, data)
+    local fh = io.open(path, "w")
+    if not fh then return false end
+    fh:write(data or "")
+    fh:close()
+    return true
+end
+
+-- Parse an integer from a string safely (ignore gsub secondary returns, junk).
+local function to_int(s, default)
+    if s == nil then return default end
+    if type(s) == "number" then
+        if s ~= s then return default end -- NaN
+        return math.floor(s)
+    end
+    s = tostring(s):match("^%s*([-+]?%d+)") or ""
+    if s == "" then return default end
+    return tonumber(s, 10) or default
+end
+
+-- Shell-quote a single argument to prevent command injection via LuCI params.
+local function shq(s)
+    s = s or ""
+    return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+-- Node ids are restricted to safe filename characters only.
+local function valid_id(id)
+    return id ~= nil and id ~= "" and id:match("^[A-Za-z0-9_%-]+$") ~= nil
+end
+
+function action_status()
+    local running = run("/usr/bin/sb-manager status")
+    local active = run("/usr/bin/sb-manager active")
+    local mode = run("/usr/bin/sb-manager mode_status")
+    local led = run("/usr/bin/sb-manager led_status")
+    local watchdog = run("/usr/bin/sb-manager watchdog_status")
+    local proto = run("/usr/bin/sb-manager nodetype")
+    local mgr_ver = run("/usr/bin/sb-manager version")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({
+        running = running,
+        active_node = active,
+        mode = mode,
+        led = led,
+        watchdog = watchdog,
+        proto = proto,
+        api_version = SB_API_VERSION,
+        manager_version = mgr_ver,
+    })
+end
+
+function action_start()
+    run("/usr/bin/sb-manager start >/dev/null 2>&1 &")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_stop()
+    run("/usr/bin/sb-manager stop >/dev/null 2>&1")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_restart()
+    run("/usr/bin/sb-manager restart >/dev/null 2>&1 &")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_switch()
+    local id = luci.http.formvalue("id")
+    luci.http.prepare_content("application/json")
+    if not valid_id(id) then
+        luci.http.write_json({ ok = false, error = "invalid node id" })
+        return
+    end
+    run("/usr/bin/sb-manager switch " .. shq(id))
+    luci.http.write_json({ ok = true })
+end
+
+function action_addnode()
+    local id = luci.http.formvalue("id")
+    local link = luci.http.formvalue("link")
+    luci.http.prepare_content("application/json")
+    if not valid_id(id) then
+        luci.http.write_json({ ok = false, error = "invalid node id" })
+        return
+    end
+    if not link or link == "" then
+        luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
+        return
+    end
+
+    -- Accept vless://, Amnezia vpn:// share links, or IPsec JSON.
+    local trimmed = link:match("^%s*(.-)%s*$") or link
+    local is_ipsec = trimmed:sub(1, 1) == "{"
+    local is_vless = trimmed:match("^[Vv][Ll][Ee][Ss][Ss]://") ~= nil
+    local is_vpn = trimmed:match("^[Vv][Pp][Nn]://") ~= nil
+    if not is_ipsec and not is_vless and not is_vpn then
+        luci.http.write_json({
+            ok = false,
+            error = "paste vless://, vpn:// (Amnezia), or IPsec JSON ({cert, hostName, ...})"
+        })
+        return
+    end
+
+    local payload = link
+    if is_vless or is_vpn then
+        -- Strip whitespace/newlines inside share links (vpn:// is one token).
+        payload = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
+    else
+        -- Keep JSON structure; only trim outer whitespace.
+        payload = trimmed
+    end
+
+    -- Guard against truncated POSTs (uhttpd body limits) for Amnezia JSON.
+    if is_ipsec then
+        local opens = select(2, payload:gsub("%{", ""))
+        local closes = select(2, payload:gsub("%}", ""))
+        if opens ~= closes or not payload:find('"cert"') then
+            luci.http.write_json({
+                ok = false,
+                error = "IPsec JSON looks truncated or incomplete (missing cert / unbalanced braces). Try vpn:// in LuCI (browser decode) or a smaller paste."
+            })
+            return
+        end
+    end
+
+    local tmp = "/tmp/sb_link_" .. id .. ".txt"
+    local rc_file = "/tmp/sb_addnode_" .. id .. ".rc"
+    local err_file = "/tmp/sb_addnode_" .. id .. ".err"
+    if not write_file(tmp, payload) then
+        luci.http.write_json({ ok = false, error = "failed to write temp file" })
+        return
+    end
+
+    -- Unique rc/err paths avoid races if two adds overlap.
+    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp)
+        .. " >" .. shq(err_file) .. " 2>&1; echo $? > " .. shq(rc_file))
+    os.remove(tmp)
+
+    local rc = to_int(read_file(rc_file), 1)
+    os.remove(rc_file)
+
+    if rc ~= 0 then
+        local err = read_file(err_file)
+        os.remove(err_file)
+        if err == "" then
+            err = "failed to parse config (rc=" .. tostring(rc) .. ")"
+        end
+        -- Keep error message bounded for the UI.
+        if #err > 400 then
+            err = err:sub(1, 400) .. "..."
+        end
+        luci.http.write_json({ ok = false, error = err })
+        return
+    end
+    os.remove(err_file)
+
+    -- Activate the new node so Start/Restart actually uses it.
+    run("/usr/bin/sb-manager switch " .. shq(id))
+    local ntype = run("/usr/bin/sb-manager nodetype " .. shq(id))
+    luci.http.write_json({ ok = true, activated = id, proto = ntype })
+end
+
+function action_delnode()
+    local id = luci.http.formvalue("id")
+    luci.http.prepare_content("application/json")
+    if not valid_id(id) then
+        luci.http.write_json({ ok = false, error = "invalid node id" })
+        return
+    end
+    run("/usr/bin/sb-manager delnode " .. shq(id))
+    luci.http.write_json({ ok = true })
+end
+
+function action_listnodes()
+    local out = run("/usr/bin/sb-manager listnodes")
+    local nodes = {}
+    for id in out:gmatch("[^\n]+") do
+        table.insert(nodes, id)
+    end
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ nodes = nodes })
+end
+
+function action_mode()
+    local mode = luci.http.formvalue("mode")
+    luci.http.prepare_content("application/json")
+    if mode ~= "tunnel" and mode ~= "proxy" then
+        luci.http.write_json({ ok = false, error = "mode must be 'tunnel' or 'proxy'" })
+        return
+    end
+    run("/usr/bin/sb-manager mode_toggle " .. shq(mode))
+    luci.http.write_json({ ok = true })
+end
+
+function action_watchdog()
+    local state = luci.http.formvalue("state")
+    luci.http.prepare_content("application/json")
+    if state ~= "0" and state ~= "1" then
+        luci.http.write_json({ ok = false, error = "state must be 0 or 1" })
+        return
+    end
+    run("/usr/bin/sb-manager watchdog_toggle " .. shq(state))
+    luci.http.write_json({ ok = true })
+end
+
+function action_log()
+    -- Return JSON so LuCI XHR.get can parse it (text/plain left data=null in the UI).
+    local text = ""
+    local f = io.open("/var/log/singbox.log", "r")
+    if f then
+        local size = f:seek("end")
+        if size and size > 8000 then
+            f:seek("set", size - 8000)
+        else
+            f:seek("set", 0)
+        end
+        text = f:read("*a") or ""
+        f:close()
+    end
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ log = text })
+end
+SB_LUA_EOF
+
+cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
+<%+header%>
+
+<div class="cbi-map">
+	<h2 name="content">Sing-Box VPN Manager</h2>
+
+	<div class="cbi-section">
+		<div class="cbi-section-node">
+			<table class="table">
+				<tr>
+					<td class="td" style="width:40%"><strong>Status</strong></td>
+					<td class="td"><span id="sb_status">Loading...</span></td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Active Node</strong></td>
+					<td class="td"><span id="sb_active_node">-</span></td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Routing Mode</strong></td>
+					<td class="td">
+						<select id="sb_mode_select">
+							<option value="tunnel">Full Tunnel (transparent proxy)</option>
+							<option value="proxy">Proxy Only (SOCKS/HTTP on :1080)</option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Watchdog</strong></td>
+					<td class="td">
+						<input type="checkbox" id="sb_watchdog_toggle" /> Auto-restart if sing-box crashes
+					</td>
+				</tr>
+				<tr>
+					<td class="td"><strong>Panel build</strong></td>
+					<td class="td"><span id="sb_api_version">?</span></td>
+				</tr>
+			</table>
+
+			<div class="cbi-page-actions">
+				<button class="cbi-button cbi-button-apply" id="sb_btn_start">Start</button>
+				<button class="cbi-button cbi-button-reset" id="sb_btn_stop">Stop</button>
+				<button class="cbi-button cbi-button-action" id="sb_btn_restart">Restart</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>Nodes</h3>
+		<div class="cbi-section-node">
+			<table class="table" id="sb_node_table">
+				<tr><th class="th">ID</th><th class="th">Actions</th></tr>
+			</table>
+			<div class="cbi-page-actions">
+				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  vpn://... (Amnezia)  OR  IPsec JSON" rows="4" style="width:60%"></textarea>
+				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
+			</div>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> (decoded in your browser), export JSON, or <code>.sswan</code>. Connecting IPsec needs <code>strongswan</code>/<code>swanctl</code> on the router (often missing on OEM ZLT firmware).</p>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>Log (last 8 KB)</h3>
+		<pre id="sb_log" style="max-height:300px; overflow:auto; background:#111; color:#ccc; padding:8px;"></pre>
+	</div>
+</div>
+
+<script type="text/javascript">
+	var sb_url = "<%=luci.dispatcher.build_url("admin", "services", "singbox")%>";
+	var sb_token = "<%=luci.dispatcher.context.authtoken%>";
+	var sb_known_nodes = [];
+
+	function sb_api(action, params, cb, usePost) {
+		params = params || {};
+		var handle = function(x, data) {
+			if (!data && x) {
+				var raw = x.responseText || "";
+				if (raw) {
+					try { data = JSON.parse(raw); } catch (e) {}
+				}
+				if (!data) {
+					data = {
+						ok: false,
+						error: "HTTP " + (x.status || 0) +
+							(raw ? (": " + raw.replace(/\s+/g, " ").substring(0, 180)) : " (empty/no JSON)")
+					};
+				}
+			}
+			cb(data || { ok: false, error: "no response from router" });
+		};
+		if (usePost) {
+			var body = {};
+			for (var k in params) body[k] = params[k];
+			if (sb_token) body.token = sb_token;
+			XHR.post(sb_url + "/" + action, body, handle);
+		} else {
+			var qs = "";
+			for (var k in params) {
+				qs += (qs ? "&" : "") + encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
+			}
+			XHR.get(sb_url + "/" + action + (qs ? "?" + qs : ""), null, handle);
+		}
+	}
+
+	function sb_refresh_status() {
+		sb_api("status", null, function(data) {
+			if (!data) return;
+			var status = data.running || "Unknown";
+			if (data.proto && data.proto !== "none" && data.proto !== "vless") {
+				status = status + " [" + data.proto + "]";
+			}
+			document.getElementById("sb_status").textContent = status;
+			document.getElementById("sb_active_node").textContent =
+				(data.active_node || "none") + (data.proto && data.proto !== "none" ? " (" + data.proto + ")" : "");
+			document.getElementById("sb_mode_select").value = data.mode || "tunnel";
+			document.getElementById("sb_watchdog_toggle").checked = (data.watchdog === "1");
+			var verEl = document.getElementById("sb_api_version");
+			if (verEl) {
+				var ver = data.api_version || 0;
+				var mgr = data.manager_version || "?";
+				verEl.textContent = "API v" + ver + " / manager " + mgr;
+				verEl.style.color = (ver >= 3 && String(mgr).indexOf("ipsec4") >= 0) ? "" : "#c00";
+			}
+		});
+	}
+
+	function sb_refresh_log() {
+		sb_api("log", null, function(data) {
+			var el = document.getElementById("sb_log");
+			el.textContent = (data && data.log) ? data.log : "";
+			el.scrollTop = el.scrollHeight;
+		});
+	}
+
+	function sb_refresh_after_start() {
+		// start/restart run in background; give sing-box a moment before polling.
+		setTimeout(function() {
+			sb_refresh_status();
+			sb_refresh_log();
+		}, 1500);
+	}
+
+	function sb_render_nodes() {
+		var table = document.getElementById("sb_node_table");
+		while (table.rows.length > 1) table.deleteRow(1);
+		sb_known_nodes.forEach(function(id) {
+			var row = table.insertRow(-1);
+			var idCell = row.insertCell(0);
+			var actCell = row.insertCell(1);
+			idCell.textContent = id;
+
+			var switchBtn = document.createElement("button");
+			switchBtn.className = "cbi-button cbi-button-apply";
+			switchBtn.textContent = "Activate";
+			switchBtn.onclick = function() {
+				sb_api("switch", { id: id }, function() {
+					sb_api("restart", null, sb_refresh_after_start);
+				});
+			};
+
+			var delBtn = document.createElement("button");
+			delBtn.className = "cbi-button cbi-button-remove";
+			delBtn.textContent = "Delete";
+			delBtn.onclick = function() {
+				if (!confirm("Delete node " + id + "?")) return;
+				sb_api("delnode", { id: id }, function() {
+					sb_known_nodes = sb_known_nodes.filter(function(n) { return n !== id; });
+					sb_render_nodes();
+				});
+			};
+
+			actCell.appendChild(switchBtn);
+			actCell.appendChild(delBtn);
+		});
+	}
+
+	document.getElementById("sb_btn_start").onclick = function() { sb_api("start", null, sb_refresh_after_start); };
+	document.getElementById("sb_btn_stop").onclick = function() { sb_api("stop", null, sb_refresh_status); };
+	document.getElementById("sb_btn_restart").onclick = function() { sb_api("restart", null, sb_refresh_after_start); };
+
+	document.getElementById("sb_mode_select").onchange = function(e) {
+		sb_api("mode", { mode: e.target.value }, function() {
+			if (confirm("Mode changed. Restart sing-box now to apply?")) {
+				sb_api("restart", null, sb_refresh_status);
+			}
+		});
+	};
+
+	document.getElementById("sb_watchdog_toggle").onchange = function(e) {
+		sb_api("watchdog", { state: e.target.checked ? "1" : "0" }, sb_refresh_status);
+	};
+
+	/* Amnezia vpn:// = Base64URL(qCompress(JSON)). Decode in-browser so the
+	   router does not need python3 (OEM ZLT feeds often lack it). */
+	function sb_b64url_to_u8(s) {
+		s = s.replace(/-/g, "+").replace(/_/g, "/");
+		while (s.length % 4) s += "=";
+		var bin = atob(s);
+		var out = new Uint8Array(bin.length);
+		for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
+	}
+
+	function sb_inflate_zlib(u8) {
+		return new Promise(function(resolve, reject) {
+			if (typeof DecompressionStream === "undefined") {
+				reject(new Error("Browser lacks DecompressionStream; use Chrome/Firefox/Edge, or paste IPsec JSON"));
+				return;
+			}
+			var ds = new DecompressionStream("deflate");
+			var stream = new Blob([u8]).stream().pipeThrough(ds);
+			new Response(stream).arrayBuffer().then(function(buf) {
+				resolve(new TextDecoder("utf-8").decode(buf));
+			}).catch(reject);
+		});
+	}
+
+	function sb_extract_ipsec(obj) {
+		if (!obj || typeof obj !== "object") return null;
+		if (obj.cert && (obj.hostName || obj.addr)) return obj;
+		var containers = obj.containers || [];
+		var def = obj.defaultContainer || "";
+		function fromContainer(c) {
+			if (!c) return null;
+			var ike = c.ikev2 || c.ipsec || {};
+			var last = ike.last_config;
+			if (!last) return null;
+			var lastObj = (typeof last === "string") ? JSON.parse(last) : last;
+			if (lastObj && typeof lastObj.config === "string" && lastObj.config.charAt(0) === "{") {
+				try { return JSON.parse(lastObj.config); } catch (e) {}
+			}
+			if (!lastObj.hostName && obj.hostName) lastObj.hostName = obj.hostName;
+			if (lastObj.password == null) lastObj.password = "";
+			if (!lastObj.userName && lastObj.clientId) lastObj.userName = lastObj.clientId;
+			return lastObj;
+		}
+		var i, c, got = null;
+		for (i = 0; i < containers.length; i++) {
+			c = containers[i];
+			if (def && c.container === def) {
+				got = fromContainer(c);
+				if (got) return got;
+			}
+		}
+		for (i = 0; i < containers.length; i++) {
+			got = fromContainer(containers[i]);
+			if (got) return got;
+		}
+		return null;
+	}
+
+	function sb_decode_vpn_link(link) {
+		var raw = link.replace(/^vpn:\/\//i, "");
+		var blob = sb_b64url_to_u8(raw);
+		var zlibPart = blob.slice(4);
+		return sb_inflate_zlib(zlibPart).then(function(text) {
+			var obj = JSON.parse(text);
+			var ipsec = sb_extract_ipsec(obj);
+			if (!ipsec || !ipsec.cert) throw new Error("No Amnezia IPsec/IKEv2 cert in vpn:// payload");
+			return JSON.stringify(ipsec);
+		});
+	}
+
+	function sb_do_addnode(id, payload) {
+		sb_api("addnode", { id: id, link: payload }, function(data) {
+			if (data && data.ok) {
+				if (sb_known_nodes.indexOf(id) === -1) sb_known_nodes.push(id);
+				sb_render_nodes();
+				document.getElementById("sb_new_node_id").value = "";
+				document.getElementById("sb_new_node_link").value = "";
+				sb_api("restart", null, sb_refresh_after_start);
+			} else {
+				alert("Failed to add node: " + ((data && data.error) || "unknown error"));
+			}
+		}, true);
+	}
+
+	document.getElementById("sb_btn_addnode").onclick = function() {
+		var id = document.getElementById("sb_new_node_id").value.trim();
+		var link = document.getElementById("sb_new_node_link").value.trim();
+		if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+			alert("Node id must be alphanumeric (letters, digits, -, _ only).");
+			return;
+		}
+		if (!link) {
+			alert("Paste a vless://, vpn:// (Amnezia), or IPsec JSON config first.");
+			return;
+		}
+		var isJson = link.charAt(0) === "{";
+		var low = link.toLowerCase();
+		var isVless = low.indexOf("vless://") === 0;
+		var isVpn = low.indexOf("vpn://") === 0;
+		if (!isJson && !isVless && !isVpn) {
+			alert("Config must be vless://, vpn://, or JSON starting with {");
+			return;
+		}
+		if (isVpn) {
+			sb_decode_vpn_link(link.replace(/\s+/g, "")).then(function(jsonPayload) {
+				sb_do_addnode(id, jsonPayload);
+			}).catch(function(err) {
+				alert("Failed to decode vpn:// in browser: " + (err && err.message ? err.message : err));
+			});
+			return;
+		}
+		sb_do_addnode(id, isVless ? link.replace(/\s+/g, "") : link);
+	};
+
+	function sb_load_nodes() {
+		sb_api("listnodes", null, function(data) {
+			sb_known_nodes = (data && data.nodes) || [];
+			sb_render_nodes();
+		});
+	}
+
+	sb_refresh_status();
+	sb_load_nodes();
+	sb_refresh_log();
+	setInterval(sb_refresh_status, 5000);
+	setInterval(sb_refresh_log, 8000);
+</script>
+
+<%+footer%>
+SB_HTM_EOF
+rm -f /usr/lib/lua/luci/controller/xray.lua /usr/lib/lua/luci/view/xray_panel.htm 2>/dev/null || true
+
+log "7. Initializing state files (preserving existing nodes)..."
+: > /etc/singbox/nodes.list
+[ -f /etc/singbox/active_node ] || printf 'none' > /etc/singbox/active_node
+[ -f /etc/singbox/routing_mode ] || printf 'tunnel' > /etc/singbox/routing_mode
+[ -f /etc/singbox/watchdog.flag ] || printf '0' > /etc/singbox/watchdog.flag
+# Keep sb_bin.path written during binary install.
+[ -f /etc/singbox/sb_bin.path ] || printf '%s\n' "$SB_BIN_PATH" > /etc/singbox/sb_bin.path
+
+log "8. Clearing LuCI cache..."
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-templatecache 2>/dev/null || true
+/etc/init.d/uhttpd restart 2>/dev/null || true
+
+log "======================================================="
+log "Sing-Box VPN Manager ${SINGBOX_VERSION} installed."
+log "VLESS:   echo 'vless://...' > /tmp/link.txt && sb-manager addnode home1 /tmp/link.txt"
+log "Amnezia: echo 'vpn://...' > /tmp/a.txt && sb-manager addnode ike1 /tmp/a.txt"
+log "         (or paste vpn:// / IPsec JSON in LuCI)"
+log "Then:    sb-manager switch <id> && sb-manager start"
+log "======================================================="
