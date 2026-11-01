@@ -10,7 +10,7 @@
 set -eu
 
 SINGBOX_VERSION="1.14.3"
-INSTALLER_VERSION="2026.11.01-ipsec23"
+INSTALLER_VERSION="2026.11.01-ipsec24"
 
 log() { echo "[install] $*"; }
 log "installer ${INSTALLER_VERSION}"
