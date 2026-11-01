@@ -35,7 +35,7 @@ rm -f /etc/swanctl/conf.d/sbvpn.conf \
 
 log "Removing files..."
 rm -rf /data/singbox_core /opt/singbox_core /usr/local/singbox_core /etc/singbox
-rm -f /usr/bin/sb-manager /usr/bin/sing-box
+rm -f /usr/bin/sb-manager /usr/bin/sb-vpn-decode /usr/bin/sing-box
 rm -f /usr/lib/lua/luci/controller/singbox.lua
 rm -f /usr/lib/lua/luci/view/singbox_panel.htm
 

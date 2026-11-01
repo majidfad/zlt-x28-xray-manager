@@ -228,14 +228,73 @@ EOF
     return 0
 }
 
+# Decode Amnezia vpn:// share link → JSON file. Needs python3 (sb-vpn-decode).
+decode_vpn_link_file() {
+    _in="$1"
+    _out="$2"
+    _dec=""
+    for _c in /usr/bin/sb-vpn-decode /usr/local/bin/sb-vpn-decode; do
+        [ -x "$_c" ] && _dec="$_c" && break
+    done
+    if [ -z "$_dec" ]; then
+        echo "[System] sb-vpn-decode missing; cannot import vpn:// links." >> "$LOG_FILE"
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    elif command -v python >/dev/null 2>&1; then
+        python "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    else
+        # shebang may still work if env python3 exists
+        "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    fi
+    if [ ! -s "$_out" ]; then
+        echo "[System] vpn:// decode failed:" >> "$LOG_FILE"
+        cat /tmp/sb_vpn_decode.err >> "$LOG_FILE" 2>/dev/null
+        echo "vpn:// decode failed (need python3 + sb-vpn-decode). See /var/log/singbox.log" >&2
+        return 1
+    fi
+    return 0
+}
+
 parse_link_to_json() {
     FILE="$1"
-    # Detect Amnezia IKEv2/IPsec JSON (export or strongswan.profile / .sswan)
+    # Amnezia share link: vpn:// + Base64URL(qCompress(JSON))
+    _head=$(head -c 16 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
+    case "$_head" in
+        vpn://*|VPN://*)
+            if ! decode_vpn_link_file "$FILE" /tmp/sb_vpn_decoded.json; then
+                return
+            fi
+            # Decoded payload may be flat IPsec JSON or still a server object —
+            # parse_ipsec_json + decoder already prefers ikev2 last_config.
+            if parse_ipsec_json /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json; then
+                cat /tmp/sb_parse_out.json
+            else
+                # If decoder returned full server JSON without extract, try raw fields
+                echo "Failed to extract IPsec config from vpn:// link" >&2
+            fi
+            rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+            return
+            ;;
+    esac
+
+    # Detect Amnezia IKEv2/IPsec JSON (export, server JSON, or .sswan)
     _head=$(head -c 256 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
     case "$_head" in
         \{*)
-            if grep -qE '"hostName"|"addr"|"ikev2-cert"|"p12"' "$FILE" 2>/dev/null \
-                && grep -qE '"cert"|"p12"' "$FILE" 2>/dev/null; then
+            if grep -qE '"hostName"|"addr"|"ikev2-cert"|"p12"|"amnezia-ipsec"|"ikev2"|"last_config"' "$FILE" 2>/dev/null \
+                && grep -qE '"cert"|"p12"|"last_config"' "$FILE" 2>/dev/null; then
+                # Full Amnezia server JSON → extract via sb-vpn-decode
+                if grep -q '"containers"' "$FILE" 2>/dev/null; then
+                    if decode_vpn_link_file "$FILE" /tmp/sb_vpn_decoded.json \
+                        && parse_ipsec_json /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json; then
+                        cat /tmp/sb_parse_out.json
+                        rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+                        return
+                    fi
+                    rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+                fi
                 parse_ipsec_json "$FILE" /tmp/sb_parse_out.json && cat /tmp/sb_parse_out.json
                 rm -f /tmp/sb_parse_out.json
                 return
@@ -856,7 +915,7 @@ case "$1" in
         parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
         if [ ! -s "$DIR_SB/node_$2.json" ]; then
             rm -f "$DIR_SB/node_$2.json"
-            echo "Failed to parse config (expected vless:// or Amnezia IPsec JSON: cert/hostName or .sswan)" >&2
+            echo "Failed to parse config (expected vless://, vpn://, or Amnezia IPsec JSON)" >&2
             exit 1
         fi
         exit 0

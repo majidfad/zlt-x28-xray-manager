@@ -220,6 +220,25 @@ elif command -v opkg >/dev/null 2>&1; then
 else
     log "NOTE: no opkg — install strongSwan manually if you need IPsec."
 fi
+
+# python3 is required to decode Amnezia vpn:// share links (qCompress+Base64URL).
+log "2c. Checking python3 (for vpn:// Amnezia links)..."
+if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+    log "python3 available for vpn:// decode."
+elif command -v opkg >/dev/null 2>&1; then
+    for _pkg in python3-light python3; do
+        if opkg install "$_pkg" >/tmp/sb_opkg_py.log 2>&1; then
+            log "Installed $_pkg"
+            break
+        fi
+    done
+    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+        log "NOTE: python3 not installed — vpn:// import needs: opkg install python3-light"
+        log "      (raw IPsec JSON still works without python3)"
+    fi
+else
+    log "NOTE: install python3 to import Amnezia vpn:// share links."
+fi
 CORE_DIR="$(pick_core_dir)"
 SB_BIN_PATH="$CORE_DIR/sing-box"
 # When falling back to /usr/bin, binary name is just sing-box there already.
@@ -541,14 +560,73 @@ EOF
     return 0
 }
 
+# Decode Amnezia vpn:// share link → JSON file. Needs python3 (sb-vpn-decode).
+decode_vpn_link_file() {
+    _in="$1"
+    _out="$2"
+    _dec=""
+    for _c in /usr/bin/sb-vpn-decode /usr/local/bin/sb-vpn-decode; do
+        [ -x "$_c" ] && _dec="$_c" && break
+    done
+    if [ -z "$_dec" ]; then
+        echo "[System] sb-vpn-decode missing; cannot import vpn:// links." >> "$LOG_FILE"
+        return 1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    elif command -v python >/dev/null 2>&1; then
+        python "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    else
+        # shebang may still work if env python3 exists
+        "$_dec" "$_in" > "$_out" 2>/tmp/sb_vpn_decode.err
+    fi
+    if [ ! -s "$_out" ]; then
+        echo "[System] vpn:// decode failed:" >> "$LOG_FILE"
+        cat /tmp/sb_vpn_decode.err >> "$LOG_FILE" 2>/dev/null
+        echo "vpn:// decode failed (need python3 + sb-vpn-decode). See /var/log/singbox.log" >&2
+        return 1
+    fi
+    return 0
+}
+
 parse_link_to_json() {
     FILE="$1"
-    # Detect Amnezia IKEv2/IPsec JSON (export or strongswan.profile / .sswan)
+    # Amnezia share link: vpn:// + Base64URL(qCompress(JSON))
+    _head=$(head -c 16 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
+    case "$_head" in
+        vpn://*|VPN://*)
+            if ! decode_vpn_link_file "$FILE" /tmp/sb_vpn_decoded.json; then
+                return
+            fi
+            # Decoded payload may be flat IPsec JSON or still a server object —
+            # parse_ipsec_json + decoder already prefers ikev2 last_config.
+            if parse_ipsec_json /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json; then
+                cat /tmp/sb_parse_out.json
+            else
+                # If decoder returned full server JSON without extract, try raw fields
+                echo "Failed to extract IPsec config from vpn:// link" >&2
+            fi
+            rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+            return
+            ;;
+    esac
+
+    # Detect Amnezia IKEv2/IPsec JSON (export, server JSON, or .sswan)
     _head=$(head -c 256 "$FILE" 2>/dev/null | tr -d '\r\n\t ')
     case "$_head" in
         \{*)
-            if grep -qE '"hostName"|"addr"|"ikev2-cert"|"p12"' "$FILE" 2>/dev/null \
-                && grep -qE '"cert"|"p12"' "$FILE" 2>/dev/null; then
+            if grep -qE '"hostName"|"addr"|"ikev2-cert"|"p12"|"amnezia-ipsec"|"ikev2"|"last_config"' "$FILE" 2>/dev/null \
+                && grep -qE '"cert"|"p12"|"last_config"' "$FILE" 2>/dev/null; then
+                # Full Amnezia server JSON → extract via sb-vpn-decode
+                if grep -q '"containers"' "$FILE" 2>/dev/null; then
+                    if decode_vpn_link_file "$FILE" /tmp/sb_vpn_decoded.json \
+                        && parse_ipsec_json /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json; then
+                        cat /tmp/sb_parse_out.json
+                        rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+                        return
+                    fi
+                    rm -f /tmp/sb_vpn_decoded.json /tmp/sb_parse_out.json
+                fi
                 parse_ipsec_json "$FILE" /tmp/sb_parse_out.json && cat /tmp/sb_parse_out.json
                 rm -f /tmp/sb_parse_out.json
                 return
@@ -1169,7 +1247,7 @@ case "$1" in
         parse_link_to_json "$3" > "$DIR_SB/node_$2.json"
         if [ ! -s "$DIR_SB/node_$2.json" ]; then
             rm -f "$DIR_SB/node_$2.json"
-            echo "Failed to parse config (expected vless:// or Amnezia IPsec JSON: cert/hostName or .sswan)" >&2
+            echo "Failed to parse config (expected vless://, vpn://, or Amnezia IPsec JSON)" >&2
             exit 1
         fi
         exit 0
@@ -1212,6 +1290,170 @@ case "$1" in
 esac
 SB_MGR_EOF
 chmod +x /usr/bin/sb-manager
+
+log "5b. Installing sb-vpn-decode (Amnezia vpn:// decoder)..."
+cat << 'SB_VPNDEC_EOF' > /usr/bin/sb-vpn-decode
+#!/usr/bin/env python3
+"""Decode Amnezia vpn:// share links (qCompress + Base64URL) to JSON on stdout.
+
+Usage:
+  sb-vpn-decode 'vpn://AAA...'
+  sb-vpn-decode /path/to/file.txt
+  echo 'vpn://...' | sb-vpn-decode
+"""
+from __future__ import print_function
+
+import base64
+import json
+import sys
+import zlib
+
+
+def read_input(argv):
+    if len(argv) >= 2:
+        arg = argv[1]
+        if arg.startswith("vpn://") or arg.startswith("VPN://"):
+            return ("vpn", arg.strip())
+        try:
+            with open(arg, "r") as fh:
+                data = fh.read().strip()
+        except IOError as exc:
+            sys.stderr.write("cannot read %s: %s\n" % (arg, exc))
+            sys.exit(2)
+        if data.lower().startswith("vpn://"):
+            return ("vpn", data)
+        return ("json", data)
+    data = sys.stdin.read().strip()
+    if not data:
+        sys.stderr.write("usage: sb-vpn-decode <vpn://...|file>\n")
+        sys.exit(2)
+    if data.lower().startswith("vpn://"):
+        return ("vpn", data)
+    return ("json", data)
+
+
+def b64url_decode(s):
+    s = s.replace("-", "+").replace("_", "/")
+    pad = (-len(s)) % 4
+    if pad:
+        s += "=" * pad
+    return base64.b64decode(s)
+
+
+def quncompress(blob):
+    """Qt qUncompress: 4-byte big-endian size + zlib payload."""
+    if len(blob) < 6:
+        raise ValueError("payload too short")
+    # Prefer Qt layout; fall back to raw zlib / plain JSON.
+    try:
+        return zlib.decompress(blob[4:])
+    except zlib.error:
+        try:
+            return zlib.decompress(blob)
+        except zlib.error:
+            return blob
+
+
+def extract_ipsec_payload(obj):
+    """Prefer IKEv2 last_config / nested config from Amnezia server JSON."""
+    if not isinstance(obj, dict):
+        return obj
+
+    # Already a flat IPsec export
+    if "cert" in obj and ("hostName" in obj or "addr" in obj):
+        return obj
+
+    containers = obj.get("containers") or []
+    default = obj.get("defaultContainer") or ""
+
+    def from_container(c):
+        if not isinstance(c, dict):
+            return None
+        ike = c.get("ikev2") or c.get("ipsec") or {}
+        if not isinstance(ike, dict):
+            return None
+        last = ike.get("last_config")
+        if not last:
+            return None
+        if isinstance(last, str):
+            try:
+                last_obj = json.loads(last)
+            except ValueError:
+                return None
+        elif isinstance(last, dict):
+            last_obj = last
+        else:
+            return None
+        # Nested "config" string is the canonical Amnezia client export.
+        nested = last_obj.get("config")
+        if isinstance(nested, str) and nested.strip().startswith("{"):
+            try:
+                return json.loads(nested)
+            except ValueError:
+                pass
+        # Promote top-level fields; fill host from server if missing.
+        out = dict(last_obj)
+        if "hostName" not in out and obj.get("hostName"):
+            out["hostName"] = obj["hostName"]
+        if "password" not in out:
+            out["password"] = ""
+        if "userName" not in out and out.get("clientId"):
+            out["userName"] = out["clientId"]
+        return out
+
+    # Prefer defaultContainer match
+    preferred = None
+    for c in containers:
+        name = (c or {}).get("container") or ""
+        if default and name == default:
+            preferred = from_container(c)
+            if preferred:
+                return preferred
+        if name in ("amnezia-ipsec", "amnezia-ikev2", "ipsec"):
+            preferred = preferred or from_container(c)
+
+    if preferred:
+        return preferred
+
+    for c in containers:
+        got = from_container(c)
+        if got:
+            return got
+
+    return obj
+
+
+def main():
+    kind, raw = read_input(sys.argv)
+    try:
+        if kind == "vpn":
+            if raw.lower().startswith("vpn://"):
+                raw = raw[6:]
+            blob = b64url_decode(raw)
+            plain = quncompress(blob)
+            if isinstance(plain, bytes):
+                text = plain.decode("utf-8")
+            else:
+                text = plain
+            obj = json.loads(text)
+        else:
+            obj = json.loads(raw)
+    except Exception as exc:
+        sys.stderr.write("failed to decode Amnezia config: %s\n" % exc)
+        sys.exit(1)
+
+    payload = extract_ipsec_payload(obj)
+    if not isinstance(payload, dict) or not payload.get("cert"):
+        sys.stderr.write("no IPsec/IKEv2 cert found in Amnezia config\n")
+        sys.exit(1)
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()
+SB_VPNDEC_EOF
+chmod +x /usr/bin/sb-vpn-decode
 
 log "6. Installing LuCI UI..."
 cat << 'SB_LUA_EOF' > /usr/lib/lua/luci/controller/singbox.lua
@@ -1315,21 +1557,21 @@ function action_addnode()
         luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
         return
     end
-    -- Detect Amnezia-style IPsec JSON vs vless:// share link.
+    -- Accept vless://, Amnezia vpn:// share links, or IPsec JSON.
     local trimmed = link:match("^%s*(.-)%s*$") or link
     local is_ipsec = trimmed:sub(1, 1) == "{"
-    local is_vless = trimmed:match("^vless://") ~= nil
-    if not is_ipsec and not is_vless then
-        -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
+    local is_vless = trimmed:match("^[Vv][Ll][Ee][Ss][Ss]://") ~= nil
+    local is_vpn = trimmed:match("^[Vv][Pp][Nn]://") ~= nil
+    if not is_ipsec and not is_vless and not is_vpn then
         luci.http.write_json({
             ok = false,
-            error = "paste a vless:// URL or Amnezia IPsec JSON ({cert, hostName, userName, password})"
+            error = "paste vless://, vpn:// (Amnezia), or IPsec JSON ({cert, hostName, ...})"
         })
         return
     end
     local payload = link
-    if is_vless then
-        -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+    if is_vless or is_vpn then
+        -- Strip whitespace/newlines inside share links (vpn:// is one token).
         payload = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
     else
         -- Keep JSON structure; only trim outer whitespace.
@@ -1472,10 +1714,10 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			</table>
 			<div class="cbi-page-actions">
 				<input type="text" id="sb_new_node_id" placeholder="node id (e.g. home1)" style="width:150px" />
-				<textarea id="sb_new_node_link" placeholder="vless://...  OR  Amnezia IPsec JSON {&quot;cert&quot;,&quot;hostName&quot;,&quot;userName&quot;,&quot;password&quot;}" rows="4" style="width:60%"></textarea>
+				<textarea id="sb_new_node_link" placeholder="vless://...  OR  vpn://... (Amnezia)  OR  IPsec JSON" rows="4" style="width:60%"></textarea>
 				<button class="cbi-button cbi-button-add" id="sb_btn_addnode">Add Node</button>
 			</div>
-			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> share link &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: paste export JSON (<code>cert</code> + <code>hostName</code> + <code>userName</code> + <code>password</code>) or <code>.sswan</code> profile. Needs strongSwan on the router.</p>
+			<p style="opacity:0.75;margin-top:4px"><strong>VLESS</strong>: <code>vless://</code> &nbsp;|&nbsp; <strong>Amnezia IPsec</strong>: <code>vpn://</code> share link, export JSON, or <code>.sswan</code>. Needs strongSwan + python3 on the router.</p>
 		</div>
 	</div>
 
@@ -1611,13 +1853,15 @@ cat << 'SB_HTM_EOF' > /usr/lib/lua/luci/view/singbox_panel.htm
 			return;
 		}
 		if (!link) {
-			alert("Paste a vless:// link or Amnezia IPsec JSON first.");
+			alert("Paste a vless://, vpn:// (Amnezia), or IPsec JSON config first.");
 			return;
 		}
 		var isJson = link.charAt(0) === "{";
-		var isVless = link.indexOf("vless://") === 0;
-		if (!isJson && !isVless) {
-			alert("Config must be a vless:// URL or Amnezia IPsec JSON starting with {");
+		var low = link.toLowerCase();
+		var isVless = low.indexOf("vless://") === 0;
+		var isVpn = low.indexOf("vpn://") === 0;
+		if (!isJson && !isVless && !isVpn) {
+			alert("Config must be vless://, vpn://, or JSON starting with {");
 			return;
 		}
 		// POST: payloads are too long/fragile for GET query strings.
@@ -1666,8 +1910,8 @@ rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-templatecache 2>/dev
 
 log "======================================================="
 log "Sing-Box VPN Manager ${SINGBOX_VERSION} installed."
-log "VLESS:  echo 'vless://...' > /tmp/link.txt && sb-manager addnode home1 /tmp/link.txt"
-log "IPsec:  save Amnezia JSON (cert/hostName/userName/password) to a file, then:"
-log "        sb-manager addnode ike1 /tmp/ipsec.json"
-log "Then:   sb-manager switch <id> && sb-manager start"
+log "VLESS:   echo 'vless://...' > /tmp/link.txt && sb-manager addnode home1 /tmp/link.txt"
+log "Amnezia: echo 'vpn://...' > /tmp/a.txt && sb-manager addnode ike1 /tmp/a.txt"
+log "         (or paste vpn:// / IPsec JSON in LuCI)"
+log "Then:    sb-manager switch <id> && sb-manager start"
 log "======================================================="

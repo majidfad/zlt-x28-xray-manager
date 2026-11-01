@@ -98,21 +98,21 @@ function action_addnode()
         luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
         return
     end
-    -- Detect Amnezia-style IPsec JSON vs vless:// share link.
+    -- Accept vless://, Amnezia vpn:// share links, or IPsec JSON.
     local trimmed = link:match("^%s*(.-)%s*$") or link
     local is_ipsec = trimmed:sub(1, 1) == "{"
-    local is_vless = trimmed:match("^vless://") ~= nil
-    if not is_ipsec and not is_vless then
-        -- Maybe JSON with leading BOM/whitespace already handled; reject junk.
+    local is_vless = trimmed:match("^[Vv][Ll][Ee][Ss][Ss]://") ~= nil
+    local is_vpn = trimmed:match("^[Vv][Pp][Nn]://") ~= nil
+    if not is_ipsec and not is_vless and not is_vpn then
         luci.http.write_json({
             ok = false,
-            error = "paste a vless:// URL or Amnezia IPsec JSON ({cert, hostName, userName, password})"
+            error = "paste vless://, vpn:// (Amnezia), or IPsec JSON ({cert, hostName, ...})"
         })
         return
     end
     local payload = link
-    if is_vless then
-        -- Normalize pasted links: strip whitespace and optional surrounding quotes.
+    if is_vless or is_vpn then
+        -- Strip whitespace/newlines inside share links (vpn:// is one token).
         payload = link:gsub("^[%s\"']+", ""):gsub("[%s\"']+$", ""):gsub("%s+", "")
     else
         -- Keep JSON structure; only trim outer whitespace.

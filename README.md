@@ -62,33 +62,26 @@ sb-manager start
 
 ### Amnezia IPsec (IKEv2)
 
-Paste an Amnezia client export (certificate auth):
+Accepted inputs:
 
-```json
-{
-  "cert": "<base64 PKCS#12>",
-  "hostName": "45.59.114.193",
-  "password": "",
-  "userName": "bh0tvgzSYjve"
-}
-```
-
-Also accepts Amnezia `strongswan.profile` / `.sswan` JSON (`type: ikev2-cert`,
-`remote.addr`, `local.p12`).
+1. **`vpn://...` share link** (Amnezia app “Share” / QR payload)
+2. Flat export JSON (`cert` / `hostName` / `userName` / `password`)
+3. `strongswan.profile` / `.sswan` (`type: ikev2-cert`)
 
 ```sh
-# Save the JSON to a file, then:
-sb-manager addnode ike1 /tmp/ipsec.json
+# vpn:// share link:
+echo 'vpn://AAA...' > /tmp/amnezia.txt
+sb-manager addnode ike1 /tmp/amnezia.txt
 sb-manager switch ike1
 sb-manager start
-# status should show: Running (Amnezia IPsec)
+# status → Running (Amnezia IPsec)
 ```
 
-Requires **strongSwan** + **openssl** (`swanctl` or `ipsec`). The installer
-tries `opkg install strongswan-full swanctl openssl-util` when possible.
-Switching between VLESS and Amnezia IPsec stops the other engine automatically.
-Proxy-only mode is for sing-box (VLESS); Amnezia IPsec always uses a
-policy-based tunnel + LAN SNAT.
+`vpn://` decoding needs **python3** (`opkg install python3-light`) plus
+`sb-vpn-decode` (installed by `install.sh`). Connecting needs **strongSwan** +
+**openssl** (`swanctl` / `ipsec`). Switching VLESS ↔ Amnezia IPsec stops the
+other engine automatically. Proxy-only mode is for sing-box; Amnezia IPsec
+always uses a policy-based tunnel + LAN SNAT.
 
 Common commands:
 
@@ -169,6 +162,7 @@ files/
     base_config.json      # sing-box config template (outbounds injected here)
   usr/bin/
     sb-manager             # core control script (start/stop/node mgmt/watchdog)
+    sb-vpn-decode          # Amnezia vpn:// → IPsec JSON (python3)
   usr/lib/lua/luci/
     controller/singbox.lua # LuCI backend (AJAX endpoints)
     view/singbox_panel.htm # LuCI frontend panel
