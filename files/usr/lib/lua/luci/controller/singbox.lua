@@ -1,5 +1,8 @@
 -- LuCI controller for Sing-Box VPN Manager
+-- api_version bumped when breaking UI/controller fixes ship (check status JSON).
 module("luci.controller.singbox", package.seeall)
+
+local SB_API_VERSION = 4
 
 function index()
     if not nixio.fs.access("/usr/bin/sb-manager") then
@@ -81,6 +84,7 @@ function action_status()
     local led = run("/usr/bin/sb-manager led_status")
     local watchdog = run("/usr/bin/sb-manager watchdog_status")
     local proto = run("/usr/bin/sb-manager nodetype")
+    local mgr_ver = run("/usr/bin/sb-manager version")
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         running = running,
@@ -89,6 +93,8 @@ function action_status()
         led = led,
         watchdog = watchdog,
         proto = proto,
+        api_version = SB_API_VERSION,
+        manager_version = mgr_ver,
     })
 end
 

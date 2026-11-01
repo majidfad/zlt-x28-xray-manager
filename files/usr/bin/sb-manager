@@ -21,7 +21,10 @@ SB_BIN="/data/singbox_core/sing-box"
 IPSEC_DIR="$DIR_SB/ipsec"
 IPSEC_CONN="sbvpn"
 IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
+# Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
+IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
+SB_MANAGER_VERSION="2026.11.01-ipsec4"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -468,13 +471,14 @@ clean_ipsec_nat() {
 stop_ipsec() {
     clean_ipsec_nat
     if command -v swanctl >/dev/null 2>&1; then
+        SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --terminate --ike "$IPSEC_CONN" >/dev/null 2>&1 || true
         swanctl --terminate --ike "$IPSEC_CONN" >/dev/null 2>&1 || true
-        rm -f "$IPSEC_SWANCTL"
-        swanctl --load-conns >/dev/null 2>&1 || swanctl --load-all >/dev/null 2>&1 || true
-    elif command -v ipsec >/dev/null 2>&1; then
+        rm -f "$IPSEC_SWANCTL" /etc/swanctl/conf.d/sbvpn.conf
+        rm -rf "$IPSEC_SWANCTL_DIR"
+    fi
+    if command -v ipsec >/dev/null 2>&1; then
         ipsec down "$IPSEC_CONN" >/dev/null 2>&1 || true
         rm -f /etc/ipsec.d/sbvpn.conf /etc/ipsec.conf.sbvpn 2>/dev/null
-        # Remove our include block if present
         if [ -f /etc/ipsec.conf ] && grep -q "sbvpn-begin" /etc/ipsec.conf 2>/dev/null; then
             awk '/# sbvpn-begin/{skip=1} /# sbvpn-end/{skip=0; next} !skip{print}' /etc/ipsec.conf > /tmp/ipsec.conf.new
             mv /tmp/ipsec.conf.new /etc/ipsec.conf
@@ -538,18 +542,20 @@ prepare_ipsec_material() {
         fi
     fi
 
-    # Split certificates / key from the bag.
+    # Split certificates / key from the bag (PKCS#8, RSA, EC).
     awk '
-        /BEGIN (ENCRYPTED )?PRIVATE KEY/,/END (ENCRYPTED )?PRIVATE KEY/ {print > keyf}
-        /BEGIN CERTIFICATE/ {c++; n=c}
-        /BEGIN CERTIFICATE/,/END CERTIFICATE/ {
-            if (n==1) print > certf
-            else print > caf
-        }
+        /BEGIN ([A-Z0-9]+ )?PRIVATE KEY/ { k=1 }
+        k { print > keyf }
+        /END ([A-Z0-9]+ )?PRIVATE KEY/ { k=0 }
+        /BEGIN CERTIFICATE/ { c++; n=c; cert=1 }
+        cert { if (n==1) print > certf; else print > caf }
+        /END CERTIFICATE/ { cert=0 }
     ' keyf="$_dir/client.key" certf="$_dir/client.pem" caf="$_dir/ca.pem" "$_dir/all.pem"
 
     if [ ! -s "$_dir/client.key" ] || [ ! -s "$_dir/client.pem" ]; then
         echo "[System] PKCS#12 did not contain a client key+cert." >> "$LOG_FILE"
+        echo "[System] all.pem head:" >> "$LOG_FILE"
+        head -n 5 "$_dir/all.pem" >> "$LOG_FILE" 2>/dev/null
         return 1
     fi
     chmod 600 "$_dir/client.key" "$_dir/client.p12" "$_dir/all.pem"
@@ -561,82 +567,91 @@ prepare_ipsec_material() {
     return 0
 }
 
+# Build an isolated SWANCTL_DIR so OEM /etc/swanctl junk cannot break --load-all.
+prepare_swanctl_dir() {
+    _id="$1"
+    _dir="$IPSEC_DIR/$_id"
+    rm -rf "$IPSEC_SWANCTL_DIR"
+    mkdir -p "$IPSEC_SWANCTL_DIR/x509" "$IPSEC_SWANCTL_DIR/private" \
+             "$IPSEC_SWANCTL_DIR/x509ca" "$IPSEC_SWANCTL_DIR/conf.d"
+    cp -f "$_dir/client.pem" "$IPSEC_SWANCTL_DIR/x509/sbvpn_client.pem"
+    cp -f "$_dir/client.key" "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
+    if [ -s "$_dir/ca.pem" ]; then
+        cp -f "$_dir/ca.pem" "$IPSEC_SWANCTL_DIR/x509ca/sbvpn_ca.pem"
+    fi
+    chmod 600 "$IPSEC_SWANCTL_DIR/private/sbvpn_client.key"
+    # Minimal main file — only our connection.
+    echo "include conf.d/*.conf" > "$IPSEC_SWANCTL_DIR/swanctl.conf"
+    # Also mirror into system conf.d for visibility/debugging.
+    mkdir -p /etc/swanctl/conf.d
+}
+
+# Write a minimal Amnezia-compatible swanctl conn into the isolated dir.
 write_swanctl_conn() {
     _id="$1"
     _dir="$IPSEC_DIR/$_id"
     _node="$DIR_SB/node_${_id}.json"
     _host=$(cat "$_dir/host")
     _user=$(cat "$_dir/user")
-    _pass=$(cat "$_dir/pass" 2>/dev/null)
     _ike=$(extract_json_str "$_node" ikeProposal)
     _esp=$(extract_json_str "$_node" espProposal)
+    _use_pss="${2:-0}"
+    _variant="${3:-full}"
     [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
     [ -z "$_esp" ] && _esp="aes128gcm16"
 
-    # Amnezia Android profile loads PKCS#12 directly; prefer that when swanctl supports it.
-    mkdir -p /etc/swanctl/conf.d /etc/swanctl/x509 /etc/swanctl/private \
-             /etc/swanctl/x509ca /etc/swanctl/pkcs12
-    cp -f "$_dir/client.p12" "/etc/swanctl/pkcs12/sbvpn_client.p12"
-    cp -f "$_dir/client.pem" "/etc/swanctl/x509/sbvpn_client.pem"
-    cp -f "$_dir/client.key" "/etc/swanctl/private/sbvpn_client.key"
-    if [ -s "$_dir/ca.pem" ]; then
-        cp -f "$_dir/ca.pem" "/etc/swanctl/x509ca/sbvpn_ca.pem"
-    fi
-    chmod 600 /etc/swanctl/private/sbvpn_client.key /etc/swanctl/pkcs12/sbvpn_client.p12
+    prepare_swanctl_dir "$_id"
+    _cfg="$IPSEC_SWANCTL_DIR/conf.d/sbvpn.conf"
+    IPSEC_SWANCTL="$_cfg"
 
-    _local_id=""
-    if [ -n "$_user" ]; then
-        _local_id="id = $_user"
-    fi
-    _p12_secret=""
-    if [ -n "$_pass" ]; then
-        _p12_secret="secret = \"$_pass\""
-    fi
-    _ca_line=""
-    if [ -s "$_dir/ca.pem" ]; then
-        _ca_line="cacerts = sbvpn_ca.pem"
-    fi
+    {
+        echo "connections {"
+        echo "    ${IPSEC_CONN} {"
+        echo "        version = 2"
+        echo "        remote_addrs = ${_host}"
+        # Variants strip options that older/OEM strongSwan reject as "invalid configuration".
+        if [ "$_variant" = "full" ] || [ "$_variant" = "vip" ]; then
+            echo "        vips = 0.0.0.0"
+        fi
+        if [ "$_variant" = "full" ] || [ "$_variant" = "vip" ] || [ "$_variant" = "basic" ]; then
+            echo "        proposals = ${_ike}"
+        fi
+        if [ "$_variant" = "full" ]; then
+            echo "        encap = yes"
+        fi
+        echo "        local {"
+        echo "            auth = pubkey"
+        echo "            certs = sbvpn_client.pem"
+        [ -n "$_user" ] && echo "            id = ${_user}"
+        [ "$_use_pss" = "1" ] && echo "            rsa_pss = yes"
+        echo "        }"
+        echo "        remote {"
+        echo "            auth = pubkey"
+        if [ "$_variant" = "full" ] || [ "$_variant" = "vip" ]; then
+            [ -n "$_host" ] && echo "            id = ${_host}"
+        fi
+        [ -s "$_dir/ca.pem" ] && echo "            cacerts = sbvpn_ca.pem"
+        echo "        }"
+        echo "        children {"
+        echo "            ${IPSEC_CONN} {"
+        echo "                remote_ts = 0.0.0.0/0"
+        if [ "$_variant" = "full" ] || [ "$_variant" = "vip" ] || [ "$_variant" = "basic" ]; then
+            echo "                esp_proposals = ${_esp}"
+        fi
+        echo "                start_action = none"
+        echo "            }"
+        echo "        }"
+        echo "    }"
+        echo "}"
+        echo "secrets {"
+        echo "    private-sbvpn {"
+        echo "        file = sbvpn_client.key"
+        echo "    }"
+        echo "}"
+    } > "$_cfg"
 
-    # Match Amnezia strongswan.profile: ikev2-cert + rsa-pss + fixed proposals.
-    cat > "$IPSEC_SWANCTL" << EOF
-connections {
-    $IPSEC_CONN {
-        version = 2
-        remote_addrs = $_host
-        vips = 0.0.0.0
-        proposals = $_ike,aes256-sha256-modp2048,default
-        local {
-            auth = pubkey
-            certs = sbvpn_client.pem
-            rsa_pss = yes
-            $_local_id
-        }
-        remote {
-            auth = pubkey
-            $_ca_line
-        }
-        children {
-            net {
-                remote_ts = 0.0.0.0/0
-                esp_proposals = $_esp,aes128gcm16,aes256gcm16,default
-                start_action = start
-                dpd_action = restart
-                hostaccess = yes
-            }
-        }
-    }
-}
-
-secrets {
-    private-sbvpn {
-        file = sbvpn_client.key
-    }
-    pkcs12-sbvpn {
-        file = sbvpn_client.p12
-        $_p12_secret
-    }
-}
-EOF
+    cp -f "$_cfg" /etc/swanctl/conf.d/sbvpn.conf 2>/dev/null || true
+    echo "[System] sb-manager $SB_MANAGER_VERSION swanctl variant=$_variant ike=$_ike esp=$_esp pss=$_use_pss" >> "$LOG_FILE"
 }
 
 write_ipsec_conf_conn() {
@@ -653,14 +668,28 @@ write_ipsec_conf_conn() {
     _leftid="%any"
     [ -n "$_user" ] && _leftid="$_user"
 
-    # Ensure private key is listed in secrets
+    # Prefer PKCS#12 in secrets (works for RSA/EC). Fall back to key file.
+    _p12abs="$IPSEC_DIR/$_id/client.p12"
+    _pass=$(cat "$_dir/pass" 2>/dev/null)
+    {
+        echo "# sbvpn-secrets-begin"
+        if [ -s "$_p12abs" ]; then
+            echo ": P12 ${_p12abs} \"${_pass}\""
+        else
+            echo ": RSA sbvpn_client.key"
+            echo ": ECDSA sbvpn_client.key"
+        fi
+        echo "# sbvpn-secrets-end"
+    } > /tmp/sb_ipsec.secrets.frag
     if [ -f /etc/ipsec.secrets ]; then
-        grep -q "sbvpn_client.key" /etc/ipsec.secrets 2>/dev/null || \
-            echo ': RSA sbvpn_client.key' >> /etc/ipsec.secrets
+        awk '/# sbvpn-secrets-begin/{skip=1} /# sbvpn-secrets-end/{skip=0; next} !skip{print}' \
+            /etc/ipsec.secrets > /tmp/ipsec.secrets.base 2>/dev/null \
+            || cp /etc/ipsec.secrets /tmp/ipsec.secrets.base
+        cat /tmp/ipsec.secrets.base /tmp/sb_ipsec.secrets.frag > /etc/ipsec.secrets
     else
-        echo ': RSA sbvpn_client.key' > /etc/ipsec.secrets
-        chmod 600 /etc/ipsec.secrets
+        cp /tmp/sb_ipsec.secrets.frag /etc/ipsec.secrets
     fi
+    chmod 600 /etc/ipsec.secrets
 
     # Inject / replace conn block in ipsec.conf
     if [ -f /etc/ipsec.conf ]; then
@@ -685,8 +714,8 @@ conn $IPSEC_CONN
   rightauth=pubkey
   rightid=%any
   rightsubnet=0.0.0.0/0
-  ike=aes256-sha256-modp2048,aes256-sha256-ecp256!
-  esp=aes128gcm16,aes256gcm16,aes128-sha256!
+  ike=aes256-sha256-modp2048
+  esp=aes128gcm16
   dpdaction=restart
   dpddelay=30s
   fragmentation=yes
@@ -739,15 +768,112 @@ setup_ipsec_lan_nat() {
     iptables -t nat -I POSTROUTING -j SB_IPSEC_NAT
 }
 
+# Run swanctl against our isolated SWANCTL_DIR only.
+swanctl_iso() {
+    SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl "$@"
+}
+
+try_start_ipsec_stroke() {
+    _id="$1"
+    command -v ipsec >/dev/null 2>&1 || return 1
+    echo "[System] Trying classic ipsec/stroke backend..." >> "$LOG_FILE"
+    write_ipsec_conf_conn "$_id"
+    # Ensure charon via ipsec
+    if [ -x /etc/init.d/ipsec ]; then
+        /etc/init.d/ipsec enable >/dev/null 2>&1 || true
+        /etc/init.d/ipsec restart >/dev/null 2>&1 || /etc/init.d/ipsec start >/dev/null 2>&1 || true
+    fi
+    : > /tmp/sb_ipsec.err
+    ipsec stroke >/dev/null 2>&1 || true
+    ipsec reload >>/tmp/sb_ipsec.err 2>&1 || true
+    ipsec rereadall >>/tmp/sb_ipsec.err 2>&1 || true
+    ipsec up "$IPSEC_CONN" >>/tmp/sb_ipsec.err 2>&1 || true
+    sleep 3
+    if is_ipsec_running; then
+        echo "[System] ipsec/stroke connected." >> "$LOG_FILE"
+        return 0
+    fi
+    echo "[System] ipsec/stroke failed:" >> "$LOG_FILE"
+    cat /tmp/sb_ipsec.err >> "$LOG_FILE" 2>/dev/null
+    ipsec statusall >> "$LOG_FILE" 2>&1 || true
+    return 1
+}
+
+try_start_ipsec_swanctl() {
+    _id="$1"
+    command -v swanctl >/dev/null 2>&1 || return 1
+    echo "[System] Trying swanctl backend (isolated SWANCTL_DIR=$IPSEC_SWANCTL_DIR)..." >> "$LOG_FILE"
+
+    # Ensure daemon is up (system charon still serves swanctl).
+    if [ -x /etc/init.d/swanctl ]; then
+        /etc/init.d/swanctl enable >/dev/null 2>&1 || true
+        /etc/init.d/swanctl start >/dev/null 2>&1 || true
+    fi
+    if [ -x /etc/init.d/ipsec ]; then
+        /etc/init.d/ipsec enable >/dev/null 2>&1 || true
+        /etc/init.d/ipsec start >/dev/null 2>&1 || true
+    fi
+
+    # Validate PEMs before load.
+    if ! openssl x509 -in "$IPSEC_DIR/$_id/client.pem" -noout >/tmp/sb_pem.err 2>&1; then
+        echo "[System] client.pem invalid:" >> "$LOG_FILE"
+        cat /tmp/sb_pem.err >> "$LOG_FILE"
+        return 1
+    fi
+    openssl x509 -in "$IPSEC_DIR/$_id/client.pem" -noout -subject -dates >> "$LOG_FILE" 2>&1 || true
+
+    _loaded=0
+    # Try increasingly compatible config variants.
+    for _variant in min basic vip full; do
+        for _pss in 0 1; do
+            # rsa_pss only meaningful on fuller variants
+            [ "$_pss" = "1" ] && [ "$_variant" = "min" ] && continue
+            write_swanctl_conn "$_id" "$_pss" "$_variant"
+            : > /tmp/sb_swan.err
+            if swanctl_iso --load-all >>/tmp/sb_swan.err 2>&1 \
+                || { swanctl_iso --load-creds >>/tmp/sb_swan.err 2>&1 \
+                     && swanctl_iso --load-conns >>/tmp/sb_swan.err 2>&1; }; then
+                if swanctl_iso --list-conns 2>/dev/null | grep -q "$IPSEC_CONN"; then
+                    _loaded=1
+                    echo "[System] swanctl loaded OK (variant=$_variant pss=$_pss)" >> "$LOG_FILE"
+                    break 2
+                fi
+            fi
+            echo "[System] swanctl load rejected variant=$_variant pss=$_pss:" >> "$LOG_FILE"
+            cat /tmp/sb_swan.err >> "$LOG_FILE"
+            echo "[System] --- config dump ---" >> "$LOG_FILE"
+            cat "$IPSEC_SWANCTL_DIR/conf.d/sbvpn.conf" >> "$LOG_FILE" 2>/dev/null
+        done
+    done
+
+    if [ "$_loaded" != "1" ]; then
+        echo "[System] All swanctl variants failed to load." >> "$LOG_FILE"
+        return 1
+    fi
+
+    if ! is_ipsec_running; then
+        : > /tmp/sb_swan_init.err
+        swanctl_iso --initiate --child "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
+            || swanctl_iso --initiate --ike "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
+            || true
+        sleep 3
+    fi
+    if is_ipsec_running; then
+        echo "[System] swanctl connected." >> "$LOG_FILE"
+        return 0
+    fi
+    echo "[System] swanctl initiate failed:" >> "$LOG_FILE"
+    cat /tmp/sb_swan_init.err >> "$LOG_FILE" 2>/dev/null
+    SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --list-conns >> "$LOG_FILE" 2>&1 || true
+    SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --list-creds >> "$LOG_FILE" 2>&1 || true
+    return 1
+}
+
 start_ipsec() {
+    echo "[System] Amnezia IPsec start via sb-manager $SB_MANAGER_VERSION" >> "$LOG_FILE"
+
     if ! have_strongswan; then
         echo "[System] strongSwan not installed (no swanctl/ipsec in PATH)." >> "$LOG_FILE"
-        echo "[System] OEM ZLT feeds often lack it. Try:" >> "$LOG_FILE"
-        echo "[System]   opkg update" >> "$LOG_FILE"
-        echo "[System]   opkg list | grep -i swan" >> "$LOG_FILE"
-        echo "[System]   opkg install strongswan strongswan-default strongswan-swanctl" >> "$LOG_FILE"
-        echo "[System] If packages are Unknown, this firmware cannot run Amnezia IPsec" >> "$LOG_FILE"
-        echo "[System] without a custom strongSwan build / official OpenWrt image." >> "$LOG_FILE"
         return 1
     fi
     if ! command -v openssl >/dev/null 2>&1; then
@@ -764,41 +890,21 @@ start_ipsec() {
         return 1
     fi
 
-    # Ensure charon is running
-    if [ -x /etc/init.d/swanctl ]; then
-        /etc/init.d/swanctl enable >/dev/null 2>&1 || true
-        /etc/init.d/swanctl start >/dev/null 2>&1 || true
-    fi
-    if [ -x /etc/init.d/ipsec ]; then
-        /etc/init.d/ipsec enable >/dev/null 2>&1 || true
-        /etc/init.d/ipsec start >/dev/null 2>&1 || true
+    # Prefer stroke/ipsec on OpenWrt (often more reliable than a half-wired swanctl),
+    # then fall back to isolated swanctl.
+    _ok=0
+    if try_start_ipsec_stroke "$_id"; then
+        _ok=1
+    elif try_start_ipsec_swanctl "$_id"; then
+        _ok=1
     fi
 
-    if command -v swanctl >/dev/null 2>&1; then
-        write_swanctl_conn "$_id"
-        swanctl --load-all >/tmp/sb_swan.err 2>&1 || swanctl --load-conns >/tmp/sb_swan.err 2>&1 || true
-        swanctl --load-creds >/dev/null 2>&1 || true
-        # Initiate if not already up
-        if ! swanctl --list-sas 2>/dev/null | grep -q "$IPSEC_CONN"; then
-            swanctl --initiate --child net >/tmp/sb_swan_init.err 2>&1 || \
-            swanctl --initiate --ike "$IPSEC_CONN" >/tmp/sb_swan_init.err 2>&1 || true
-        fi
-        sleep 2
-        if ! is_ipsec_running; then
-            echo "[System] swanctl initiate failed:" >> "$LOG_FILE"
-            cat /tmp/sb_swan.err /tmp/sb_swan_init.err 2>/dev/null >> "$LOG_FILE"
-            return 1
-        fi
-    else
-        write_ipsec_conf_conn "$_id"
-        ipsec reload >/tmp/sb_ipsec.err 2>&1 || true
-        ipsec up "$IPSEC_CONN" >/tmp/sb_ipsec.err 2>&1 || true
-        sleep 2
-        if ! is_ipsec_running; then
-            echo "[System] ipsec up failed:" >> "$LOG_FILE"
-            cat /tmp/sb_ipsec.err 2>/dev/null >> "$LOG_FILE"
-            return 1
-        fi
+    if [ "$_ok" != "1" ]; then
+        echo "[System] Amnezia IPsec failed on both ipsec and swanctl backends." >> "$LOG_FILE"
+        echo "[System] Diagnostics: swanctl=$(command -v swanctl) ipsec=$(command -v ipsec)" >> "$LOG_FILE"
+        swanctl --version >> "$LOG_FILE" 2>&1 || true
+        ipsec version >> "$LOG_FILE" 2>&1 || true
+        return 1
     fi
 
     echo "ipsec" > "$PROTO_POINTER"
@@ -897,6 +1003,7 @@ start_watchdog() {
 }
 
 case "$1" in
+    version) echo "$SB_MANAGER_VERSION"; exit 0 ;;
     start) start_sb; exit 0 ;;
     stop) stop_sb; exit 0 ;;
     restart) stop_sb; sleep 1; start_sb; exit 0 ;;

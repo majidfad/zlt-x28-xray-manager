@@ -29,6 +29,10 @@
 						<input type="checkbox" id="sb_watchdog_toggle" /> Auto-restart if sing-box crashes
 					</td>
 				</tr>
+				<tr>
+					<td class="td"><strong>Panel build</strong></td>
+					<td class="td"><span id="sb_api_version">?</span></td>
+				</tr>
 			</table>
 
 			<div class="cbi-page-actions">
@@ -109,6 +113,13 @@
 				(data.active_node || "none") + (data.proto && data.proto !== "none" ? " (" + data.proto + ")" : "");
 			document.getElementById("sb_mode_select").value = data.mode || "tunnel";
 			document.getElementById("sb_watchdog_toggle").checked = (data.watchdog === "1");
+			var verEl = document.getElementById("sb_api_version");
+			if (verEl) {
+				var ver = data.api_version || 0;
+				var mgr = data.manager_version || "?";
+				verEl.textContent = "API v" + ver + " / manager " + mgr;
+				verEl.style.color = (ver >= 3 && String(mgr).indexOf("ipsec4") >= 0) ? "" : "#c00";
+			}
 		});
 	}
 
