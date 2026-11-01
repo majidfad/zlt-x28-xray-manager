@@ -1493,11 +1493,46 @@ function index()
     entry({"admin", "services", "singbox", "log"}, call("action_log")).leaf = true
 end
 
+-- Run a shell command; return trimmed stdout as a SINGLE string.
+-- IMPORTANT: never return string.gsub(...) directly — gsub returns
+-- (result, nsubs), and callers like tonumber(run(...)) would treat nsubs
+-- as the numeric base (e.g. tonumber("0", 1) → "base out of range").
 local function run(cmd)
     local f = io.popen(cmd)
     local out = f and f:read("*a") or ""
     if f then f:close() end
-    return (out or ""):gsub("%s+$", "")
+    out = tostring(out or "")
+    out = out:gsub("%s+$", "")
+    return out
+end
+
+local function read_file(path)
+    local f = io.open(path, "r")
+    if not f then return "" end
+    local data = f:read("*a") or ""
+    f:close()
+    data = data:gsub("%s+$", "")
+    return data
+end
+
+local function write_file(path, data)
+    local fh = io.open(path, "w")
+    if not fh then return false end
+    fh:write(data or "")
+    fh:close()
+    return true
+end
+
+-- Parse an integer from a string safely (ignore gsub secondary returns, junk).
+local function to_int(s, default)
+    if s == nil then return default end
+    if type(s) == "number" then
+        if s ~= s then return default end -- NaN
+        return math.floor(s)
+    end
+    s = tostring(s):match("^%s*([-+]?%d+)") or ""
+    if s == "" then return default end
+    return tonumber(s, 10) or default
 end
 
 -- Shell-quote a single argument to prevent command injection via LuCI params.
@@ -1570,6 +1605,7 @@ function action_addnode()
         luci.http.write_json({ ok = false, error = "empty config (use POST; GET truncates long payloads)" })
         return
     end
+
     -- Accept vless://, Amnezia vpn:// share links, or IPsec JSON.
     local trimmed = link:match("^%s*(.-)%s*$") or link
     local is_ipsec = trimmed:sub(1, 1) == "{"
@@ -1582,6 +1618,7 @@ function action_addnode()
         })
         return
     end
+
     local payload = link
     if is_vless or is_vpn then
         -- Strip whitespace/newlines inside share links (vpn:// is one token).
@@ -1590,25 +1627,51 @@ function action_addnode()
         -- Keep JSON structure; only trim outer whitespace.
         payload = trimmed
     end
+
+    -- Guard against truncated POSTs (uhttpd body limits) for Amnezia JSON.
+    if is_ipsec then
+        local opens = select(2, payload:gsub("%{", ""))
+        local closes = select(2, payload:gsub("%}", ""))
+        if opens ~= closes or not payload:find('"cert"') then
+            luci.http.write_json({
+                ok = false,
+                error = "IPsec JSON looks truncated or incomplete (missing cert / unbalanced braces). Try vpn:// in LuCI (browser decode) or a smaller paste."
+            })
+            return
+        end
+    end
+
     local tmp = "/tmp/sb_link_" .. id .. ".txt"
-    local fh = io.open(tmp, "w")
-    if not fh then
+    local rc_file = "/tmp/sb_addnode_" .. id .. ".rc"
+    local err_file = "/tmp/sb_addnode_" .. id .. ".err"
+    if not write_file(tmp, payload) then
         luci.http.write_json({ ok = false, error = "failed to write temp file" })
         return
     end
-    fh:write(payload)
-    fh:close()
-    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp) .. " >/tmp/sb_addnode.err 2>&1; echo $? > /tmp/sb_addnode.rc")
+
+    -- Unique rc/err paths avoid races if two adds overlap.
+    run("/usr/bin/sb-manager addnode " .. shq(id) .. " " .. shq(tmp)
+        .. " >" .. shq(err_file) .. " 2>&1; echo $? > " .. shq(rc_file))
     os.remove(tmp)
-    local rc = tonumber(run("cat /tmp/sb_addnode.rc 2>/dev/null")) or 1
+
+    local rc = to_int(read_file(rc_file), 1)
+    os.remove(rc_file)
+
     if rc ~= 0 then
-        local err = run("cat /tmp/sb_addnode.err 2>/dev/null")
-        luci.http.write_json({
-            ok = false,
-            error = (err ~= "" and err) or "failed to parse vless/IPsec config"
-        })
+        local err = read_file(err_file)
+        os.remove(err_file)
+        if err == "" then
+            err = "failed to parse config (rc=" .. tostring(rc) .. ")"
+        end
+        -- Keep error message bounded for the UI.
+        if #err > 400 then
+            err = err:sub(1, 400) .. "..."
+        end
+        luci.http.write_json({ ok = false, error = err })
         return
     end
+    os.remove(err_file)
+
     -- Activate the new node so Start/Restart actually uses it.
     run("/usr/bin/sb-manager switch " .. shq(id))
     local ntype = run("/usr/bin/sb-manager nodetype " .. shq(id))

@@ -156,6 +156,11 @@ v1.9.3. No config changes were needed since the schema is unchanged.
 - The LuCI controller shell-quotes and validates every HTTP parameter before
   it reaches the shell (node ids are restricted to `[A-Za-z0-9_-]+`), closing
   a command-injection gap in the admin panel.
+- Fixed LuCI `tonumber` 500 on Add Node: `run()` used to return
+  `string.gsub`'s second value (substitution count), so
+  `tonumber("0", 1)` crashed with "base out of range" after Amnezia/IPsec
+  imports. `run()` now returns a single trimmed string; exit codes use a
+  safe `to_int()` parser.
 
 ## Project layout
 
