@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec20"
+SB_MANAGER_VERSION="2026.11.01-ipsec21"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1020,7 +1020,7 @@ diagnose_x509_plugin_load() {
         ensure_strongswan_conf
         export_ss_env
         # charon -v or foreground briefly — log lines mentioning x509/pkcs1
-        ( STRONGSWAN_CONF="$SB_SS_CONF" "$_charon" --use-syslog=0 2>&1 & _cp=$!
+        ( STRONGSWAN_CONF="$SB_SS_CONF" "$_charon" 2>&1 & _cp=$!
           sleep 2
           kill "$_cp" 2>/dev/null || true
           wait "$_cp" 2>/dev/null || true
@@ -1098,8 +1098,9 @@ start_charon_daemon() {
     : > /tmp/sb_charon.log
     echo "[System] Starting $_charon (log: /tmp/sb_charon.log) ..." >> "$LOG_FILE"
     # Do NOT also run `ipsec start` in parallel — starter fights a hand-started charon.
+    # NOTE: --use-syslog takes NO argument; --use-syslog=0 aborts with usage and exits 1.
     STRONGSWAN_CONF="$SB_SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
-        "$_charon" --use-syslog=0 >>/tmp/sb_charon.log 2>&1 &
+        "$_charon" >>/tmp/sb_charon.log 2>&1 &
     echo $! > /tmp/sb_charon.pid
     sleep 1
 
