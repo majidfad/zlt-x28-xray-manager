@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec22"
+SB_MANAGER_VERSION="2026.11.01-ipsec23"
 # Dedicated conf — OpenWrt UCI rewrites /tmp/strongswan.conf and drops our plugins.
 SB_SS_CONF="/etc/singbox/strongswan.conf"
 
@@ -1214,11 +1214,16 @@ write_swanctl_conn() {
         echo "        }"
         echo "        remote {"
         echo "            auth = pubkey"
+        # Amnezia server ID is the cert CN, not the IP. Using the IP here
+        # often yields AUTHENTICATION_FAILED. Prefer %any (or omit).
         if [ "$_variant" = "full" ] || [ "$_variant" = "vip" ]; then
-            [ -n "$_host" ] && echo "            id = ${_host}"
+            echo "            id = %any"
         fi
         [ -s "$_dir/ca.pem" ] && echo "            cacerts = sbvpn_ca.pem"
         echo "        }"
+        # Always send our cert (Amnezia needs it in IKE_AUTH).
+        echo "        send_cert = always"
+        echo "        send_certreq = yes"
         echo "        children {"
         echo "            ${IPSEC_CONN} {"
         echo "                remote_ts = 0.0.0.0/0"
@@ -1311,6 +1316,9 @@ conn $IPSEC_CONN
   dpddelay=30s
   fragmentation=yes
   forceencaps=yes
+  leftsendcert=always
+  rightid=%any
+  rsa_pss=yes
 # sbvpn-end
 EOF
     mv /tmp/ipsec.conf.base /etc/ipsec.conf
@@ -1425,70 +1433,59 @@ try_start_ipsec_swanctl() {
     fi
     openssl x509 -in "$IPSEC_DIR/$_id/client.pem" -noout -subject -dates >> "$LOG_FILE" 2>&1 || true
 
-    _loaded=0
-    # Try increasingly compatible config variants.
-    for _variant in min basic vip full; do
-        for _pss in 0 1; do
-            # rsa_pss only meaningful on fuller variants
+    # Amnezia: try RSA-PSS first (server AUTH_FAILED on classic PKCS1 is common),
+    # then PKCS1. Prefer full/vip (vips + proposals) over stripped min.
+    # Important: test INITIATE per variant — first successful *load* is not enough.
+    _ok=0
+    : > /tmp/sb_swan_init.err
+    for _pss in 1 0; do
+        for _variant in full vip basic min; do
             [ "$_pss" = "1" ] && [ "$_variant" = "min" ] && continue
             write_swanctl_conn "$_id" "$_pss" "$_variant"
             : > /tmp/sb_swan.err
-            if swanctl_iso --load-all >>/tmp/sb_swan.err 2>&1 \
-                || { swanctl_iso --load-creds >>/tmp/sb_swan.err 2>&1 \
-                     && swanctl_iso --load-conns >>/tmp/sb_swan.err 2>&1; }; then
-                if swanctl_iso --list-conns 2>/dev/null | grep -q "$IPSEC_CONN"; then
-                    _loaded=1
-                    echo "[System] swanctl loaded OK (variant=$_variant pss=$_pss)" >> "$LOG_FILE"
-                    break 2
-                fi
+            if ! swanctl_iso --load-all >>/tmp/sb_swan.err 2>&1 \
+                && ! { swanctl_iso --load-creds >>/tmp/sb_swan.err 2>&1 \
+                       && swanctl_iso --load-conns >>/tmp/sb_swan.err 2>&1; }; then
+                echo "[System] load rejected variant=$_variant pss=$_pss" >> "$LOG_FILE"
+                cat /tmp/sb_swan.err >> "$LOG_FILE"
+                continue
             fi
-            # If still aborting on strongswan.conf, stop wasting variants.
-            if grep -q 'abort initialization' /tmp/sb_swan.err 2>/dev/null; then
-                echo "[System] swanctl still aborts on init (strongswan.conf):" >> "$LOG_FILE"
-                cat /tmp/sb_swan.err >> "$LOG_FILE"
-                ensure_strongswan_conf || true
-                # Retry once after rewrite
-                : > /tmp/sb_swan.err
-                if swanctl_iso --load-all >>/tmp/sb_swan.err 2>&1; then
-                    if swanctl_iso --list-conns 2>/dev/null | grep -q "$IPSEC_CONN"; then
-                        _loaded=1
-                        echo "[System] swanctl loaded OK after conf rewrite (variant=$_variant)" >> "$LOG_FILE"
-                        break 2
-                    fi
-                fi
-                echo "[System] swanctl load rejected variant=$_variant pss=$_pss:" >> "$LOG_FILE"
-                cat /tmp/sb_swan.err >> "$LOG_FILE"
-                echo "[System] --- config dump ---" >> "$LOG_FILE"
-                cat "$IPSEC_SWANCTL_DIR/conf.d/sbvpn.conf" >> "$LOG_FILE" 2>/dev/null
+            if ! swanctl_iso --list-conns 2>/dev/null | grep -q "$IPSEC_CONN"; then
+                echo "[System] load OK but conn missing variant=$_variant pss=$_pss" >> "$LOG_FILE"
+                continue
+            fi
+            echo "[System] loaded variant=$_variant pss=$_pss — initiating..." >> "$LOG_FILE"
+            # Tear prior half-open SA before retry
+            swanctl_iso --terminate --ike "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 || true
+            sleep 1
+            swanctl_iso --initiate --child "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
+                || swanctl_iso --initiate --ike "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
+                || true
+            sleep 4
+            if is_ipsec_running; then
+                echo "[System] swanctl connected (variant=$_variant pss=$_pss)." >> "$LOG_FILE"
+                _ok=1
                 break 2
             fi
-            echo "[System] swanctl load rejected variant=$_variant pss=$_pss:" >> "$LOG_FILE"
-            cat /tmp/sb_swan.err >> "$LOG_FILE"
-            echo "[System] --- config dump ---" >> "$LOG_FILE"
-            cat "$IPSEC_SWANCTL_DIR/conf.d/sbvpn.conf" >> "$LOG_FILE" 2>/dev/null
+            # Keep AUTH_FAILED / INVAL_KE lines for the next attempt
+            echo "[System] initiate failed variant=$_variant pss=$_pss" >> "$LOG_FILE"
+            tail -n 15 /tmp/sb_swan_init.err >> "$LOG_FILE" 2>/dev/null || true
+            # Signature scheme clue
+            if grep -q 'AUTHENTICATION_FAILED' /tmp/sb_swan_init.err 2>/dev/null; then
+                echo "[System] server sent AUTHENTICATION_FAILED (try other rsa_pss / remote id)" >> "$LOG_FILE"
+            fi
         done
     done
 
-    if [ "$_loaded" != "1" ]; then
-        echo "[System] All swanctl variants failed to load." >> "$LOG_FILE"
-        return 1
-    fi
-
-    if ! is_ipsec_running; then
-        : > /tmp/sb_swan_init.err
-        swanctl_iso --initiate --child "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
-            || swanctl_iso --initiate --ike "$IPSEC_CONN" >>/tmp/sb_swan_init.err 2>&1 \
-            || true
-        sleep 3
-    fi
-    if is_ipsec_running; then
-        echo "[System] swanctl connected." >> "$LOG_FILE"
+    if [ "$_ok" = "1" ]; then
         return 0
     fi
-    echo "[System] swanctl initiate failed:" >> "$LOG_FILE"
+    echo "[System] swanctl: all Amnezia variants failed to connect." >> "$LOG_FILE"
     cat /tmp/sb_swan_init.err >> "$LOG_FILE" 2>/dev/null
     SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --list-conns >> "$LOG_FILE" 2>&1 || true
-    SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --list-creds >> "$LOG_FILE" 2>&1 || true
+    SWANCTL_DIR="$IPSEC_SWANCTL_DIR" swanctl --list-certs >> "$LOG_FILE" 2>&1 || true
+    echo "[System] last config:" >> "$LOG_FILE"
+    cat "$IPSEC_SWANCTL_DIR/conf.d/sbvpn.conf" >> "$LOG_FILE" 2>/dev/null || true
     return 1
 }
 
