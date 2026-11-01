@@ -24,7 +24,7 @@ IPSEC_SWANCTL="/etc/swanctl/conf.d/sbvpn.conf"
 # Isolated swanctl tree — avoids broken OEM /etc/swanctl configs breaking --load-all.
 IPSEC_SWANCTL_DIR="/tmp/sb_swanctl"
 PROTO_POINTER="$DIR_SB/active_proto"
-SB_MANAGER_VERSION="2026.11.01-ipsec4"
+SB_MANAGER_VERSION="2026.11.01-ipsec5"
 
 # Resolve a sing-box binary that actually executes on this device.
 # A file can be -x yet still "not found" at runtime (wrong CPU arch / corrupt).
@@ -156,20 +156,49 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# Extract a top-level JSON string field (ash-friendly; values must not contain raw quotes).
+# Extract a top-level JSON string field.
+# IMPORTANT: BusyBox awk often truncates very long lines (~4KB). Amnezia
+# PKCS#12 certs are 6KB+, so prefer Lua (always on LuCI routers) for extraction.
 extract_json_str() {
     _file="$1"
     _key="$2"
-    # Collapse to one line-ish stream but keep content; match "key":"value"
+    if command -v lua >/dev/null 2>&1; then
+        lua -e '
+            local key = select(1, ...)
+            local path = select(2, ...)
+            local f = io.open(path, "rb")
+            if not f then os.exit(1) end
+            local s = f:read("*a") or ""
+            f:close()
+            -- Match "key" : "value" with simple escapes
+            local pat = "\"" .. key .. "\"%s*:%s*\""
+            local i, j = s:find(pat)
+            if not i then os.exit(2) end
+            local out = {}
+            local k = j + 1
+            while k <= #s do
+                local c = s:sub(k, k)
+                if c == "\\" then
+                    k = k + 1
+                    out[#out+1] = s:sub(k, k)
+                elseif c == "\"" then
+                    break
+                else
+                    out[#out+1] = c
+                end
+                k = k + 1
+            end
+            io.write(table.concat(out))
+        ' "$_key" "$_file" 2>/dev/null && return 0
+    fi
+    # Fallback: awk (may truncate huge cert values on BusyBox).
     tr '\n\r' '  ' < "$_file" | awk -v key="$_key" '
     {
         s = $0
-        # Find "key"
         qkey = "\"" key "\""
         p = index(s, qkey)
         if (p == 0) exit
         rest = substr(s, p + length(qkey))
-        # Skip whitespace and colon
         sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
         if (substr(rest, 1, 1) != "\"") exit
         rest = substr(rest, 2)
@@ -499,6 +528,63 @@ stop_sb() {
     echo "[System] VPN fully terminated." >> "$LOG_FILE"
 }
 
+# Decode base64 (std or url-safe) to a binary file.
+b64_decode_to_file() {
+    _b64="$1"
+    _out="$2"
+    # URL-safe → standard; BusyBox-safe (no GNU tr --).
+    printf '%s' "$_b64" | sed 's/-/+/g; s/_/\//g' > /tmp/sb_b64.norm
+    _len=$(wc -c < /tmp/sb_b64.norm | tr -dc '0-9')
+    _pad=$(( _len % 4 ))
+    if [ "$_pad" = "2" ]; then printf '==' >> /tmp/sb_b64.norm
+    elif [ "$_pad" = "3" ]; then printf '=' >> /tmp/sb_b64.norm
+    fi
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d < /tmp/sb_b64.norm > "$_out" 2>/dev/null \
+            || base64 -d -i < /tmp/sb_b64.norm > "$_out" 2>/dev/null \
+            || openssl base64 -d -A -in /tmp/sb_b64.norm -out "$_out" 2>/dev/null
+    else
+        openssl base64 -d -A -in /tmp/sb_b64.norm -out "$_out" 2>/dev/null
+    fi
+    rm -f /tmp/sb_b64.norm
+    [ -s "$_out" ]
+}
+
+# Try openssl pkcs12 unpack with a given password into key/cert/ca PEMs.
+# Uses -clcerts so we never mistake the CA for the client cert.
+pkcs12_unpack() {
+    _p12="$1"
+    _pass="$2"
+    _dir="$3"
+    _err="$4"
+    rm -f "$_dir/client.key" "$_dir/client.pem" "$_dir/ca.pem" "$_dir/all.pem"
+    # Prefer split extract (client cert vs CA).
+    if openssl pkcs12 -in "$_p12" -nodes -nocerts -passin "pass:$_pass" \
+            -out "$_dir/client.key" >"$_err" 2>&1 \
+        && openssl pkcs12 -in "$_p12" -nodes -clcerts -nokeys -passin "pass:$_pass" \
+            -out "$_dir/client.pem" >>"$_err" 2>&1; then
+        openssl pkcs12 -in "$_p12" -nodes -cacerts -nokeys -passin "pass:$_pass" \
+            -out "$_dir/ca.pem" >>"$_err" 2>&1 || true
+        if [ -s "$_dir/client.key" ] && [ -s "$_dir/client.pem" ]; then
+            return 0
+        fi
+    fi
+    # OpenSSL 3 legacy ciphers (ignore failure on 1.1.x).
+    if openssl pkcs12 -help 2>&1 | grep -q -- '-legacy'; then
+        if openssl pkcs12 -in "$_p12" -nodes -legacy -nocerts -passin "pass:$_pass" \
+                -out "$_dir/client.key" >"$_err" 2>&1 \
+            && openssl pkcs12 -in "$_p12" -nodes -legacy -clcerts -nokeys -passin "pass:$_pass" \
+                -out "$_dir/client.pem" >>"$_err" 2>&1; then
+            openssl pkcs12 -in "$_p12" -nodes -legacy -cacerts -nokeys -passin "pass:$_pass" \
+                -out "$_dir/ca.pem" >>"$_err" 2>&1 || true
+            if [ -s "$_dir/client.key" ] && [ -s "$_dir/client.pem" ]; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 # Prepare PKCS#12 material for an IPsec node id.
 prepare_ipsec_material() {
     _id="$1"
@@ -511,56 +597,54 @@ prepare_ipsec_material() {
     _user=$(extract_json_str "$_node" userName)
 
     if [ -z "$_cert" ] || [ -z "$_host" ]; then
-        echo "[System] IPsec node $_id missing cert/hostName." >> "$LOG_FILE"
+        echo "[System] IPsec node $_id missing cert/hostName (cert_len=${#_cert})." >> "$LOG_FILE"
+        echo "[System] If cert_len is tiny, BusyBox truncated it — need lua for extract." >> "$LOG_FILE"
         return 1
     fi
-
-    # Decode PKCS#12 (Amnezia / strongSwan .p12, may use BER indefinite length).
-    if command -v base64 >/dev/null 2>&1; then
-        printf '%s' "$_cert" | base64 -d > "$_dir/client.p12" 2>/dev/null || \
-        printf '%s' "$_cert" | base64 -d 2>/dev/null > "$_dir/client.p12"
-    else
-        printf '%s' "$_cert" | openssl base64 -d -A > "$_dir/client.p12" 2>/dev/null
-    fi
-    if [ ! -s "$_dir/client.p12" ]; then
-        echo "[System] Failed to base64-decode IPsec certificate." >> "$LOG_FILE"
-        return 1
-    fi
+    echo "[System] IPsec material: host=$_host user=$_user cert_b64_len=${#_cert}" >> "$LOG_FILE"
 
     if ! command -v openssl >/dev/null 2>&1; then
         echo "[System] openssl required to unpack IPsec PKCS#12. Install openssl-util." >> "$LOG_FILE"
         return 1
     fi
 
-    # Extract PEM bag; OpenSSL 3 may need -legacy for older P12 bags.
-    rm -f "$_dir/all.pem" "$_dir/client.pem" "$_dir/client.key" "$_dir/ca.pem"
-    if ! openssl pkcs12 -in "$_dir/client.p12" -nodes -password "pass:$_pass" -out "$_dir/all.pem" >/tmp/sb_p12.err 2>&1; then
-        if ! openssl pkcs12 -in "$_dir/client.p12" -nodes -legacy -password "pass:$_pass" -out "$_dir/all.pem" >/tmp/sb_p12.err 2>&1; then
-            echo "[System] openssl pkcs12 extract failed:" >> "$LOG_FILE"
-            cat /tmp/sb_p12.err >> "$LOG_FILE"
-            return 1
-        fi
-    fi
-
-    # Split certificates / key from the bag (PKCS#8, RSA, EC).
-    awk '
-        /BEGIN ([A-Z0-9]+ )?PRIVATE KEY/ { k=1 }
-        k { print > keyf }
-        /END ([A-Z0-9]+ )?PRIVATE KEY/ { k=0 }
-        /BEGIN CERTIFICATE/ { c++; n=c; cert=1 }
-        cert { if (n==1) print > certf; else print > caf }
-        /END CERTIFICATE/ { cert=0 }
-    ' keyf="$_dir/client.key" certf="$_dir/client.pem" caf="$_dir/ca.pem" "$_dir/all.pem"
-
-    if [ ! -s "$_dir/client.key" ] || [ ! -s "$_dir/client.pem" ]; then
-        echo "[System] PKCS#12 did not contain a client key+cert." >> "$LOG_FILE"
-        echo "[System] all.pem head:" >> "$LOG_FILE"
-        head -n 5 "$_dir/all.pem" >> "$LOG_FILE" 2>/dev/null
+    if ! b64_decode_to_file "$_cert" "$_dir/client.p12"; then
+        echo "[System] Failed to base64-decode IPsec certificate (len=${#_cert})." >> "$LOG_FILE"
         return 1
     fi
-    chmod 600 "$_dir/client.key" "$_dir/client.p12" "$_dir/all.pem"
+    echo "[System] PKCS#12 bytes: $(wc -c < "$_dir/client.p12")" >> "$LOG_FILE"
+    # Debug header (MIACAQM... = BER PFX)
+    echo "[System] PKCS#12 asn1 header:" >> "$LOG_FILE"
+    openssl asn1parse -inform DER -in "$_dir/client.p12" 2>&1 | head -n 8 >> "$LOG_FILE" || true
 
-    # Export for caller via files; also write a tiny env file.
+    # Try passwords: configured, empty, username (some panels).
+    _unpacked=0
+    for _try in "$_pass" "" "$_user"; do
+        if pkcs12_unpack "$_dir/client.p12" "$_try" "$_dir" /tmp/sb_p12.err; then
+            _pass="$_try"
+            _unpacked=1
+            echo "[System] PKCS#12 unpacked OK (pass_len=${#_try})" >> "$LOG_FILE"
+            break
+        fi
+    done
+
+    if [ "$_unpacked" != "1" ]; then
+        echo "[System] openssl pkcs12 extract failed for all passwords:" >> "$LOG_FILE"
+        cat /tmp/sb_p12.err >> "$LOG_FILE" 2>/dev/null
+        openssl pkcs12 -info -in "$_dir/client.p12" -noout -passin pass: >> "$LOG_FILE" 2>&1 || true
+        return 1
+    fi
+
+    # Refuse CA-as-client (Amnezia bags put CA alongside client).
+    if openssl x509 -in "$_dir/client.pem" -noout -text 2>/dev/null \
+        | grep -q 'CA:TRUE'; then
+        echo "[System] client.pem looks like a CA — picking wrong cert from bag." >> "$LOG_FILE"
+        openssl x509 -in "$_dir/client.pem" -noout -subject >> "$LOG_FILE" 2>&1
+        return 1
+    fi
+    openssl x509 -in "$_dir/client.pem" -noout -subject >> "$LOG_FILE" 2>&1 || true
+
+    chmod 600 "$_dir/client.key" "$_dir/client.p12"
     printf '%s\n' "$_host" > "$_dir/host"
     printf '%s\n' "$_user" > "$_dir/user"
     printf '%s\n' "$_pass" > "$_dir/pass"
@@ -778,15 +862,17 @@ try_start_ipsec_stroke() {
     command -v ipsec >/dev/null 2>&1 || return 1
     echo "[System] Trying classic ipsec/stroke backend..." >> "$LOG_FILE"
     write_ipsec_conf_conn "$_id"
-    # Ensure charon via ipsec
-    if [ -x /etc/init.d/ipsec ]; then
-        /etc/init.d/ipsec enable >/dev/null 2>&1 || true
-        /etc/init.d/ipsec restart >/dev/null 2>&1 || /etc/init.d/ipsec start >/dev/null 2>&1 || true
-    fi
     : > /tmp/sb_ipsec.err
-    ipsec stroke >/dev/null 2>&1 || true
-    ipsec reload >>/tmp/sb_ipsec.err 2>&1 || true
+    # starter must be running ("Reloading ... starter is not running")
+    if [ -x /etc/init.d/ipsec ]; then
+        /etc/init.d/ipsec enable >>/tmp/sb_ipsec.err 2>&1 || true
+        /etc/init.d/ipsec stop >>/tmp/sb_ipsec.err 2>&1 || true
+        /etc/init.d/ipsec start >>/tmp/sb_ipsec.err 2>&1 || true
+    fi
+    ipsec start >>/tmp/sb_ipsec.err 2>&1 || true
+    sleep 1
     ipsec rereadall >>/tmp/sb_ipsec.err 2>&1 || true
+    ipsec reload >>/tmp/sb_ipsec.err 2>&1 || true
     ipsec up "$IPSEC_CONN" >>/tmp/sb_ipsec.err 2>&1 || true
     sleep 3
     if is_ipsec_running; then
@@ -1028,6 +1114,15 @@ case "$1" in
             rm -f "$DIR_SB/node_$2.json"
             echo "Failed to parse config (expected vless://, vpn://, or Amnezia IPsec JSON)" >&2
             exit 1
+        fi
+        # For IPsec: unpack PKCS#12 now so Activate does not depend on re-parsing
+        # a huge cert line (and so we fail early with a clear error).
+        if [ "$(node_proto "$DIR_SB/node_$2.json")" = "ipsec" ]; then
+            if ! prepare_ipsec_material "$2"; then
+                rm -f "$DIR_SB/node_$2.json"
+                echo "Failed to unpack Amnezia PKCS#12 (see /var/log/singbox.log)" >&2
+                exit 1
+            fi
         fi
         exit 0
         ;;
