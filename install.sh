@@ -78,11 +78,14 @@ chmod 755 /etc/init.d/zi-vpn
 echo "[zi-install] strongSwan 5.9.2 stack"
 "$BIN_DIR/zi-install-stack" || /usr/bin/zi-install-stack
 
-rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null || true
+# LuCI cache — stale/broken controllers blank the whole UI
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-*cache 2>/dev/null || true
 killall -HUP uhttpd 2>/dev/null || true
+/etc/init.d/uhttpd restart 2>/dev/null || true
 
 echo "[zi-install] DONE"
 echo "  LuCI: Services → ZLT IPsec"
+echo "  If LuCI still blank: rm -rf /tmp/luci-*cache; /etc/init.d/uhttpd restart"
 echo "  CLI:  zi-manager import <vpn-or-json> && zi-manager start"
 echo "  Check: zi-manager ss_check"
 exit 0
