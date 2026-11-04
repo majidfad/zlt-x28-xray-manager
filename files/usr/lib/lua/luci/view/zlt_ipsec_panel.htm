@@ -1,0 +1,189 @@
+<%+header%>
+<style>
+.zi-wrap{max-width:920px;margin:0 auto;padding:12px 16px 40px;font-family:system-ui,sans-serif}
+.zi-wrap h2{margin:0 0 8px;font-size:1.35rem}
+.zi-sub{color:#666;margin:0 0 18px;font-size:.9rem}
+.zi-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;align-items:center}
+.zi-badge{display:inline-block;padding:4px 10px;border-radius:4px;font-size:.85rem;font-weight:600}
+.zi-up{background:#d4edda;color:#155724}
+.zi-down{background:#f8d7da;color:#721c24}
+.zi-unk{background:#e2e3e5;color:#383d41}
+.zi-card{border:1px solid #ddd;border-radius:6px;padding:14px;margin-bottom:14px;background:#fafafa}
+.zi-card h3{margin:0 0 10px;font-size:1.05rem}
+.zi-card label{display:block;font-size:.85rem;margin:8px 0 4px;color:#444}
+.zi-card textarea,.zi-card input,.zi-card select{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:.9rem}
+.zi-card textarea{min-height:120px;font-family:ui-monospace,monospace}
+.zi-btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.zi-btns button{padding:8px 16px;border:0;border-radius:4px;cursor:pointer;font-weight:600}
+.zi-primary{background:#1a73e8;color:#fff}
+.zi-danger{background:#c62828;color:#fff}
+.zi-muted{background:#e0e0e0;color:#333}
+.zi-log{background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:4px;font-family:ui-monospace,monospace;font-size:.78rem;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.zi-meta{font-size:.85rem;color:#555;margin-top:6px}
+.zi-err{color:#c62828;font-size:.9rem;margin-top:8px}
+.zi-ok{color:#2e7d32;font-size:.9rem;margin-top:8px}
+.zi-tabs{display:flex;gap:4px;margin-bottom:10px}
+.zi-tabs button{padding:6px 12px;border:1px solid #ccc;background:#fff;border-radius:4px 4px 0 0;cursor:pointer}
+.zi-tabs button.on{background:#1a73e8;color:#fff;border-color:#1a73e8}
+.zi-pane{display:none}.zi-pane.on{display:block}
+</style>
+
+<div class="zi-wrap">
+  <h2>ZLT IPsec</h2>
+  <p class="zi-sub">Amnezia IKEv2 tunnel · LAN + VPN server auto-excluded · health ping every 5 min</p>
+
+  <div class="zi-row">
+    <span id="zi-badge" class="zi-badge zi-unk">…</span>
+    <span class="zi-meta" id="zi-meta"></span>
+  </div>
+
+  <div class="zi-card">
+    <h3>Profile</h3>
+    <div class="zi-tabs">
+      <button type="button" class="on" data-pane="paste" onclick="ziTab(this)">Paste vpn:// / JSON</button>
+      <button type="button" data-pane="manual" onclick="ziTab(this)">Manual</button>
+    </div>
+    <div id="pane-paste" class="zi-pane on">
+      <label for="zi-cfg">vpn:// link or flat JSON</label>
+      <textarea id="zi-cfg" placeholder="vpn://... or {&quot;host&quot;:&quot;...&quot;,&quot;user_name&quot;:&quot;...&quot;,...}"></textarea>
+    </div>
+    <div id="pane-manual" class="zi-pane">
+      <label>Server host / IP</label>
+      <input id="zi-host" type="text" autocomplete="off" />
+      <label>Identity (user / cert CN)</label>
+      <input id="zi-id" type="text" autocomplete="off" />
+      <label>PKCS#12 password</label>
+      <input id="zi-pass" type="password" autocomplete="off" />
+      <label>IKE proposal</label>
+      <input id="zi-ike" type="text" value="aes256-sha256-modp2048" />
+      <label>ESP proposal</label>
+      <input id="zi-esp" type="text" value="aes128gcm16" />
+      <label>PKCS#12 file (.p12 / .pfx)</label>
+      <input id="zi-p12" type="file" accept=".p12,.pfx,application/x-pkcs12" />
+    </div>
+    <div class="zi-btns">
+      <button type="button" class="zi-primary" onclick="ziImport()">Save profile</button>
+      <button type="button" class="zi-primary" onclick="ziStart()">Connect</button>
+      <button type="button" class="zi-danger" onclick="ziStop()">Disconnect</button>
+      <button type="button" class="zi-muted" onclick="ziRefresh()">Refresh</button>
+    </div>
+    <div id="zi-msg"></div>
+  </div>
+
+  <div class="zi-card">
+    <h3>Log</h3>
+    <div class="zi-log" id="zi-log">loading…</div>
+  </div>
+</div>
+
+<script type="text/javascript">
+function ziUrl(act) {
+  return '<%=luci.dispatcher.build_url("admin","services","zlt_ipsec","api")%>?act=' + encodeURIComponent(act);
+}
+function ziTab(btn) {
+  var panes = document.querySelectorAll('.zi-pane');
+  var tabs = document.querySelectorAll('.zi-tabs button');
+  for (var i = 0; i < panes.length; i++) panes[i].className = 'zi-pane';
+  for (var i = 0; i < tabs.length; i++) tabs[i].className = '';
+  btn.className = 'on';
+  document.getElementById('pane-' + btn.getAttribute('data-pane')).className = 'zi-pane on';
+}
+function ziMsg(ok, text) {
+  var el = document.getElementById('zi-msg');
+  el.className = ok ? 'zi-ok' : 'zi-err';
+  el.textContent = text || '';
+}
+function ziPost(act, data, cb) {
+  var fd = new FormData();
+  if (data) for (var k in data) if (data.hasOwnProperty(k)) fd.append(k, data[k]);
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', ziUrl(act), true);
+  xhr.onload = function() {
+    var j = null;
+    try { j = JSON.parse(xhr.responseText); } catch (e) { j = { ok: false, error: xhr.responseText }; }
+    cb(j);
+  };
+  xhr.onerror = function() { cb({ ok: false, error: 'network error' }); };
+  xhr.send(fd);
+}
+function ziRefresh() {
+  ziPost('status', null, function(j) {
+    var badge = document.getElementById('zi-badge');
+    var st = (j.status || '').toLowerCase();
+    if (st.indexOf('up') >= 0 || st.indexOf('established') >= 0 || st === 'connected') {
+      badge.className = 'zi-badge zi-up';
+      badge.textContent = 'Connected';
+    } else if (st.indexOf('down') >= 0 || st === 'disconnected' || st === 'stopped') {
+      badge.className = 'zi-badge zi-down';
+      badge.textContent = 'Disconnected';
+    } else {
+      badge.className = 'zi-badge zi-unk';
+      badge.textContent = j.status || 'unknown';
+    }
+    var meta = [];
+    if (j.host) meta.push('server: ' + j.host);
+    if (j.user) meta.push('id: ' + j.user);
+    if (j.ping_fails) meta.push('ping fails: ' + j.ping_fails);
+    if (j.version) meta.push(j.version);
+    document.getElementById('zi-meta').textContent = meta.join(' · ');
+    document.getElementById('zi-log').textContent = j.log || '(empty)';
+  });
+}
+function ziFileB64(file, cb) {
+  var r = new FileReader();
+  r.onload = function() {
+    var s = r.result || '';
+    var i = s.indexOf('base64,');
+    cb(i >= 0 ? s.substring(i + 7) : s);
+  };
+  r.onerror = function() { cb(''); };
+  r.readAsDataURL(file);
+}
+function ziImport() {
+  var pasteOn = document.getElementById('pane-paste').className.indexOf('on') >= 0;
+  if (pasteOn) {
+    var cfg = document.getElementById('zi-cfg').value;
+    if (!cfg.trim()) { ziMsg(false, 'Paste a vpn:// link or JSON first'); return; }
+    ziMsg(true, 'Saving…');
+    ziPost('import', { config: cfg }, function(j) {
+      if (j.ok) { ziMsg(true, 'Profile saved'); ziRefresh(); }
+      else ziMsg(false, j.error || 'import failed');
+    });
+    return;
+  }
+  var host = document.getElementById('zi-host').value.trim();
+  var id = document.getElementById('zi-id').value.trim();
+  var pass = document.getElementById('zi-pass').value;
+  var ike = document.getElementById('zi-ike').value.trim();
+  var esp = document.getElementById('zi-esp').value.trim();
+  var file = document.getElementById('zi-p12').files[0];
+  if (!host || !id || !file) { ziMsg(false, 'host, identity and .p12 required'); return; }
+  ziMsg(true, 'Encoding certificate…');
+  ziFileB64(file, function(b64) {
+    if (!b64) { ziMsg(false, 'could not read .p12'); return; }
+    ziPost('import_manual', {
+      host: host, id: id, password: pass, ike: ike, esp: esp, p12_b64: b64
+    }, function(j) {
+      if (j.ok) { ziMsg(true, 'Profile saved'); ziRefresh(); }
+      else ziMsg(false, j.error || 'import failed');
+    });
+  });
+}
+function ziStart() {
+  ziMsg(true, 'Connecting…');
+  ziPost('start', null, function(j) {
+    if (j.ok) { setTimeout(ziRefresh, 2500); ziMsg(true, 'Start requested'); }
+    else ziMsg(false, j.error || 'start failed');
+  });
+}
+function ziStop() {
+  ziMsg(true, 'Disconnecting…');
+  ziPost('stop', null, function(j) {
+    if (j.ok) { setTimeout(ziRefresh, 1000); ziMsg(true, 'Stopped'); }
+    else ziMsg(false, j.error || 'stop failed');
+  });
+}
+ziRefresh();
+setInterval(ziRefresh, 8000);
+</script>
+<%+footer%>

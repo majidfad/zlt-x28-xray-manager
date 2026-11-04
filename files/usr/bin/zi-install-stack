@@ -1,0 +1,177 @@
+#!/bin/sh
+# zi-install-stack — install matched strongSwan 5.9.2 onto /data and bind-mount
+# into /usr/lib/ipsec. Safe on ZLT-X28 tiny overlay (never rm through a live bind).
+set -e
+IPSEC_LIB=/usr/lib/ipsec
+WORK=/tmp/zi_swan_dl
+MARKER=/etc/zlt-ipsec/stack.ver
+ROOT_FILE=/etc/zlt-ipsec/stack.root
+INIT=/etc/init.d/zi-swan-bind
+REPO_RAW="${ZI_REPO_RAW:-https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main}"
+TGZ_URL="${ZI_SWAN_TGZ_URL:-${REPO_RAW}/files/opt/zi-swan.tgz}"
+STACK_VER="5.9.2-zi1"
+
+mkdir -p /etc/zlt-ipsec /tmp/zi-bin "$WORK"
+
+free_kb() { df -k "$1" 2>/dev/null | awk 'NR==2 {print $4+0}'; }
+
+try_exec() {
+    _d="$1"; mkdir -p "$_d" 2>/dev/null || return 1
+    _t="$_d/.zi_exec_test"
+    printf '#!/bin/sh\nexit 0\n' > "$_t" 2>/dev/null || return 1
+    chmod +x "$_t" 2>/dev/null || { rm -f "$_t"; return 1; }
+    if "$_t" 2>/dev/null; then rm -f "$_t"; return 0; fi
+    rm -f "$_t"; return 1
+}
+
+pick_root() {
+    for b in /data /customer; do
+        [ -d "$b" ] || continue
+        _a=$(free_kb "$b"); [ -n "$_a" ] || _a=0
+        [ "$_a" -ge 4096 ] || continue
+        mount -o remount,rw,exec "$b" 2>/dev/null || true
+        if try_exec "$b/zi-swan"; then echo "$b/zi-swan"; return 0; fi
+    done
+    return 1
+}
+
+http_get() {
+    _url="$1"; _out="$2"; rm -f "$_out"
+    echo "[zi-stack] GET $_url"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -T 60 -O "$_out" "$_url" && [ -s "$_out" ] && return 0
+        wget -q -T 60 --no-check-certificate -O "$_out" "$_url" && [ -s "$_out" ] && return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --max-time 120 -o "$_out" "$_url" && [ -s "$_out" ] && return 0
+    fi
+    return 1
+}
+
+fix_modes() {
+    _r="$1"
+    chmod 755 "$_r/lib/ipsec/charon" "$_r/lib/ipsec/starter" "$_r/lib/ipsec/stroke" \
+              "$_r/sbin/ipsec" "$_r/sbin/swanctl" 2>/dev/null || true
+    chmod 755 "$_r/lib/ipsec/"*.so* "$_r/lib/ipsec/plugins/"*.so 2>/dev/null || true
+}
+
+fetch_tgz() {
+    OPT="$1"
+    echo "[zi-stack] downloading $TGZ_URL"
+    http_get "$TGZ_URL" "$WORK/zi-swan.tgz" || return 1
+    _sz=$(wc -c < "$WORK/zi-swan.tgz")
+    echo "[zi-stack] bytes=$_sz"
+    [ "$_sz" -gt 10000 ] || return 1
+    rm -rf "$WORK/out"; mkdir -p "$WORK/out"
+    tar -xzf "$WORK/zi-swan.tgz" -C "$WORK/out" || return 1
+    rm -rf "$OPT"; mkdir -p "$(dirname "$OPT")"
+    if [ -d "$WORK/out/sb-swan" ]; then
+        mv "$WORK/out/sb-swan" "$OPT"
+    elif [ -d "$WORK/out/zi-swan" ]; then
+        mv "$WORK/out/zi-swan" "$OPT"
+    else
+        mkdir -p "$OPT"; mv "$WORK/out/"* "$OPT/" 2>/dev/null || true
+    fi
+    fix_modes "$OPT"
+    [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ]
+}
+
+safe_umount_ipsec() {
+    killall charon starter 2>/dev/null || true
+    sleep 1
+    if mount | grep -q " on $IPSEC_LIB "; then
+        umount "$IPSEC_LIB" 2>/dev/null || umount -l "$IPSEC_LIB" 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+bind_stack() {
+    OPT="$1"; SRC="$OPT/lib/ipsec"
+    [ -f "$SRC/charon" ] || return 1
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    fix_modes "$OPT"
+    mkdir -p "$IPSEC_LIB" 2>/dev/null || true
+    safe_umount_ipsec
+    if mount | grep -q " on $IPSEC_LIB "; then
+        echo "[zi-stack] ERROR: cannot umount $IPSEC_LIB — abort (will not delete)" >&2
+        return 1
+    fi
+    # Only now may we clear overlay copies (not a bind to /data).
+    _real=$(readlink -f "$IPSEC_LIB" 2>/dev/null || echo "$IPSEC_LIB")
+    case "$_real" in
+        /data/*|/customer/*) echo "[zi-stack] refuse delete on $_real"; ;;
+        *)
+            rm -f "$IPSEC_LIB"/charon "$IPSEC_LIB"/starter "$IPSEC_LIB"/stroke \
+                  "$IPSEC_LIB"/libstrongswan.so.0 "$IPSEC_LIB"/libcharon.so.0 \
+                  "$IPSEC_LIB"/libvici.so.0 "$IPSEC_LIB"/plugins/*.so 2>/dev/null || true
+            ;;
+    esac
+    echo "[zi-stack] mount --bind $SRC $IPSEC_LIB"
+    mount --bind "$SRC" "$IPSEC_LIB" || return 1
+    [ -f "$IPSEC_LIB/charon" ] || return 1
+    grep -aq '5\.9\.2' "$IPSEC_LIB/charon" || return 1
+}
+
+write_init() {
+    OPT="$1"; SRC="$OPT/lib/ipsec"
+    cat > "$INIT" << EOF
+#!/bin/sh /etc/rc.common
+START=15
+STOP=85
+start() {
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    [ -f "$SRC/charon" ] || return 1
+    mkdir -p /tmp/zi-bin "$IPSEC_LIB"
+    ln -sf "$OPT/sbin/swanctl" /tmp/zi-bin/swanctl 2>/dev/null || true
+    ln -sf "$OPT/sbin/ipsec" /tmp/zi-bin/ipsec 2>/dev/null || true
+    if mount | grep -q " on $IPSEC_LIB "; then
+        [ -f $IPSEC_LIB/charon ] && return 0
+        umount $IPSEC_LIB 2>/dev/null || umount -l $IPSEC_LIB 2>/dev/null || true
+    fi
+    mount --bind "$SRC" "$IPSEC_LIB"
+}
+stop() {
+    killall charon starter 2>/dev/null || true
+    umount $IPSEC_LIB 2>/dev/null || umount -l $IPSEC_LIB 2>/dev/null || true
+}
+EOF
+    chmod +x "$INIT"
+    "$INIT" enable 2>/dev/null || ln -sf ../init.d/zi-swan-bind /etc/rc.d/S15zi-swan-bind 2>/dev/null || true
+    if [ -f /etc/rc.local ] && ! grep -q 'zi-swan-bind\|zi-swan/lib/ipsec' /etc/rc.local 2>/dev/null; then
+        sed -i "s|^exit 0|/etc/init.d/zi-swan-bind start 2>/dev/null || true\nexit 0|" /etc/rc.local 2>/dev/null || true
+    fi
+}
+
+# ---- main ----
+echo "[zi-stack] matched strongSwan 5.9.2 for ZLT-X28"
+OPT=$(pick_root) || { echo "[zi-stack] ERROR: need /data or /customer with space+exec"; df -h; exit 1; }
+echo "[zi-stack] root=$OPT"
+
+if [ -f "$OPT/lib/ipsec/charon" ] && [ -f "$OPT/sbin/swanctl" ] \
+    && [ -f "$OPT/lib/ipsec/plugins/libstrongswan-x509.so" ] \
+    && grep -aq '5\.9\.2' "$OPT/lib/ipsec/charon" 2>/dev/null; then
+    echo "[zi-stack] reusing $OPT"
+    fix_modes "$OPT"
+else
+    fetch_tgz "$OPT" || { echo "[zi-stack] download/extract failed"; exit 1; }
+fi
+
+bind_stack "$OPT" || { echo "[zi-stack] bind-mount failed"; exit 1; }
+write_init "$OPT"
+
+mkdir -p /tmp/zi-bin
+ln -sf "$OPT/sbin/swanctl" /tmp/zi-bin/swanctl
+ln -sf "$OPT/sbin/ipsec" /tmp/zi-bin/ipsec
+echo "$OPT" > "$ROOT_FILE" 2>/dev/null || echo "$OPT" > /tmp/zi-stack.root
+echo "$STACK_VER" > "$MARKER" 2>/dev/null || true
+
+# Tiny conf snippets
+mkdir -p /etc/strongswan.d/charon /etc/zlt-ipsec 2>/dev/null || true
+for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
+    printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
+done
+
+echo "[zi-stack] OK charon=$(ls -la $IPSEC_LIB/charon)"
+echo "[zi-stack] DONE ($STACK_VER @ $OPT)"
+rm -rf "$WORK"
+exit 0

@@ -1,0 +1,514 @@
+#!/bin/sh
+# ============================================================
+# zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
+# Fresh implementation — not based on sb-manager.
+# ============================================================
+VERSION="2026.11.04-zi1"
+DIR="/etc/zlt-ipsec"
+PROFILE="$DIR/profile.json"
+MAT="$DIR/material"
+STATE_FILE="$DIR/active"          # 1 = should run after boot
+FAIL_FILE="$DIR/ping_fails"
+LOG="/var/log/zlt-ipsec.log"
+PID_WD="/var/run/zi_watchdog.pid"
+SWANCTL_DIR="/tmp/zi_swanctl"
+SS_CONF="$DIR/strongswan.conf"
+CONN="zivpn"
+PING_EVERY=300                    # seconds
+PING_FAILS=10
+PING_TARGET_DEFAULT="1.1.1.1"
+
+log() { echo "[zi] $*" | tee -a "$LOG" 2>/dev/null; echo "[System] $*" >> "$LOG" 2>/dev/null; }
+
+ensure_dirs() {
+    mkdir -p "$DIR" "$MAT" /tmp/zi-bin /var/run 2>/dev/null || true
+    : >> "$LOG" 2>/dev/null || true
+}
+
+prefer_bins() {
+    mount -o remount,rw,exec /data 2>/dev/null || true
+    _root=$(cat "$DIR/stack.root" 2>/dev/null || cat /tmp/zi-stack.root 2>/dev/null || echo /data/zi-swan)
+    [ -d "$_root/sbin" ] && export PATH="/tmp/zi-bin:$_root/sbin:$PATH"
+    mkdir -p /tmp/zi-bin
+    [ -x "$_root/sbin/swanctl" ] && ln -sf "$_root/sbin/swanctl" /tmp/zi-bin/swanctl
+    [ -x "$_root/sbin/ipsec" ] && ln -sf "$_root/sbin/ipsec" /tmp/zi-bin/ipsec
+    export LD_LIBRARY_PATH="/usr/lib/ipsec:${_root}/lib/ipsec:${LD_LIBRARY_PATH:-}"
+    export STRONGSWAN_CONF="$SS_CONF"
+    export PATH="/tmp/zi-bin:$PATH"
+}
+
+json_str() {
+    # extract_json_str key from file — busybox-friendly
+    _f="$1"; _k="$2"
+    [ -f "$_f" ] || { echo ""; return; }
+    sed -n "s/.*\"$_k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$_f" | head -n1
+}
+
+write_ss_conf() {
+    mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
+    cat > "$SS_CONF" << 'EOF'
+# zlt-ipsec generated
+charon {
+    load_modular = no
+    install_routes = yes
+    install_virtual_ip = yes
+    rsa_pss = yes
+    load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default stroke vici updown counters gcm
+}
+EOF
+    ln -sf "$SS_CONF" /etc/strongswan.conf 2>/dev/null || true
+    for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
+        printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
+    done
+}
+
+ensure_stack() {
+    prefer_bins
+    if [ -f /usr/lib/ipsec/charon ] && grep -aq '5\.9\.2' /usr/lib/ipsec/charon 2>/dev/null \
+        && [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
+        return 0
+    fi
+    log "stack missing/inactive — running zi-install-stack"
+    if [ -x /tmp/zi-install-stack ]; then
+        /tmp/zi-install-stack >>"$LOG" 2>&1 || true
+    elif [ -x /data/zi-bin/zi-install-stack ]; then
+        /data/zi-bin/zi-install-stack >>"$LOG" 2>&1 || true
+    elif [ -x /usr/bin/zi-install-stack ]; then
+        /usr/bin/zi-install-stack >>"$LOG" 2>&1 || true
+    else
+        log "ERROR: zi-install-stack not found"
+        return 1
+    fi
+    prefer_bins
+    [ -f /usr/lib/ipsec/charon ] && grep -aq '5\.9\.2' /usr/lib/ipsec/charon
+}
+
+b64_decode_file() {
+    _in="$1"; _out="$2"
+    if command -v base64 >/dev/null 2>&1; then
+        printf '%s' "$_in" | base64 -d > "$_out" 2>/dev/null && [ -s "$_out" ] && return 0
+        printf '%s' "$_in" | base64 -D > "$_out" 2>/dev/null && [ -s "$_out" ] && return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        printf '%s' "$_in" | openssl base64 -d -A > "$_out" 2>/dev/null && [ -s "$_out" ] && return 0
+    fi
+    return 1
+}
+
+pkcs12_unpack() {
+    _p12="$1"; _pass="$2"; _dir="$3"
+    openssl pkcs12 -in "$_p12" -nodes -nocerts -passin "pass:$_pass" \
+        -out "$_dir/client.key" 2>/tmp/zi_p12.err \
+    && openssl pkcs12 -in "$_p12" -nodes -clcerts -nokeys -passin "pass:$_pass" \
+        -out "$_dir/client.pem" 2>>/tmp/zi_p12.err || return 1
+    openssl pkcs12 -in "$_p12" -nodes -cacerts -nokeys -passin "pass:$_pass" \
+        -out "$_dir/ca.pem" 2>>/tmp/zi_p12.err || true
+    # strip bag attributes / normalize
+    if grep -q 'BEGIN CERTIFICATE' "$_dir/client.pem" 2>/dev/null; then
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$_dir/client.pem" > "$_dir/client.pem.n" \
+            && mv "$_dir/client.pem.n" "$_dir/client.pem"
+    fi
+    if grep -q 'BEGIN.*PRIVATE KEY' "$_dir/client.key" 2>/dev/null; then
+        awk '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/' "$_dir/client.key" > "$_dir/client.key.n" \
+            && mv "$_dir/client.key.n" "$_dir/client.key"
+    fi
+    [ -s "$_dir/client.pem" ] && [ -s "$_dir/client.key" ]
+}
+
+import_profile() {
+    # $1 = path to vpn:// file or JSON file
+    _src="$1"
+    [ -f "$_src" ] || { log "import: file missing"; return 1; }
+    ensure_dirs
+    _raw=$(cat "$_src")
+    case "$_raw" in
+        vpn://*|VPN://*)
+            if command -v python3 >/dev/null 2>&1; then
+                python3 /usr/bin/zi-vpn-decode "$_src" > "$PROFILE.tmp" 2>/tmp/zi_dec.err \
+                    || python3 /data/zi-bin/zi-vpn-decode "$_src" > "$PROFILE.tmp" 2>/tmp/zi_dec.err \
+                    || { log "vpn:// decode failed"; cat /tmp/zi_dec.err >>"$LOG"; return 1; }
+            elif command -v python >/dev/null 2>&1; then
+                python /usr/bin/zi-vpn-decode "$_src" > "$PROFILE.tmp" 2>/tmp/zi_dec.err \
+                    || { log "vpn:// decode failed"; return 1; }
+            else
+                log "ERROR: python required to decode vpn://"
+                return 1
+            fi
+            mv "$PROFILE.tmp" "$PROFILE"
+            ;;
+        *)
+            # assume JSON
+            cp -f "$_src" "$PROFILE"
+            ;;
+    esac
+    prepare_material || return 1
+    log "profile imported (host=$(cat $MAT/host 2>/dev/null))"
+    return 0
+}
+
+prepare_material() {
+    ensure_dirs
+    [ -f "$PROFILE" ] || { log "no profile.json"; return 1; }
+    rm -rf "$MAT"; mkdir -p "$MAT"
+    _host=$(json_str "$PROFILE" hostName)
+    [ -z "$_host" ] && _host=$(json_str "$PROFILE" addr)
+    _user=$(json_str "$PROFILE" userName)
+    [ -z "$_user" ] && _user=$(json_str "$PROFILE" clientId)
+    _pass=$(json_str "$PROFILE" password)
+    _cert=$(json_str "$PROFILE" cert)
+    [ -z "$_cert" ] && _cert=$(json_str "$PROFILE" p12)
+    _ike=$(json_str "$PROFILE" ikeProposal)
+    [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
+    _esp=$(json_str "$PROFILE" espProposal)
+    [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
+    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
+    [ -z "$_esp" ] && _esp="aes128gcm16"
+    [ -z "$_host" ] && { log "ERROR: no hostName/addr in profile"; return 1; }
+    [ -z "$_cert" ] && { log "ERROR: no cert/p12 in profile"; return 1; }
+    printf '%s' "$_host" > "$MAT/host"
+    printf '%s' "$_user" > "$MAT/user"
+    printf '%s' "$_pass" > "$MAT/pass"
+    printf '%s' "$_ike" > "$MAT/ike"
+    printf '%s' "$_esp" > "$MAT/esp"
+    # optional dns
+    _d1=$(json_str "$PROFILE" dns1); [ -n "$_d1" ] && printf '%s' "$_d1" > "$MAT/dns1"
+    echo "1" > "$MAT/rsa_pss"
+    b64_decode_file "$_cert" "$MAT/client.p12" || { log "ERROR: base64 p12 decode failed"; return 1; }
+    _ok=0
+    for _try in "$_pass" "" "$_user"; do
+        if pkcs12_unpack "$MAT/client.p12" "$_try" "$MAT"; then _ok=1; printf '%s' "$_try" > "$MAT/pass"; break; fi
+    done
+    [ "$_ok" = "1" ] || { log "ERROR: PKCS#12 unpack failed"; cat /tmp/zi_p12.err >>"$LOG" 2>/dev/null; return 1; }
+    chmod 600 "$MAT/client.key" "$MAT/client.p12" "$MAT/pass"
+    log "material ready host=$_host user=$_user ike=$_ike esp=$_esp"
+    return 0
+}
+
+import_manual() {
+    # host user p12_path [password] [ike] [esp]
+    _host="$1"; _user="$2"; _p12="$3"; _pass="${4:-}"; _ike="${5:-aes256-sha256-modp2048}"; _esp="${6:-aes128gcm16}"
+    [ -n "$_host" ] && [ -n "$_user" ] && [ -f "$_p12" ] || {
+        echo "Usage: zi-manager import-manual <host> <id> <p12file> [password] [ike] [esp]" >&2
+        return 1
+    }
+    ensure_dirs
+    if command -v base64 >/dev/null 2>&1; then
+        _b64=$(base64 -w0 "$_p12" 2>/dev/null || base64 "$_p12" | tr -d '\n')
+    else
+        _b64=$(openssl base64 -A -in "$_p12")
+    fi
+    cat > "$PROFILE" << EOF
+{
+  "hostName": "$_host",
+  "userName": "$_user",
+  "password": "$_pass",
+  "cert": "$_b64",
+  "ikeProposal": "$_ike",
+  "espProposal": "$_esp",
+  "rsa_pss": true
+}
+EOF
+    prepare_material
+}
+
+stop_daemons() {
+    prefer_bins
+    swanctl --terminate --ike "$CONN" >/dev/null 2>&1 || true
+    ipsec down "$CONN" >/dev/null 2>&1 || true
+    ipsec stop >/dev/null 2>&1 || true
+    killall charon starter 2>/dev/null || true
+    sleep 1
+}
+
+clean_tunnel_nat() {
+    iptables -t nat -D POSTROUTING -j ZI_NAT 2>/dev/null || true
+    iptables -t nat -F ZI_NAT 2>/dev/null || true
+    iptables -t nat -X ZI_NAT 2>/dev/null || true
+}
+
+lan_cidrs() {
+    # Print LAN IPv4 CIDRs (one per line)
+    ip -4 addr show 2>/dev/null | awk '
+        $1=="inet" {
+            split($2,a,"/")
+            ip=a[1]; pfx=a[2]+0
+            if (ip ~ /^127\./) next
+            n=split(ip,o,".")
+            if (n!=4) next
+            # rough private only for exceptions list (still include all non-lo)
+            print $2
+        }'
+}
+
+setup_tunnel_nat() {
+    clean_tunnel_nat
+    _vip="$1"
+    _server=$(cat "$MAT/host" 2>/dev/null)
+    iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
+    # Auto exceptions: LAN CIDRs + VPN server
+    lan_cidrs | while read -r _c; do
+        [ -n "$_c" ] || continue
+        iptables -t nat -A ZI_NAT -d "$_c" -j RETURN 2>/dev/null || true
+    done
+    [ -n "$_server" ] && iptables -t nat -A ZI_NAT -d "$_server" -j RETURN 2>/dev/null || true
+    # classic privates as safety net
+    for _n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16; do
+        iptables -t nat -A ZI_NAT -d "$_n" -j RETURN 2>/dev/null || true
+    done
+    if [ -n "$_vip" ]; then
+        iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
+        log "tunnel NAT SNAT -> $_vip (LAN+server excepted)"
+    else
+        iptables -t nat -A ZI_NAT -j MASQUERADE
+        log "tunnel NAT MASQUERADE (no VIP yet)"
+    fi
+    iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
+}
+
+detect_vip() {
+    _v=""
+    _v=$(ip -4 addr show 2>/dev/null | awk '/inet / {
+        split($2,a,"/"); ip=a[1]
+        if (ip !~ /^127\./ && ip !~ /^192\.168\./ && ip !~ /^10\./ && ip !~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)
+            { print ip; exit }
+    }')
+    # also from swanctl list-sas
+    if [ -z "$_v" ]; then
+        _v=$(swanctl --list-sas 2>/dev/null | awk '/[[:space:]][0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[/]/ {
+            for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) { print $i; exit }
+        }')
+    fi
+    echo "$_v"
+}
+
+is_up() {
+    prefer_bins
+    swanctl --list-sas 2>/dev/null | grep -q 'ESTABLISHED' && return 0
+    ipsec status 2>/dev/null | grep -q 'ESTABLISHED' && return 0
+    return 1
+}
+
+prepare_swanctl_tree() {
+    rm -rf "$SWANCTL_DIR"
+    mkdir -p "$SWANCTL_DIR/x509" "$SWANCTL_DIR/private" "$SWANCTL_DIR/x509ca" \
+             "$SWANCTL_DIR/conf.d" "$SWANCTL_DIR/pkcs12"
+    cp -f "$MAT/client.pem" "$SWANCTL_DIR/x509/client.pem"
+    cp -f "$MAT/client.key" "$SWANCTL_DIR/private/client.key"
+    [ -s "$MAT/ca.pem" ] && cp -f "$MAT/ca.pem" "$SWANCTL_DIR/x509ca/ca.pem"
+    chmod 600 "$SWANCTL_DIR/private/client.key"
+    echo 'include conf.d/*.conf' > "$SWANCTL_DIR/swanctl.conf"
+    _host=$(cat "$MAT/host")
+    _user=$(cat "$MAT/user")
+    _ike=$(cat "$MAT/ike")
+    _esp=$(cat "$MAT/esp")
+    cat > "$SWANCTL_DIR/conf.d/zivpn.conf" << EOF
+connections {
+    ${CONN} {
+        version = 2
+        remote_addrs = ${_host}
+        vips = 0.0.0.0
+        proposals = ${_ike}
+        encap = yes
+        mobike = no
+        fragmentation = yes
+        send_cert = always
+        local {
+            auth = ike:rsa/pss-sha256
+            rsa_pss = yes
+            certs = client.pem
+            id = ${_user}
+        }
+        remote {
+            auth = pubkey
+            id = ${_host}
+            cacerts = ca.pem
+        }
+        children {
+            ${CONN} {
+                remote_ts = 0.0.0.0/0
+                esp_proposals = ${_esp}
+                start_action = none
+            }
+        }
+    }
+}
+secrets {
+    private-client {
+        file = client.key
+    }
+}
+EOF
+}
+
+start_charon() {
+    write_ss_conf
+    prefer_bins
+    stop_daemons
+    rm -f /var/run/charon.vici /var/run/charon.ctl
+    if [ ! -x /usr/lib/ipsec/charon ]; then
+        log "ERROR: /usr/lib/ipsec/charon missing — run zi-install-stack"
+        return 1
+    fi
+    STRONGSWAN_CONF="$SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
+        /usr/lib/ipsec/charon >>/tmp/zi_charon.log 2>&1 &
+    _i=0
+    while [ "$_i" -lt 15 ]; do
+        [ -S /var/run/charon.vici ] && return 0
+        pidof charon >/dev/null 2>&1 || break
+        sleep 1
+        _i=$((_i + 1))
+    done
+    log "ERROR: charon did not create vici socket"
+    cat /tmp/zi_charon.log >>"$LOG" 2>/dev/null || true
+    return 1
+}
+
+swan() {
+    prefer_bins
+    SWANCTL_DIR="$SWANCTL_DIR" STRONGSWAN_CONF="$SS_CONF" swanctl --noprompt "$@" 2>/dev/null \
+        || SWANCTL_DIR="$SWANCTL_DIR" STRONGSWAN_CONF="$SS_CONF" swanctl "$@"
+}
+
+start_vpn() {
+    ensure_dirs
+    log "start $VERSION"
+    [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
+    [ -s "$MAT/client.key" ] || prepare_material || return 1
+    ensure_stack || return 1
+    write_ss_conf
+    prepare_swanctl_tree
+    start_charon || return 1
+
+    if ! swan --load-all >>"$LOG" 2>&1; then
+        # fallback pubkey+rsa_pss without ike:rsa/pss-sha256
+        log "load-all with ike:rsa/pss-sha256 failed — trying pubkey+rsa_pss"
+        sed -i 's/auth = ike:rsa\/pss-sha256/auth = pubkey/' "$SWANCTL_DIR/conf.d/zivpn.conf"
+        swan --load-all >>"$LOG" 2>&1 || { log "swanctl load failed"; return 1; }
+    fi
+
+    swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
+        || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
+        || true
+    sleep 4
+    if ! is_up; then
+        log "initiate failed"
+        swan --list-conns >>"$LOG" 2>&1 || true
+        swan --list-certs >>"$LOG" 2>&1 || true
+        return 1
+    fi
+    _vip=$(detect_vip)
+    setup_tunnel_nat "$_vip"
+    echo "1" > "$STATE_FILE"
+    echo "0" > "$FAIL_FILE"
+    log "IPsec ESTABLISHED vip=${_vip:-none}"
+    start_watchdog
+    return 0
+}
+
+stop_vpn() {
+    ensure_dirs
+    log "stop"
+    [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$PID_WD"
+    clean_tunnel_nat
+    stop_daemons
+    echo "0" > "$STATE_FILE"
+    echo "0" > "$FAIL_FILE"
+    log "VPN fully terminated (WAN fallback)"
+}
+
+ping_target() {
+    if [ -s "$MAT/dns1" ]; then
+        cat "$MAT/dns1"
+    else
+        echo "$PING_TARGET_DEFAULT"
+    fi
+}
+
+watchdog_loop() {
+    echo $$ > "$PID_WD"
+    while true; do
+        sleep "$PING_EVERY"
+        [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
+        if ! is_up; then
+            log "watchdog: SA down — stopping VPN"
+            stop_vpn
+            exit 0
+        fi
+        _t=$(ping_target)
+        if ping -c 1 -W 5 "$_t" >/dev/null 2>&1; then
+            echo "0" > "$FAIL_FILE"
+        else
+            _f=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+            _f=$((_f + 1))
+            echo "$_f" > "$FAIL_FILE"
+            log "watchdog: ping $_t fail $_f/$PING_FAILS"
+            if [ "$_f" -ge "$PING_FAILS" ]; then
+                log "watchdog: $PING_FAILS consecutive ping fails — disconnect VPN, fall back to WAN"
+                stop_vpn
+                exit 0
+            fi
+        fi
+    done
+}
+
+start_watchdog() {
+    [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
+    watchdog_loop &
+    echo $! > "$PID_WD"
+}
+
+ss_check() {
+    prefer_bins
+    echo "=== zi-manager ss_check ($VERSION) ==="
+    df -h / /data /customer 2>/dev/null || df -h /
+    echo "stack.root=$(cat $DIR/stack.root 2>/dev/null || echo ?)"
+    echo "stack.ver=$(cat $DIR/stack.ver 2>/dev/null || echo ?)"
+    mount | grep ' on /usr/lib/ipsec ' || echo "(no bind on /usr/lib/ipsec)"
+    ls -la /usr/lib/ipsec/charon /usr/lib/ipsec/plugins/libstrongswan-x509.so 2>&1 || true
+    if [ -f /usr/lib/ipsec/charon ] && grep -aq '5\.9\.2' /usr/lib/ipsec/charon; then
+        echo "charon: 5.9.2 OK"
+    else
+        echo "charon: NOT 5.9.2"
+    fi
+    echo "swanctl=$(command -v swanctl)"
+    swanctl --version 2>&1 | head -n2 || true
+    echo "active=$(cat $STATE_FILE 2>/dev/null)"
+    echo "ping_fails=$(cat $FAIL_FILE 2>/dev/null)"
+    if is_up; then echo "sa: ESTABLISHED"; else echo "sa: down"; fi
+    ipsec statusall 2>/dev/null | sed -n 's/.*loaded plugins: /plugins: /p' || true
+    echo "=== end ==="
+}
+
+status() {
+    if is_up; then echo "Running (IPsec tunnel)"; else echo "Stopped"; fi
+}
+
+boot_start() {
+    ensure_dirs
+    /etc/init.d/zi-swan-bind start 2>/dev/null || true
+    [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
+    [ -f "$PROFILE" ] || exit 0
+    start_vpn
+}
+
+case "$1" in
+    version) echo "$VERSION" ;;
+    start) ensure_dirs; start_vpn ;;
+    stop) stop_vpn ;;
+    restart) stop_vpn; sleep 1; start_vpn ;;
+    status) status ;;
+    ss_check|check) ss_check ;;
+    import)
+        [ -n "$2" ] || { echo "Usage: zi-manager import <file>"; exit 1; }
+        import_profile "$2"
+        ;;
+    import-manual) shift; import_manual "$@" ;;
+    prepare) prepare_material ;;
+    watchdog) watchdog_loop ;;
+    boot) boot_start ;;
+    *)
+        echo "Usage: zi-manager {start|stop|restart|status|ss_check|import <file>|import-manual ...|version|boot}"
+        exit 1
+        ;;
+esac

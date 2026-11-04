@@ -1,216 +1,45 @@
-# ZLT-X28 Sing-Box VPN Manager
+# ZLT-X28 IPsec Manager (`zi-*`)
 
-Transparent-proxy VPN manager for the ZLT-X28 (and similar OpenWrt/ARM64
-routers), built on [sing-box](https://github.com/SagerNet/sing-box). Supports
-VLESS + REALITY / TLS nodes, Amnezia-style IKEv2/IPsec (PKCS#12 JSON) via
-strongSwan, full-tunnel (tproxy) or SOCKS/HTTP proxy-only routing modes, a
-watchdog, and a LuCI web UI.
+Amnezia **IKEv2 / IPsec** tunnel for ZLT-X28 (OpenWrt). No sing-box / VLESS.
 
-## Status
+## Features
 
-Functional. REALITY connectivity bug (see below) is fixed by pinning a
-current sing-box release. UI is a minimal first pass — see
-[Roadmap](#roadmap) for planned improvements.
+- Import `vpn://` link, flat JSON, or manual host + PKCS#12
+- Matched **strongSwan 5.9.2** on `/data` + bind-mount (tiny overlay safe)
+- RSA-PSS (`ike:rsa/pss-sha256`) for Amnezia Libreswan peers
+- Tunnel mode with SNAT; **LAN CIDRs + VPN server IP** auto-excepted
+- Health ping every **5 minutes**; **10** consecutive fails → disconnect (WAN fallback)
+- One active profile; LuCI under **Services → ZLT IPsec**
 
-## Requirements
-
-- OpenWrt router, ARM64 (tested target: ZLT-X28)
-- `iptables` + `ip` (standard OpenWrt iptables-legacy stack)
-- `curl`, `tar`
-- LuCI + `uhttpd` (optional, only needed for the web UI)
-- For IKEv2/IPsec nodes: `strongswan` / `swanctl` + `openssl-util`
-
-## Install
+## Install (on router)
 
 ```sh
-# On the router:
-curl -L -o install.sh https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main/scripts/install.sh
-sh install.sh
+wget -q -T 60 -O /tmp/zi-install.sh \
+  https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main/install.sh
+sh /tmp/zi-install.sh
 ```
 
-Or clone the repo onto the router and run `sh scripts/install.sh` from the
-repo root (the script locates `files/` relative to itself).
+Then open LuCI → **Services → ZLT IPsec**, paste `vpn://` or JSON, **Save** → **Connect**.
 
-Architecture is auto-detected from userspace (not only `uname -m`). OpenWrt
-needs the **musl** build; the installer prefers `linux-*-musl.tar.gz` and
-falls back across arch/libc variants until one actually runs.
+## CLI
 
 ```sh
-SINGBOX_ARCH=armv7 SINGBOX_LIBC=musl sh scripts/install.sh   # 32-bit ARM OpenWrt
-SINGBOX_ARCH=arm64 SINGBOX_LIBC=musl sh scripts/install.sh   # 64-bit ARM OpenWrt
+zi-manager import /tmp/cfg.txt    # vpn:// file or JSON
+zi-manager start
+zi-manager status
+zi-manager ss_check
+zi-manager stop
 ```
-
-If the binary exists but Start/install says `not found`, it is the wrong
-arch or a glibc build on musl OpenWrt — re-run install (musl is default now).
 
 ## Uninstall
 
 ```sh
-sh scripts/uninstall.sh
+wget -q -O /tmp/zi-un.sh \
+  https://raw.githubusercontent.com/majidfad/zlt-x28-xray-manager/main/uninstall.sh
+sh /tmp/zi-un.sh
 ```
 
-## Usage
+## Notes
 
-Add a node from a `vless://` share link (REALITY or plain TLS):
-
-```sh
-echo 'vless://uuid@host:port?...' > /tmp/link.txt
-sb-manager addnode home1 /tmp/link.txt
-sb-manager switch home1
-sb-manager start
-```
-
-### Amnezia IPsec (IKEv2)
-
-Accepted inputs:
-
-1. **`vpn://...` share link** (Amnezia app “Share” / QR payload)
-2. Flat export JSON (`cert` / `hostName` / `userName` / `password`)
-3. `strongswan.profile` / `.sswan` (`type: ikev2-cert`)
-
-```sh
-# vpn:// share link:
-echo 'vpn://AAA...' > /tmp/amnezia.txt
-sb-manager addnode ike1 /tmp/amnezia.txt
-sb-manager switch ike1
-sb-manager start
-# status → Running (Amnezia IPsec)
-```
-
-**Import:** paste `vpn://` in the LuCI panel — the **browser** decodes it (no
-python on the router). CLI `sb-vpn-decode` still wants optional `python3`.
-
-**Connect:** needs **strongSwan** (`swanctl` or `ipsec`) + openssl. OEM ZLT
-feeds usually lack `strongswan-mod-x509` / `pkcs1`; `install.sh` embeds those
-`.so` files from `files/usr/lib/ipsec/plugins/` and installs them **offline**
-(no CDN). Manual: scp `libstrongswan-*.so` → `/usr/lib/ipsec/plugins/`.
-
-Switching VLESS ↔ Amnezia IPsec stops the other engine automatically.
-Proxy-only mode is for sing-box; Amnezia IPsec uses policy-based tunnel + LAN SNAT.
-
-Common commands:
-
-```sh
-sb-manager status            # Running / Stopped
-sb-manager restart
-sb-manager listnodes
-sb-manager delnode home1
-sb-manager mode_toggle proxy # or: tunnel
-sb-manager mode_status
-sb-manager watchdog_toggle 1 # auto-restart sing-box if it dies
-```
-
-Routing modes:
-
-- `tunnel` — transparent proxy via iptables TPROXY/REDIRECT, routes all LAN
-  traffic through the active node.
-- `proxy` — sing-box only listens on `0.0.0.0:1080` (SOCKS/HTTP mixed inbound);
-  no iptables rules are touched. Useful for testing a node without affecting
-  the whole LAN.
-
-The LuCI panel is under **Services → Sing-Box VPN** once installed.
-
-## The REALITY bug and its fix
-
-The original script pinned **sing-box v1.9.3** (June 2024). Against modern
-REALITY servers, that build consistently logs:
-
-```
-inbound/tproxy[tproxy-in]: process connection ...: reality verification failed
-```
-
-This was diagnosed by elimination, not guesswork:
-
-- The `vless://` link parser was traced by hand against a real affected link —
-  `pbk`, `sid`, `sni`, `fp` all decoded correctly, so this was not a parsing
-  bug on values without percent-encoding (though a real latent parsing bug
-  existed and is fixed below).
-- Router clock was confirmed accurate (`date -u` matched real time) — not a
-  clock-skew issue.
-- The same link was confirmed working from another (modern) client — the
-  server and credentials are not at fault.
-- sing-box v1.9.3 bundles `sagernet/utls v1.5.4` and an early REALITY
-  implementation. Later sing-box releases bumped uTLS through several major
-  versions with REALITY/ClientHello compatibility fixes, and the VLESS/REALITY
-  config schema did not change in the process — so upgrading the pinned
-  binary is a drop-in fix.
-
-**Fix applied:** the installer now downloads **sing-box v1.14.3** instead of
-v1.9.3. No config changes were needed since the schema is unchanged.
-
-### Other correctness fixes made while auditing the script
-
-- `urldecode()` in `sb-manager` previously decoded only 7 hardcoded `%XX`
-  sequences. Any REALITY/TLS link with an unlisted encoded character in a
-  query value (e.g. `%26`, encoded `spx` paths, etc.) would silently produce a
-  wrong value. Replaced with a full percent-decoder.
-- Parsed values are now JSON-escaped before being embedded in the generated
-  node config, so a `"` or `\` in `sni`/`host` can't produce invalid JSON.
-- `sb-manager start` now runs `sing-box check` on the generated config before
-  launching it, and aborts with a logged reason instead of starting a broken
-  process silently.
-- Added IPv6 literal address support (`[::1]:port`) in the link parser.
-- Added a `listnodes` command (needed by the UI to show existing nodes after
-  a page reload) and a `restart` command.
-- The LuCI controller shell-quotes and validates every HTTP parameter before
-  it reaches the shell (node ids are restricted to `[A-Za-z0-9_-]+`), closing
-  a command-injection gap in the admin panel.
-- Fixed LuCI `tonumber` 500 on Add Node: `run()` used to return
-  `string.gsub`'s second value (substitution count), so
-  `tonumber("0", 1)` crashed with "base out of range" after Amnezia/IPsec
-  imports. `run()` now returns a single trimmed string; exit codes use a
-  safe `to_int()` parser.
-
-## Project layout
-
-```
-scripts/
-  install.sh       # clean install / reinstall
-  uninstall.sh      # full removal
-files/
-  etc/singbox/
-    base_config.json      # sing-box config template (outbounds injected here)
-  usr/bin/
-    sb-manager             # core control script (start/stop/node mgmt/watchdog)
-    sb-vpn-decode          # Amnezia vpn:// → IPsec JSON (python3)
-  usr/lib/lua/luci/
-    controller/singbox.lua # LuCI backend (AJAX endpoints)
-    view/singbox_panel.htm # LuCI frontend panel
-```
-
-## Roadmap
-
-Functionality is stable; these are the planned next improvements, roughly in
-priority order:
-
-1. **Multi-protocol support** — `vless` (sing-box) and IKEv2/IPsec (strongSwan)
-   are supported. Still planned: `trojan`, `hysteria2`, `shadowsocks` share-link
-   parsing in `sb-manager addnode`.
-2. **Subscription import** — fetch a base64 subscription URL and expand it
-   into multiple nodes instead of pasting links one at a time.
-3. **Latency/health check per node** — periodic TCP connect + HTTP probe
-   through each node, shown in the UI, so you can pick the fastest one.
-4. **Config persistence across sing-box upgrades** — store nodes/mode state
-   independent of `/etc/singbox` so re-running `install.sh` doesn't require
-   re-adding nodes (it already preserves `/etc/singbox` today, but this
-   should be made explicit/tested with an upgrade path, not just clean
-   install).
-5. **UI**: replace the plain HTML table with a proper LuCI CBI form, add a
-   per-node latency badge, add a "test before activate" button, and show
-   decoded node details (server/port/security) instead of just the id.
-6. **Structured logging** — JSON log output from sing-box plus a filtered
-   LuCI log view (errors only / connections only).
-7. **Firewall integration** — register the tproxy rules via UCI/firewall
-   includes instead of raw iptables calls in `sb-manager`, so they survive
-   `/etc/init.d/firewall reload` and show up in `fw4`/`fw3` status correctly.
-8. **Automated tests** — a POSIX-sh test harness (e.g. with `bats-core`) for
-   `parse_link_to_json` and `urldecode` against a fixture set of link formats.
-
-## Contributing
-
-Issues and PRs welcome. Run `shellcheck scripts/*.sh files/usr/bin/sb-manager`
-before submitting; CI runs the same check.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+- Stack lives under `/data/zi-swan` (or `/customer/zi-swan`). Never `rm -rf /usr/lib/ipsec` while the bind is mounted.
+- Proxy / VLESS / sing-box are intentionally not supported.

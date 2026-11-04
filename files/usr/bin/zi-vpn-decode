@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Decode Amnezia vpn:// (qCompress + Base64URL) to flat IPsec JSON on stdout."""
+from __future__ import print_function
+import base64, json, sys, zlib
+
+
+def b64url_decode(s):
+    s = s.replace("-", "+").replace("_", "/")
+    s += "=" * ((-len(s)) % 4)
+    return base64.b64decode(s)
+
+
+def quncompress(blob):
+    try:
+        return zlib.decompress(blob[4:])
+    except zlib.error:
+        try:
+            return zlib.decompress(blob)
+        except zlib.error:
+            return blob
+
+
+def from_container(c, server_host):
+    if not isinstance(c, dict):
+        return None
+    ike = c.get("ikev2") or c.get("ipsec") or {}
+    if not isinstance(ike, dict):
+        return None
+    last = ike.get("last_config")
+    if not last:
+        return None
+    if isinstance(last, str):
+        try:
+            last = json.loads(last)
+        except ValueError:
+            return None
+    nested = last.get("config")
+    if isinstance(nested, str) and nested.strip().startswith("{"):
+        try:
+            last = json.loads(nested)
+        except ValueError:
+            pass
+    out = dict(last)
+    if "hostName" not in out and server_host:
+        out["hostName"] = server_host
+    if "password" not in out:
+        out["password"] = ""
+    if "userName" not in out and out.get("clientId"):
+        out["userName"] = out["clientId"]
+    # Normalize strongswan.profile shape
+    if "cert" not in out and isinstance(out.get("local"), dict):
+        loc = out["local"]
+        if loc.get("p12"):
+            out["cert"] = loc["p12"]
+        if loc.get("rsa-pss") is not None:
+            out["rsa_pss"] = str(loc.get("rsa-pss")).lower() in ("1", "true", "yes")
+    rem = out.get("remote") if isinstance(out.get("remote"), dict) else {}
+    if "hostName" not in out and rem.get("addr"):
+        out["hostName"] = rem["addr"]
+    if out.get("ike-proposal") and not out.get("ikeProposal"):
+        out["ikeProposal"] = out["ike-proposal"]
+    if out.get("esp-proposal") and not out.get("espProposal"):
+        out["espProposal"] = out["esp-proposal"]
+    return out
+
+
+def normalize(obj):
+    if not isinstance(obj, dict):
+        return obj
+    if "cert" in obj and ("hostName" in obj or "addr" in obj):
+        if "hostName" not in obj and obj.get("addr"):
+            obj = dict(obj)
+            obj["hostName"] = obj["addr"]
+        return obj
+    host = obj.get("hostName") or ""
+    containers = obj.get("containers") or []
+    default = obj.get("defaultContainer") or ""
+    preferred = None
+    for c in containers:
+        name = (c or {}).get("container") or ""
+        if default and name == default:
+            preferred = from_container(c, host)
+            if preferred:
+                return preferred
+        if name in ("amnezia-ipsec", "amnezia-ikev2", "ipsec"):
+            preferred = preferred or from_container(c, host)
+    return preferred or obj
+
+
+def main(argv):
+    if len(argv) >= 2:
+        arg = argv[1].strip()
+        if arg.lower().startswith("vpn://"):
+            data = arg
+        else:
+            with open(arg, "r") as fh:
+                data = fh.read().strip()
+    else:
+        data = sys.stdin.read().strip()
+    if not data:
+        sys.stderr.write("usage: zi-vpn-decode <vpn://...|file>\n")
+        sys.exit(2)
+    if data.lower().startswith("vpn://"):
+        blob = quncompress(b64url_decode(data[6:]))
+        obj = json.loads(blob.decode("utf-8"))
+        obj = normalize(obj)
+    else:
+        obj = json.loads(data)
+        obj = normalize(obj)
+    sys.stdout.write(json.dumps(obj, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

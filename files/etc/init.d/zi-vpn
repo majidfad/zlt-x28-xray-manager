@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# Remount stack bind, then restore IPsec tunnel if previously active.
+START=95
+STOP=10
+
+start() {
+    /etc/init.d/zi-swan-bind start 2>/dev/null || true
+    if [ -x /data/zi-bin/zi-manager ]; then
+        /data/zi-bin/zi-manager boot >/dev/null 2>&1 &
+    elif [ -x /usr/bin/zi-manager ]; then
+        /usr/bin/zi-manager boot >/dev/null 2>&1 &
+    fi
+}
+
+stop() {
+    if [ -x /data/zi-bin/zi-manager ]; then
+        /data/zi-bin/zi-manager stop
+    elif [ -x /usr/bin/zi-manager ]; then
+        /usr/bin/zi-manager stop
+    fi
+}
