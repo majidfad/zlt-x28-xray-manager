@@ -2,22 +2,15 @@
 
 <div class="cbi-map">
 	<h2 name="content">ZLT IPsec Manager</h2>
-	<p style="opacity:0.8;margin:0 0 12px">Amnezia IKEv2 tunnel · LAN + VPN server auto-excluded · ping every 5 min (10 fails → WAN)</p>
+	<p style="opacity:0.8;margin:0 0 12px">Amnezia IKEv2 · tunnel mode · LAN + VPN server auto-excluded · health ping 5 min / 10 fails</p>
 
 	<div class="cbi-section">
+		<h3>Status</h3>
 		<div class="cbi-section-node">
 			<table class="table">
 				<tr>
-					<td class="td" style="width:35%"><strong>Status</strong></td>
-					<td class="td"><span id="zi_status">Loading...</span></td>
-				</tr>
-				<tr>
-					<td class="td"><strong>Server</strong></td>
-					<td class="td"><span id="zi_host">-</span></td>
-				</tr>
-				<tr>
-					<td class="td"><strong>Identity</strong></td>
-					<td class="td"><span id="zi_user">-</span></td>
+					<td class="td" style="width:32%"><strong>Tunnel</strong></td>
+					<td class="td"><span id="zi_status">Loading…</span></td>
 				</tr>
 				<tr>
 					<td class="td"><strong>Ping fails</strong></td>
@@ -28,7 +21,6 @@
 					<td class="td"><span id="zi_build">?</span></td>
 				</tr>
 			</table>
-
 			<div class="cbi-page-actions">
 				<button class="cbi-button cbi-button-apply" id="zi_btn_start" type="button">Connect</button>
 				<button class="cbi-button cbi-button-reset" id="zi_btn_stop" type="button">Disconnect</button>
@@ -40,10 +32,29 @@
 	</div>
 
 	<div class="cbi-section">
-		<h3>Profile (one active)</h3>
+		<h3>IPsec configuration</h3>
 		<div class="cbi-section-node">
-			<p style="margin:0 0 8px"><strong>Paste</strong> <code>vpn://</code> link or flat IPsec JSON:</p>
-			<textarea id="zi_cfg" rows="6" style="width:98%" placeholder="vpn://... or {&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;cert&quot;:&quot;...&quot;}"></textarea>
+			<table class="table" id="zi_cfg_table">
+				<tr><td class="td" style="width:32%"><strong>Server</strong></td><td class="td"><span id="zi_host">—</span></td></tr>
+				<tr><td class="td"><strong>Identity</strong></td><td class="td"><span id="zi_user">—</span></td></tr>
+				<tr><td class="td"><strong>IKE proposal</strong></td><td class="td"><code id="zi_ike">—</code></td></tr>
+				<tr><td class="td"><strong>ESP proposal</strong></td><td class="td"><code id="zi_esp">—</code></td></tr>
+				<tr><td class="td"><strong>Auth</strong></td><td class="td"><span id="zi_auth">RSA-PSS (Amnezia)</span></td></tr>
+				<tr><td class="td"><strong>Certificate</strong></td><td class="td"><span id="zi_cert">—</span></td></tr>
+				<tr><td class="td"><strong>DNS</strong></td><td class="td"><span id="zi_dns">—</span></td></tr>
+				<tr><td class="td"><strong>Stack</strong></td><td class="td"><span id="zi_stack">—</span></td></tr>
+				<tr><td class="td"><strong>Autostart</strong></td><td class="td"><span id="zi_active">—</span></td></tr>
+			</table>
+			<p style="margin:10px 0 4px"><strong>swanctl / profile preview</strong></p>
+			<pre id="zi_conf" style="max-height:220px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px">(none yet — import a profile)</pre>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>Import profile</h3>
+		<div class="cbi-section-node">
+			<p style="margin:0 0 8px">Paste <code>vpn://</code> or flat IPsec JSON (one active profile):</p>
+			<textarea id="zi_cfg" rows="5" style="width:98%" placeholder="vpn://... or {&quot;hostName&quot;:&quot;...&quot;,&quot;userName&quot;:&quot;...&quot;,&quot;cert&quot;:&quot;...&quot;}"></textarea>
 			<div class="cbi-page-actions">
 				<button class="cbi-button cbi-button-add" id="zi_btn_save" type="button">Save profile</button>
 				<button class="cbi-button cbi-button-apply" id="zi_btn_save_connect" type="button">Save &amp; Connect</button>
@@ -55,30 +66,12 @@
 		<h3>Manual import</h3>
 		<div class="cbi-section-node">
 			<table class="table">
-				<tr>
-					<td class="td" style="width:35%">Server host / IP</td>
-					<td class="td"><input id="zi_m_host" type="text" style="width:90%" /></td>
-				</tr>
-				<tr>
-					<td class="td">Identity (user / cert CN)</td>
-					<td class="td"><input id="zi_m_id" type="text" style="width:90%" /></td>
-				</tr>
-				<tr>
-					<td class="td">PKCS#12 password</td>
-					<td class="td"><input id="zi_m_pass" type="password" style="width:90%" /></td>
-				</tr>
-				<tr>
-					<td class="td">IKE proposal</td>
-					<td class="td"><input id="zi_m_ike" type="text" style="width:90%" value="aes256-sha256-modp2048" /></td>
-				</tr>
-				<tr>
-					<td class="td">ESP proposal</td>
-					<td class="td"><input id="zi_m_esp" type="text" style="width:90%" value="aes128gcm16" /></td>
-				</tr>
-				<tr>
-					<td class="td">PKCS#12 (.p12 / .pfx)</td>
-					<td class="td"><input id="zi_m_p12" type="file" accept=".p12,.pfx,application/x-pkcs12" /></td>
-				</tr>
+				<tr><td class="td" style="width:32%">Server host / IP</td><td class="td"><input id="zi_m_host" type="text" style="width:90%" /></td></tr>
+				<tr><td class="td">Identity</td><td class="td"><input id="zi_m_id" type="text" style="width:90%" /></td></tr>
+				<tr><td class="td">PKCS#12 password</td><td class="td"><input id="zi_m_pass" type="password" style="width:90%" /></td></tr>
+				<tr><td class="td">IKE proposal</td><td class="td"><input id="zi_m_ike" type="text" style="width:90%" value="aes256-sha256-modp2048" /></td></tr>
+				<tr><td class="td">ESP proposal</td><td class="td"><input id="zi_m_esp" type="text" style="width:90%" value="aes128gcm16" /></td></tr>
+				<tr><td class="td">PKCS#12 (.p12)</td><td class="td"><input id="zi_m_p12" type="file" accept=".p12,.pfx,application/x-pkcs12" /></td></tr>
 			</table>
 			<div class="cbi-page-actions">
 				<button class="cbi-button cbi-button-add" id="zi_btn_manual" type="button">Save manual profile</button>
@@ -87,18 +80,20 @@
 	</div>
 
 	<div class="cbi-section">
-		<h3>Diagnostics</h3>
+		<h3>Security associations</h3>
 		<div class="cbi-section-node">
 			<div class="cbi-page-actions">
+				<button class="cbi-button cbi-button-action" id="zi_btn_sa" type="button">Refresh SA</button>
 				<button class="cbi-button cbi-button-action" id="zi_btn_check" type="button">Run ss_check</button>
 			</div>
-			<pre id="zi_check" style="max-height:200px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap"></pre>
+			<pre id="zi_sa" style="max-height:240px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px"></pre>
+			<pre id="zi_check" style="max-height:200px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px;margin-top:8px"></pre>
 		</div>
 	</div>
 
 	<div class="cbi-section">
-		<h3>Log (last 8 KB)</h3>
-		<pre id="zi_log" style="max-height:320px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap"></pre>
+		<h3>Log</h3>
+		<pre id="zi_log" style="max-height:300px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px"></pre>
 	</div>
 </div>
 
@@ -111,24 +106,22 @@
 		el.style.color = ok ? "#2e7d32" : "#c62828";
 		el.textContent = text || "";
 	}
+	function zi_txt(id, v, fallback) {
+		var el = document.getElementById(id);
+		if (el) el.textContent = (v && String(v).length) ? v : (fallback || "—");
+	}
 
 	function zi_api(action, params, cb, usePost) {
 		params = params || {};
 		var handle = function(x, data) {
 			if (!data && x) {
 				var raw = x.responseText || "";
-				if (raw) {
-					try { data = JSON.parse(raw); } catch (e) {}
-				}
+				if (raw) { try { data = JSON.parse(raw); } catch (e) {} }
 				if (!data) {
-					data = {
-						ok: false,
-						error: "HTTP " + (x.status || 0) +
-							(raw ? (": " + raw.replace(/\s+/g, " ").substring(0, 180)) : " (empty/no JSON)")
-					};
+					data = { ok: false, error: "HTTP " + (x.status || 0) + (raw ? (": " + raw.replace(/\s+/g, " ").substring(0, 160)) : "") };
 				}
 			}
-			cb(data || { ok: false, error: "no response from router" });
+			cb(data || { ok: false, error: "no response" });
 		};
 		if (usePost) {
 			var body = {};
@@ -137,9 +130,7 @@
 			XHR.post(zi_url + "/" + action, body, handle);
 		} else {
 			var qs = "";
-			for (var k in params) {
-				qs += (qs ? "&" : "") + encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
-			}
+			for (var k in params) qs += (qs ? "&" : "") + encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
 			XHR.get(zi_url + "/" + action + (qs ? "?" + qs : ""), null, handle);
 		}
 	}
@@ -147,13 +138,20 @@
 	function zi_refresh_status() {
 		zi_api("status", null, function(data) {
 			if (!data) return;
-			document.getElementById("zi_status").textContent = data.running || "Unknown";
-			document.getElementById("zi_host").textContent = data.host || "(none)";
-			document.getElementById("zi_user").textContent = data.user || "(none)";
-			document.getElementById("zi_fails").textContent = data.ping_fails || "0";
+			zi_txt("zi_status", data.running, "Unknown");
+			zi_txt("zi_fails", data.ping_fails || "0");
+			zi_txt("zi_host", data.host);
+			zi_txt("zi_user", data.user);
+			zi_txt("zi_ike", data.ike || "aes256-sha256-modp2048");
+			zi_txt("zi_esp", data.esp || "aes128gcm16");
+			zi_txt("zi_dns", data.dns1 || "1.1.1.1 (default ping)");
+			zi_txt("zi_auth", (data.rsa_pss === "1" || data.rsa_pss === "") ? "IKE RSA-PSS (Amnezia)" : "pubkey");
+			zi_txt("zi_cert", (data.has_cert === "1") ? "client.pem ready" : ((data.has_p12 === "1") ? "p12 present" : "missing — import profile"));
+			zi_txt("zi_stack", ((data.stack_ver || "?") + " @ " + (data.stack_root || "?")));
+			zi_txt("zi_active", data.active === "1" ? "yes (reconnect on boot)" : "no");
 			document.getElementById("zi_build").textContent =
-				"API v" + (data.api_version || "?") + " / " + (data.manager_version || "?") +
-				(data.manager_path ? " @ " + data.manager_path : "");
+				"API v" + (data.api_version || "?") + " / " + (data.manager_version || "?");
+			document.getElementById("zi_conf").textContent = data.conf_preview || "(no profile yet)";
 		});
 	}
 
@@ -164,21 +162,21 @@
 			el.scrollTop = el.scrollHeight;
 		});
 	}
-
+	function zi_refresh_sa() {
+		zi_api("sa", null, function(data) {
+			document.getElementById("zi_sa").textContent = (data && data.sa) ? data.sa : "(no SA / swanctl unavailable)";
+		});
+	}
 	function zi_refresh_all() {
 		zi_refresh_status();
 		zi_refresh_log();
+		zi_refresh_sa();
 	}
-
 	function zi_after_start() {
 		zi_msg(true, "Connecting…");
-		setTimeout(function() {
-			zi_refresh_all();
-			zi_msg(true, "Start requested — check status/log");
-		}, 2500);
+		setTimeout(function() { zi_refresh_all(); zi_msg(true, "Start requested"); }, 2500);
 	}
 
-	/* Decode vpn:// in browser (qCompress + Base64URL) so router need not have python. */
 	function zi_b64url_to_u8(s) {
 		s = s.replace(/-/g, "+").replace(/_/g, "/");
 		while (s.length % 4) s += "=";
@@ -187,35 +185,20 @@
 		for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
 		return out;
 	}
-
 	function zi_inflate_zlib(u8) {
 		return new Promise(function(resolve, reject) {
 			if (typeof DecompressionStream === "undefined") {
-				reject(new Error("Browser lacks DecompressionStream; paste flat JSON instead"));
+				reject(new Error("Browser lacks DecompressionStream"));
 				return;
 			}
-			/* qCompress: 4-byte big-endian size + zlib */
-			var payload = u8;
-			if (u8.length > 4) {
-				try {
-					var ds = new DecompressionStream("deflate");
-					var stream = new Blob([u8.subarray(4)]).stream().pipeThrough(ds);
-					new Response(stream).arrayBuffer().then(function(buf) {
-						resolve(new TextDecoder("utf-8").decode(buf));
-					}).catch(function() {
-						var ds2 = new DecompressionStream("deflate");
-						var stream2 = new Blob([u8]).stream().pipeThrough(ds2);
-						new Response(stream2).arrayBuffer().then(function(buf) {
-							resolve(new TextDecoder("utf-8").decode(buf));
-						}).catch(reject);
-					});
-					return;
-				} catch (e) { reject(e); return; }
-			}
-			reject(new Error("short vpn:// payload"));
+			var tryInflate = function(buf) {
+				var ds = new DecompressionStream("deflate");
+				return new Response(new Blob([buf]).stream().pipeThrough(ds)).arrayBuffer()
+					.then(function(ab) { return new TextDecoder("utf-8").decode(ab); });
+			};
+			tryInflate(u8.subarray(4)).catch(function() { return tryInflate(u8); }).then(resolve, reject);
 		});
 	}
-
 	function zi_extract_ipsec(obj) {
 		if (!obj || typeof obj !== "object") return null;
 		if (obj.cert && (obj.hostName || obj.addr)) {
@@ -241,67 +224,47 @@
 			if (lastObj["esp-proposal"] && !lastObj.espProposal) lastObj.espProposal = lastObj["esp-proposal"];
 			return lastObj;
 		}
-		var i, got = null;
+		var i, got;
 		for (i = 0; i < containers.length; i++) {
-			if (def && containers[i].container === def) {
-				got = fromContainer(containers[i]);
-				if (got) return got;
-			}
+			if (def && containers[i].container === def) { got = fromContainer(containers[i]); if (got) return got; }
 		}
-		for (i = 0; i < containers.length; i++) {
-			got = fromContainer(containers[i]);
-			if (got) return got;
-		}
+		for (i = 0; i < containers.length; i++) { got = fromContainer(containers[i]); if (got) return got; }
 		return null;
 	}
-
 	function zi_prepare_config(raw) {
 		raw = (raw || "").replace(/^\s+|\s+$/g, "");
 		if (!raw) return Promise.reject(new Error("empty"));
 		if (raw.indexOf("vpn://") === 0 || raw.indexOf("VPN://") === 0) {
-			var b64 = raw.replace(/^vpn:\/\//i, "");
-			var u8 = zi_b64url_to_u8(b64);
-			return zi_inflate_zlib(u8).then(function(txt) {
-				var obj = JSON.parse(txt);
-				var flat = zi_extract_ipsec(obj) || obj;
-				if (!flat.cert || !(flat.hostName || flat.addr)) {
-					throw new Error("could not find IPsec cert/host in vpn://");
-				}
+			return zi_inflate_zlib(zi_b64url_to_u8(raw.replace(/^vpn:\/\//i, ""))).then(function(txt) {
+				var flat = zi_extract_ipsec(JSON.parse(txt));
+				if (!flat || !flat.cert || !(flat.hostName || flat.addr)) throw new Error("no IPsec in vpn://");
 				return JSON.stringify(flat);
 			});
 		}
 		return Promise.resolve(raw);
 	}
-
 	function zi_save(thenConnect) {
 		var raw = document.getElementById("zi_cfg").value;
 		zi_msg(true, "Saving…");
 		zi_prepare_config(raw).then(function(cfg) {
 			zi_api("import", { config: cfg }, function(data) {
-				if (!data || !data.ok) {
-					zi_msg(false, (data && data.error) || "import failed");
-					return;
-				}
+				if (!data || !data.ok) { zi_msg(false, (data && data.error) || "import failed"); return; }
 				zi_msg(true, "Profile saved");
 				zi_refresh_all();
-				if (thenConnect) {
-					zi_api("start", null, zi_after_start);
-				}
+				if (thenConnect) zi_api("start", null, zi_after_start);
 			}, true);
 		}).catch(function(e) {
-			/* Fall back: send raw vpn:// to router (needs python) */
 			zi_api("import", { config: raw }, function(data) {
 				if (!data || !data.ok) {
 					zi_msg(false, (e && e.message ? e.message + " — " : "") + ((data && data.error) || "import failed"));
 					return;
 				}
-				zi_msg(true, "Profile saved (router decode)");
+				zi_msg(true, "Profile saved");
 				zi_refresh_all();
 				if (thenConnect) zi_api("start", null, zi_after_start);
 			}, true);
 		});
 	}
-
 	function zi_file_b64(file) {
 		return new Promise(function(resolve, reject) {
 			var r = new FileReader();
@@ -315,22 +278,20 @@
 		});
 	}
 
-	document.getElementById("zi_btn_start").onclick = function() {
-		zi_api("start", null, zi_after_start);
-	};
+	document.getElementById("zi_btn_start").onclick = function() { zi_api("start", null, zi_after_start); };
 	document.getElementById("zi_btn_stop").onclick = function() {
-		zi_api("stop", null, function() {
-			zi_msg(true, "Disconnected");
-			zi_refresh_all();
-		});
+		zi_api("stop", null, function() { zi_msg(true, "Disconnected"); zi_refresh_all(); });
 	};
-	document.getElementById("zi_btn_restart").onclick = function() {
-		zi_api("restart", null, zi_after_start);
-	};
+	document.getElementById("zi_btn_restart").onclick = function() { zi_api("restart", null, zi_after_start); };
 	document.getElementById("zi_btn_refresh").onclick = zi_refresh_all;
 	document.getElementById("zi_btn_save").onclick = function() { zi_save(false); };
 	document.getElementById("zi_btn_save_connect").onclick = function() { zi_save(true); };
-
+	document.getElementById("zi_btn_sa").onclick = zi_refresh_sa;
+	document.getElementById("zi_btn_check").onclick = function() {
+		zi_api("ss_check", null, function(data) {
+			document.getElementById("zi_check").textContent = (data && data.check) || "(empty)";
+		});
+	};
 	document.getElementById("zi_btn_manual").onclick = function() {
 		var host = document.getElementById("zi_m_host").value.replace(/^\s+|\s+$/g, "");
 		var id = document.getElementById("zi_m_id").value.replace(/^\s+|\s+$/g, "");
@@ -338,31 +299,15 @@
 		var ike = document.getElementById("zi_m_ike").value;
 		var esp = document.getElementById("zi_m_esp").value;
 		var file = document.getElementById("zi_m_p12").files[0];
-		if (!host || !id || !file) {
-			zi_msg(false, "host, identity and .p12 required");
-			return;
-		}
-		zi_msg(true, "Encoding certificate…");
+		if (!host || !id || !file) { zi_msg(false, "host, identity and .p12 required"); return; }
+		zi_msg(true, "Encoding…");
 		zi_file_b64(file).then(function(b64) {
-			zi_api("import_manual", {
-				host: host, id: id, password: pass, ike: ike, esp: esp, p12_b64: b64
-			}, function(data) {
-				if (!data || !data.ok) {
-					zi_msg(false, (data && data.error) || "manual import failed");
-					return;
-				}
+			zi_api("import_manual", { host: host, id: id, password: pass, ike: ike, esp: esp, p12_b64: b64 }, function(data) {
+				if (!data || !data.ok) { zi_msg(false, (data && data.error) || "failed"); return; }
 				zi_msg(true, "Manual profile saved");
 				zi_refresh_all();
 			}, true);
-		}).catch(function(e) {
-			zi_msg(false, e.message || "file read failed");
-		});
-	};
-
-	document.getElementById("zi_btn_check").onclick = function() {
-		zi_api("ss_check", null, function(data) {
-			document.getElementById("zi_check").textContent = (data && data.check) || (data && data.error) || "(empty)";
-		});
+		}).catch(function(e) { zi_msg(false, e.message || "file read failed"); });
 	};
 
 	zi_refresh_all();

@@ -1,7 +1,7 @@
 -- LuCI controller for ZLT IPsec (zi-manager)
 module("luci.controller.zlt_ipsec", package.seeall)
 
-local ZI_API_VERSION = 1
+local ZI_API_VERSION = 2
 
 function index()
     entry({"admin", "services", "zlt_ipsec"}, template("zlt_ipsec_panel"), _("ZLT IPsec"), 60).dependent = false
@@ -14,6 +14,7 @@ function index()
     entry({"admin", "services", "zlt_ipsec", "import_manual"}, call("action_import_manual")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "log"}, call("action_log")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "ss_check"}, call("action_ss_check")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "sa"}, call("action_sa")).leaf = true
 end
 
 local function run(cmd)
@@ -47,6 +48,17 @@ local function shq(s)
     return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
+local function mat(name)
+    return read_file("/etc/zlt-ipsec/material/" .. name)
+end
+
+local function exists(path)
+    local f = io.open(path, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+
 local function mgr()
     local f = io.open("/data/zi-bin/zi-manager", "r")
     if f then
@@ -58,7 +70,7 @@ local function mgr()
         f:close()
         return "/usr/bin/zi-manager"
     end
-    return "/usr/bin/zi-manager"
+    return "/data/zi-bin/zi-manager"
 end
 
 local function mgr_exists()
@@ -78,18 +90,47 @@ function action_status()
     else
         status = "manager missing — reinstall"
     end
+
+    local conf = read_file("/tmp/zi_swanctl/conf.d/zivpn.conf")
+    if conf == "" then
+        conf = read_file("/etc/zlt-ipsec/profile.json")
+    end
+    -- trim huge cert from profile preview
+    if conf:find('"cert"') then
+        conf = conf:gsub('"cert"%s*:%s*"[^"]*"', '"cert":"(pkcs12 omitted)"')
+    end
+
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         ok = true,
         running = status,
-        host = read_file("/etc/zlt-ipsec/material/host"),
-        user = read_file("/etc/zlt-ipsec/material/user"),
+        host = mat("host"),
+        user = mat("user"),
+        ike = mat("ike"),
+        esp = mat("esp"),
+        dns1 = mat("dns1"),
+        rsa_pss = mat("rsa_pss"),
+        has_p12 = exists("/etc/zlt-ipsec/material/client.p12") and "1" or "0",
+        has_cert = exists("/etc/zlt-ipsec/material/client.pem") and "1" or "0",
+
         ping_fails = read_file("/etc/zlt-ipsec/ping_fails"),
         active = read_file("/etc/zlt-ipsec/active"),
+        stack_root = read_file("/etc/zlt-ipsec/stack.root"),
+        stack_ver = read_file("/etc/zlt-ipsec/stack.ver"),
+        conf_preview = conf,
         api_version = ZI_API_VERSION,
         manager_version = ver,
         manager_path = m
     })
+end
+
+function action_sa()
+    local sa = run("PATH=/tmp/zi-bin:$PATH swanctl --list-sas 2>/dev/null")
+    if sa == "" then
+        sa = run("PATH=/tmp/zi-bin:$PATH ipsec statusall 2>/dev/null")
+    end
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true, sa = sa })
 end
 
 function action_start()
@@ -124,12 +165,7 @@ end
 
 function action_ss_check()
     local m = mgr()
-    local out = ""
-    if mgr_exists() then
-        out = run(m .. " ss_check")
-    else
-        out = "zi-manager not installed"
-    end
+    local out = mgr_exists() and run(m .. " ss_check") or "zi-manager not installed"
     luci.http.prepare_content("application/json")
     luci.http.write_json({ ok = true, check = out })
 end
@@ -150,9 +186,8 @@ function action_import()
     local m = mgr()
     local out = run(m .. " import " .. shq(tmp) .. " >/tmp/zi_import.log 2>&1; echo EXIT:$?")
     local err = read_file("/tmp/zi_import.log")
-    local ok = out:match("EXIT:0") ~= nil
     luci.http.prepare_content("application/json")
-    if ok then
+    if out:match("EXIT:0") then
         luci.http.write_json({ ok = true })
     else
         luci.http.write_json({ ok = false, error = (err ~= "" and err or out) })

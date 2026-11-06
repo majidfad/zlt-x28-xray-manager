@@ -69,7 +69,9 @@ fetch_bin() {
     # strip CR if any (Windows)
     tr -d '\r' < "$_dst" > "$_dst.lf" 2>/dev/null && mv -f "$_dst.lf" "$_dst"
     chmod 755 "$_dst"
-    ln -sf "$_dst" "/usr/bin/$_name" 2>/dev/null || cp -f "$_dst" "/usr/bin/$_name"
+    # NEVER copy into overlay — symlink only (tiny /)
+    rm -f "/usr/bin/$_name" 2>/dev/null || true
+    ln -sf "$_dst" "/usr/bin/$_name" 2>/dev/null || true
     ln -sf "$_dst" "/tmp/zi-bin/$_name" 2>/dev/null || true
 }
 
