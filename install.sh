@@ -28,20 +28,14 @@ http_get() {
 }
 
 ensure_web() {
-    echo "[zi-install] ensuring web server is up"
+    echo "[zi-install] ensuring OEM web is up (ZLT often has no uhttpd)"
+    for s in web webui www httpd lighttpd nginx goahead zhttpd uhttpd; do
+        [ -x "/etc/init.d/$s" ] || continue
+        "/etc/init.d/$s" start 2>/dev/null || true
+    done
     if [ -x /etc/init.d/uhttpd ]; then
-        if ! pidof uhttpd >/dev/null 2>&1; then
-            /etc/init.d/uhttpd start 2>/dev/null || true
-        else
-            # soft reload only — never leave process dead
-            killall -HUP uhttpd 2>/dev/null || true
-        fi
-        sleep 1
-        if ! pidof uhttpd >/dev/null 2>&1; then
-            /etc/init.d/uhttpd start 2>/dev/null || true
-        fi
+        pidof uhttpd >/dev/null 2>&1 || /etc/init.d/uhttpd start 2>/dev/null || true
     fi
-    pidof uhttpd >/dev/null 2>&1 && echo "[zi-install] uhttpd OK" || echo "[zi-install] WARN: uhttpd not running — run fix-web.sh"
 }
 
 wipe_legacy() {
@@ -140,26 +134,34 @@ elif [ -x /usr/bin/zi-install-stack ]; then
     /usr/bin/zi-install-stack || echo "[zi-install] WARN: stack install failed"
 fi
 
-# Also drop a tiny static status page (works even if LuCI menu is broken)
-mkdir -p /www 2>/dev/null || true
-if [ -d /www ]; then
-    cat > /www/zi-status.html << 'HTML'
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>ZLT IPsec</title></head>
-<body>
-<h1>ZLT IPsec</h1>
-<p>If this page loads, the web server is alive.</p>
-<p>Open LuCI: <a href="/cgi-bin/luci/admin/services/zlt_ipsec">Services → ZLT IPsec</a></p>
-<p>Or: <a href="/cgi-bin/luci/">LuCI home</a></p>
-</body></html>
-HTML
+# Free overlay before finishing — OEM web on :4153 dies when / is 100% full
+free_kb=$(df -k / 2>/dev/null | awk 'NR==2 {print $4+0}')
+echo "[zi-install] overlay free_kb=$free_kb"
+if [ -n "$free_kb" ] && [ "$free_kb" -lt 200 ]; then
+    echo "[zi-install] WARN: overlay almost full — removing any zi files from /"
+    rm -f /usr/lib/lua/luci/controller/zlt_ipsec.lua \
+          /usr/lib/lua/luci/view/zlt_ipsec_panel.htm 2>/dev/null || true
+    # recreate as symlinks to /data only
+    [ -f "$LUCI_DIR/controller/zlt_ipsec.lua" ] && \
+        ln -sf "$LUCI_DIR/controller/zlt_ipsec.lua" /usr/lib/lua/luci/controller/zlt_ipsec.lua 2>/dev/null || true
+    [ -f "$LUCI_DIR/view/zlt_ipsec_panel.htm" ] && \
+        ln -sf "$LUCI_DIR/view/zlt_ipsec_panel.htm" /usr/lib/lua/luci/view/zlt_ipsec_panel.htm 2>/dev/null || true
+fi
+
+# Move /etc/zlt-ipsec onto /data if it is a real dir on overlay
+if [ -d /etc/zlt-ipsec ] && [ ! -L /etc/zlt-ipsec ]; then
+    mkdir -p /data/zlt-ipsec
+    cp -a /etc/zlt-ipsec/. /data/zlt-ipsec/ 2>/dev/null || true
+    rm -rf /etc/zlt-ipsec
+    ln -sf /data/zlt-ipsec /etc/zlt-ipsec
 fi
 
 ensure_web
 
 echo "[zi-install] DONE"
 echo "  Disk:"; df -h / /data 2>/dev/null | head -n5
-echo "  LuCI:  http://<router-ip>:4153/cgi-bin/luci/admin/services/zlt_ipsec"
-echo "  Probe: http://<router-ip>:4153/zi-status.html"
-echo "  If connection refused: wget …/fix-web.sh && sh /tmp/fix-web.sh"
+echo "  This OEM has no uhttpd — web is on :4153. If refused, / is full:"
+echo "    sh /tmp/fix-web.sh   # or wget fix-web.sh"
+echo "  LuCI (if OEM includes it): …/cgi-bin/luci/admin/services/zlt_ipsec"
 echo "  CLI: zi-manager ss_check"
 exit 0
