@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.04-zi1"
+VERSION="2026.11.06-zi2"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -288,19 +288,19 @@ is_up() {
     return 1
 }
 
-prepare_swanctl_tree() {
-    rm -rf "$SWANCTL_DIR"
-    mkdir -p "$SWANCTL_DIR/x509" "$SWANCTL_DIR/private" "$SWANCTL_DIR/x509ca" \
-             "$SWANCTL_DIR/conf.d" "$SWANCTL_DIR/pkcs12"
-    cp -f "$MAT/client.pem" "$SWANCTL_DIR/x509/client.pem"
-    cp -f "$MAT/client.key" "$SWANCTL_DIR/private/client.key"
-    [ -s "$MAT/ca.pem" ] && cp -f "$MAT/ca.pem" "$SWANCTL_DIR/x509ca/ca.pem"
-    chmod 600 "$SWANCTL_DIR/private/client.key"
-    echo 'include conf.d/*.conf' > "$SWANCTL_DIR/swanctl.conf"
+write_zivpn_conf() {
+    # $1 = local auth string (pubkey | ike:rsa/pss-sha256)
+    # $2 = remote id (%any | host)
+    # NOTE: swanctl 5.9.2 has NO connection-level "rsa_pss" option —
+    # RSA-PSS is enabled only via strongswan.conf charon.rsa_pss.
+    _lauth="${1:-pubkey}"
+    _rid="${2:-%any}"
     _host=$(cat "$MAT/host")
     _user=$(cat "$MAT/user")
     _ike=$(cat "$MAT/ike")
     _esp=$(cat "$MAT/esp")
+    _cacert_line=""
+    [ -s "$SWANCTL_DIR/x509ca/ca.pem" ] && _cacert_line="            cacerts = ca.pem"
     cat > "$SWANCTL_DIR/conf.d/zivpn.conf" << EOF
 connections {
     ${CONN} {
@@ -313,15 +313,14 @@ connections {
         fragmentation = yes
         send_cert = always
         local {
-            auth = ike:rsa/pss-sha256
-            rsa_pss = yes
+            auth = ${_lauth}
             certs = client.pem
             id = ${_user}
         }
         remote {
             auth = pubkey
-            id = ${_host}
-            cacerts = ca.pem
+            id = ${_rid}
+${_cacert_line}
         }
         children {
             ${CONN} {
@@ -338,6 +337,23 @@ secrets {
     }
 }
 EOF
+}
+
+prepare_swanctl_tree() {
+    rm -rf "$SWANCTL_DIR"
+    # Create full swanctl tree (missing dirs are noisy but harmless)
+    mkdir -p "$SWANCTL_DIR/x509" "$SWANCTL_DIR/x509ca" "$SWANCTL_DIR/x509ocsp" \
+             "$SWANCTL_DIR/x509aa" "$SWANCTL_DIR/x509ac" "$SWANCTL_DIR/x509crl" \
+             "$SWANCTL_DIR/pubkey" "$SWANCTL_DIR/private" "$SWANCTL_DIR/rsa" \
+             "$SWANCTL_DIR/ecdsa" "$SWANCTL_DIR/bliss" "$SWANCTL_DIR/pkcs8" \
+             "$SWANCTL_DIR/pkcs12" "$SWANCTL_DIR/conf.d"
+    cp -f "$MAT/client.pem" "$SWANCTL_DIR/x509/client.pem"
+    cp -f "$MAT/client.key" "$SWANCTL_DIR/private/client.key"
+    [ -s "$MAT/ca.pem" ] && cp -f "$MAT/ca.pem" "$SWANCTL_DIR/x509ca/ca.pem"
+    chmod 600 "$SWANCTL_DIR/private/client.key"
+    echo 'include conf.d/*.conf' > "$SWANCTL_DIR/swanctl.conf"
+    # Default: pubkey + charon.rsa_pss (compatible with strongSwan 5.9.2)
+    write_zivpn_conf "pubkey" "%any"
 }
 
 start_charon() {
@@ -369,6 +385,13 @@ swan() {
         || SWANCTL_DIR="$SWANCTL_DIR" STRONGSWAN_CONF="$SS_CONF" swanctl "$@"
 }
 
+load_conn_try() {
+    _auth="$1"; _rid="$2"
+    write_zivpn_conf "$_auth" "$_rid"
+    log "swanctl load auth=$_auth remote_id=$_rid (rsa_pss via strongswan.conf)"
+    swan --load-all >>"$LOG" 2>&1
+}
+
 start_vpn() {
     ensure_dirs
     log "start $VERSION"
@@ -379,20 +402,28 @@ start_vpn() {
     prepare_swanctl_tree
     start_charon || return 1
 
-    if ! swan --load-all >>"$LOG" 2>&1; then
-        # fallback pubkey+rsa_pss without ike:rsa/pss-sha256
-        log "load-all with ike:rsa/pss-sha256 failed — trying pubkey+rsa_pss"
-        sed -i 's/auth = ike:rsa\/pss-sha256/auth = pubkey/' "$SWANCTL_DIR/conf.d/zivpn.conf"
-        swan --load-all >>"$LOG" 2>&1 || { log "swanctl load failed"; return 1; }
-    fi
+    _host=$(cat "$MAT/host")
+    _loaded=0
+    # 5.9.2: no swanctl rsa_pss key. Order matters for Amnezia Libreswan peers.
+    for _try in "pubkey|%any" "pubkey|$_host" "ike:rsa/pss-sha256|%any"; do
+        _a="${_try%%|*}"
+        _r="${_try##*|}"
+        if load_conn_try "$_a" "$_r"; then
+            _loaded=1
+            break
+        fi
+        log "load failed for auth=$_a id=$_r — next"
+    done
+    [ "$_loaded" = "1" ] || { log "swanctl load failed (all auth variants)"; return 1; }
 
     swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
         || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
         || true
     sleep 4
     if ! is_up; then
-        log "initiate failed"
+        log "initiate failed — see swanctl list-*"
         swan --list-conns >>"$LOG" 2>&1 || true
+        swan --list-sas >>"$LOG" 2>&1 || true
         swan --list-certs >>"$LOG" 2>&1 || true
         return 1
     fi
