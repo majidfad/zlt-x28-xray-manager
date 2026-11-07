@@ -1,9 +1,9 @@
 #!/bin/sh
 # ============================================================
-# zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
-# Fresh implementation — not based on sb-manager.
+# zi-manager - ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
+# Fresh implementation - not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi8"
+VERSION="2026.11.07-zi9"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -17,7 +17,7 @@ SWANCTL_DIR="/tmp/zi_swanctl"
 SS_CONF="$DIR/strongswan.conf"
 CONN="zivpn"
 PING_EVERY=120                    # seconds (faster recovery)
-PING_FAILS=3                      # was 10 — too slow when locked out
+PING_FAILS=3                      # was 10 - too slow when locked out
 PING_TARGET_DEFAULT="1.1.1.1"
 FAILSAFE_SECS="${ZI_FAILSAFE_SECS:-90}"   # auto emergency-stop unless confirmed
 
@@ -41,7 +41,7 @@ prefer_bins() {
 }
 
 json_str() {
-    # extract_json_str key from file — busybox-friendly
+    # extract_json_str key from file - busybox-friendly
     _f="$1"; _k="$2"
     [ -f "$_f" ] || { echo ""; return; }
     sed -n "s/.*\"$_k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$_f" | head -n1
@@ -49,9 +49,9 @@ json_str() {
 
 write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
-    # NO stroke plugin — old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
+    # NO stroke plugin - old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
     cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated (zi8 — reliable AUTH on cellular)
+# zlt-ipsec generated (zi9 = zi6 IKE that worked + VIP/MSS/DNS/QUIC)
 charon {
     load_modular = no
     install_routes = no
@@ -60,13 +60,11 @@ charon {
     threads = 16
     reuse_ikesa = yes
     make_before_break = yes
-    # Cellular drops large UDP; keep IKE fragments small (default ~1280 fails often)
-    fragment_size = 512
+    # DO NOT set fragment_size=512 - caused 5-way AUTH split and server stalls
     retransmit_tries = 5
-    retransmit_timeout = 2.0
+    retransmit_timeout = 3.0
     interfaces_use =
     interfaces_ignore =
-    # vici only (no stroke) — avoids OEM/singbox leftover secrets
     load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default vici updown counters gcm
     plugins {
         kernel-netlink {
@@ -93,7 +91,7 @@ ensure_stack() {
         && [ -f /usr/lib/ipsec/plugins/libstrongswan-x509.so ]; then
         return 0
     fi
-    log "stack missing/inactive — running zi-install-stack"
+    log "stack missing/inactive - running zi-install-stack"
     if [ -x /tmp/zi-install-stack ]; then
         /tmp/zi-install-stack >>"$LOG" 2>&1 || true
     elif [ -x /data/zi-bin/zi-install-stack ]; then
@@ -293,8 +291,8 @@ save_default_route() {
 }
 
 emergency_flush() {
-    # Hard recovery — restore LAN/SSH/web no matter what
-    log "EMERGENCY FLUSH — killing IPsec/XFRM/NAT, restoring routes"
+    # Hard recovery - restore LAN/SSH/web no matter what
+    log "EMERGENCY FLUSH - killing IPsec/XFRM/NAT, restoring routes"
     [ -f "$PID_FS" ] && kill "$(cat "$PID_FS" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_FS"
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
@@ -314,7 +312,7 @@ emergency_flush() {
     restore_default_route
     echo "0" > "$STATE_FILE" 2>/dev/null || true
     echo "0" > "$FAIL_FILE" 2>/dev/null || true
-    log "EMERGENCY FLUSH done — management access should work"
+    log "EMERGENCY FLUSH done - management access should work"
 }
 
 lan_cidrs() {
@@ -353,7 +351,7 @@ setup_tunnel_nat() {
     _server=$(cat "$MAT/host" 2>/dev/null)
     iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
     # Skip SNAT only for real LAN ifaces + VPN server + loopback
-    # (Do NOT blanket-exclude all RFC1918 — that blocked nothing useful but
+    # (Do NOT blanket-exclude all RFC1918 - that blocked nothing useful but
     #  VIP must be used as SNAT source for public destinations.)
     lan_cidrs | while read -r _c; do
         [ -n "$_c" ] || continue
@@ -373,7 +371,7 @@ setup_tunnel_nat() {
         log "tunnel NAT SNAT -> $_vip (IPsec VIP)"
     else
         iptables -t nat -A ZI_NAT -j MASQUERADE
-        log "tunnel NAT MASQUERADE (ERROR: no VIP — sites will fail)"
+        log "tunnel NAT MASQUERADE (ERROR: no VIP - sites will fail)"
     fi
     iptables -t nat -C POSTROUTING -j ZI_NAT 2>/dev/null \
         || iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
@@ -408,7 +406,7 @@ clean_quic_block() {
 
 setup_quic_block() {
     # YouTube/Instagram try HTTP/3 (QUIC/UDP443) first; over IPsec it stalls then falls
-    # back to TCP — feels like “video opens delayed”. REJECT makes fallback instant.
+    # back to TCP - feels like “video opens delayed”. REJECT makes fallback instant.
     clean_quic_block
     iptables -N ZI_NOQUIC 2>/dev/null || iptables -F ZI_NOQUIC
     iptables -A ZI_NOQUIC -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
@@ -420,13 +418,13 @@ setup_quic_block() {
 }
 
 setup_fast_dns() {
-    # INTERNAL_IP4_DNS often fails on OEM — force fast resolvers for router + dnsmasq
+    # INTERNAL_IP4_DNS often fails on OEM - force fast resolvers for router + dnsmasq
     mkdir -p /tmp/zi_dns_bak /tmp/dnsmasq.d
     [ -f /tmp/resolv.conf.auto ] && cp -a /tmp/resolv.conf.auto /tmp/zi_dns_bak/resolv.conf.auto 2>/dev/null || true
     [ -f /etc/resolv.conf ] && cp -a /etc/resolv.conf /tmp/zi_dns_bak/resolv.conf 2>/dev/null || true
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:2 rotate\n' > /tmp/resolv.conf.auto
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf 2>/dev/null || true
-    # LAN clients usually use modem DNS — push upstream to Cloudflare/Google
+    # LAN clients usually use modem DNS - push upstream to Cloudflare/Google
     printf 'server=1.1.1.1\nserver=8.8.8.8\nno-resolv\n' > /tmp/dnsmasq.d/zi.conf 2>/dev/null || true
     # Some OEM images use /tmp/dnsmasq.conf include path differently
     if [ -d /etc/dnsmasq.d ]; then
@@ -499,11 +497,11 @@ detect_vip() {
                 }
             }')
     fi
-    # 3) any "installing new virtual IP" leftover — parse list-sas for 192.168.43
+    # 3) any "installing new virtual IP" leftover - parse list-sas for 192.168.43
     if [ -z "$_v" ]; then
         _v=$(swanctl --list-sas 2>/dev/null | sed -n 's/.*\(192\.168\.43\.[0-9][0-9]*\).*/\1/p' | head -n1)
     fi
-    # 4) NEVER use cellular WAN (26.x / public) as VIP — that was the bug
+    # 4) NEVER use cellular WAN (26.x / public) as VIP - that was the bug
     echo "$_v"
 }
 
@@ -523,7 +521,7 @@ is_up() {
 write_zivpn_conf() {
     # $1 = local auth string (pubkey | ike:rsa/pss-sha256)
     # $2 = remote id (%any | host)
-    # NOTE: swanctl 5.9.2 has NO connection-level "rsa_pss" option —
+    # NOTE: swanctl 5.9.2 has NO connection-level "rsa_pss" option -
     # RSA-PSS is enabled only via strongswan.conf charon.rsa_pss.
     _lauth="${1:-pubkey}"
     _rid="${2:-%any}"
@@ -556,8 +554,8 @@ connections {
         proposals = ${_ike}
         encap = yes
         mobike = no
-        fragmentation = force
-        send_cert = ifasked
+        fragmentation = yes
+        send_cert = always
         local {
             auth = ${_lauth}
             certs = client.pem
@@ -612,7 +610,7 @@ start_charon() {
     stop_daemons
     rm -f /var/run/charon.vici /var/run/charon.ctl
     if [ ! -x /usr/lib/ipsec/charon ]; then
-        log "ERROR: /usr/lib/ipsec/charon missing — run zi-install-stack"
+        log "ERROR: /usr/lib/ipsec/charon missing - run zi-install-stack"
         return 1
     fi
     STRONGSWAN_CONF="$SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
@@ -653,7 +651,7 @@ arm_failsafe() {
     (
         sleep "$FAILSAFE_SECS"
         [ -f /tmp/zi_failsafe_armed ] || exit 0
-        log "FAILSAFE ${FAILSAFE_SECS}s fired — emergency flush (protect LAN/SSH/web)"
+        log "FAILSAFE ${FAILSAFE_SECS}s fired - emergency flush (protect LAN/SSH/web)"
         emergency_flush
     ) &
     echo $! > "$PID_FS"
@@ -671,36 +669,24 @@ lan_self_ok() {
 }
 
 wait_sa_up() {
-    # Wait for ESTABLISHED; cellular AUTH + retransmit can take >60s
-    _max="${1:-90}"
+    _max="${1:-45}"
     _i=0
     while [ "$_i" -lt "$_max" ]; do
-        if ! pidof charon >/dev/null 2>&1; then
-            log "wait_sa: charon died"
-            return 1
-        fi
+        pidof charon >/dev/null 2>&1 || return 1
         is_up && return 0
         sleep 1
         _i=$((_i + 1))
     done
-    return 1
-}
-
-do_initiate() {
-    # swanctl 5.9.2: initiate returns after kickoff; we wait for SA separately
-    swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
-        || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
-        || true
-    wait_sa_up 90
+    is_up
 }
 
 start_vpn() {
+    # zi9: restore zi6 handshake (worked) + keep VIP SNAT / MSS / DNS / QUIC
     ensure_dirs
     log "start $VERSION (lockout-safe)"
     cancel_failsafe
-    [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
+    [ -f "$PROFILE" ] || { log "ERROR: no profile - import first"; return 1; }
     [ -s "$MAT/client.key" ] || prepare_material || return 1
-    # Stable Amnezia proposal only (Curve25519 caused AUTH stalls on this server)
     _ike="aes256-sha256-modp2048"
     _esp=$(json_str "$PROFILE" espProposal)
     [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
@@ -711,7 +697,6 @@ start_vpn() {
     log "proposals ike=$_ike esp=$_esp"
     ensure_stack || return 1
     save_default_route
-    # Failsafe ONLY after SA is up — never during handshake (was killing AUTH)
     write_ss_conf
     prepare_swanctl_tree
     start_charon || { log "charon start failed"; stop_daemons; return 1; }
@@ -725,7 +710,7 @@ start_vpn() {
             _loaded=1
             break
         fi
-        log "load failed for auth=$_a id=$_r — next"
+        log "load failed for auth=$_a id=$_r - next"
     done
     if [ "$_loaded" != "1" ]; then
         log "swanctl load failed"
@@ -733,39 +718,44 @@ start_vpn() {
         return 1
     fi
 
-    log "initiating IKE (may take up to ~90s on cellular)…"
-    if ! do_initiate; then
-        log "first initiate failed — clean retry once"
+    # CRITICAL: --timeout 3 detaches; do NOT wait for failure (that aborts SA mid-AUTH)
+    log "initiating IKE (detached; waiting for SA)..."
+    swan --initiate --timeout 3 --child "$CONN" >>"$LOG" 2>&1 &
+    _ini_pid=$!
+    sleep 1
+    if ! wait_sa_up 45; then
+        log "SA not up in 45s - one clean retry"
+        kill "$_ini_pid" 2>/dev/null || true
         stop_daemons
         sleep 2
         start_charon || { log "charon restart failed"; return 1; }
-        load_conn_try "pubkey" "%any" || load_conn_try "pubkey" "$_host" || {
+        load_conn_try "pubkey" "%any" || {
             log "swanctl reload failed"; stop_daemons; return 1
         }
-        if ! do_initiate; then
+        swan --initiate --timeout 3 --child "$CONN" >>"$LOG" 2>&1 &
+        sleep 1
+        if ! wait_sa_up 45; then
             log "initiate failed after retry"
-            [ -S /var/run/charon.vici ] && swan --list-sas >>"$LOG" 2>&1 || true
             stop_daemons
             restore_default_route
             return 1
         fi
     fi
     if ! lan_self_ok; then
-        log "LAN/default route broken after SA — emergency flush"
+        log "LAN/default broken after SA - emergency flush"
         emergency_flush
         return 1
     fi
     _vip=$(detect_vip)
     if [ -z "$_vip" ]; then
-        log "ERROR: could not detect IPsec VIP (want 192.168.43.x)"
-        [ -S /var/run/charon.vici ] && swan --list-sas >>"$LOG" 2>&1 || true
+        log "ERROR: no IPsec VIP (want 192.168.43.x)"
         emergency_flush
         return 1
     fi
     setup_tunnel_nat "$_vip"
     setup_tunnel_routes "$_vip"
     if ! lan_self_ok; then
-        log "LAN broken after NAT/routes — emergency flush"
+        log "LAN broken after NAT/routes - emergency flush"
         emergency_flush
         return 1
     fi
@@ -774,10 +764,10 @@ start_vpn() {
     log "IPsec ESTABLISHED vip=$_vip"
     _t=$(ping_target)
     if ping -I "$_vip" -c 2 -W 5 "$_t" >/dev/null 2>&1; then
-        log "tunnel ping OK via VIP $_vip -> $_t — keeping tunnel (no failsafe)"
+        log "tunnel ping OK via VIP $_vip -> $_t"
         confirm_tunnel
     else
-        log "WARN: tunnel ping failed — failsafe ${FAILSAFE_SECS}s (Confirm in UI if sites work)"
+        log "WARN: tunnel ping failed - failsafe ${FAILSAFE_SECS}s (Confirm if sites work)"
         arm_failsafe
     fi
     start_watchdog
@@ -819,12 +809,12 @@ watchdog_loop() {
         sleep "$PING_EVERY"
         [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
         if ! lan_self_ok; then
-            log "watchdog: LAN/default route lost — EMERGENCY"
+            log "watchdog: LAN/default route lost - EMERGENCY"
             emergency_flush
             exit 0
         fi
         if ! is_up; then
-            log "watchdog: SA down — stopping VPN"
+            log "watchdog: SA down - stopping VPN"
             emergency_flush
             exit 0
         fi
@@ -840,7 +830,7 @@ watchdog_loop() {
             echo "$_f" > "$FAIL_FILE"
             log "watchdog: ping $_t via ${_vip:-wan} fail $_f/$PING_FAILS"
             if [ "$_f" -ge "$PING_FAILS" ]; then
-                log "watchdog: $PING_FAILS ping fails — emergency flush → WAN"
+                log "watchdog: $PING_FAILS ping fails - emergency flush → WAN"
                 emergency_flush
                 exit 0
             fi
@@ -886,19 +876,19 @@ boot_start() {
     /etc/init.d/zi-swan-bind start 2>/dev/null || true
     # Autostart ONLY with explicit opt-in file (prevents post-reboot lockout)
     if [ ! -f "$DIR/autostart" ] && [ ! -f /data/zlt-ipsec/autostart ]; then
-        log "boot: autostart disabled (no autostart file) — safe idle"
+        log "boot: autostart disabled (no autostart file) - safe idle"
         exit 0
     fi
     [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
     [ -f "$PROFILE" ] || exit 0
-    log "boot: autostart requested — starting with failsafe"
+    log "boot: autostart requested - starting with failsafe"
     start_vpn
 }
 
 confirm_tunnel() {
     rm -f /tmp/zi_failsafe_armed
     cancel_failsafe
-    log "tunnel CONFIRMED — failsafe cancelled"
+    log "tunnel CONFIRMED - failsafe cancelled"
     echo "ok: tunnel kept"
 }
 
