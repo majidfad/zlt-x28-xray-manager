@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6h"
+VERSION="2026.11.07-zi6i"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -65,9 +65,20 @@ json_str() {
 
 write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
-    # NO stroke plugin — old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
-    cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated (lockout-safe + speed, zi6)
+    _wan=""
+    if [ -f "$ROUTE_BAK" ]; then
+        # shellcheck disable=SC1090
+        . "$ROUTE_BAK" 2>/dev/null || true
+        _wan="${ZI_DEF_DEV:-}"
+    fi
+    # Prefer current default iface if bak empty/stale
+    if [ -z "$_wan" ]; then
+        _wan=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    fi
+    # NO stroke plugin - old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
+    # fragment_size 576: cellular often drops large UDP; IKEv2 fragmentation must fit MTU
+    cat > "$SS_CONF" << EOF
+# zlt-ipsec generated (lockout-safe, zi6i cellular AUTH)
 charon {
     load_modular = no
     install_routes = no
@@ -76,11 +87,13 @@ charon {
     threads = 16
     reuse_ikesa = yes
     make_before_break = yes
-    retransmit_tries = 5
-    retransmit_timeout = 3.0
-    interfaces_use =
+    fragment_size = 576
+    retransmit_tries = 10
+    retransmit_timeout = 2.0
+    retransmit_base = 1.5
+    interfaces_use = ${_wan}
     interfaces_ignore =
-    # vici only (no stroke) — avoids OEM/singbox leftover secrets
+    # vici only (no stroke) - avoids OEM/singbox leftover secrets
     load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default vici updown counters gcm
     plugins {
         kernel-netlink {
@@ -91,7 +104,7 @@ charon {
 }
 EOF
     ln -sf "$SS_CONF" /etc/strongswan.conf 2>/dev/null || true
-    # Neutralize stroke leftovers if something else loads them
+    log "strongswan.conf wan_iface=${_wan:-any} fragment_size=576"
     if [ -f /etc/ipsec.secrets ]; then
         cp -a /etc/ipsec.secrets /etc/ipsec.secrets.zi-bak 2>/dev/null || true
         printf '# zi-manager: secrets via swanctl only\n' > /etc/ipsec.secrets
@@ -99,6 +112,83 @@ EOF
     for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey mgf1; do
         printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
     done
+}
+
+# Pin IKE peer on WAN before AUTH (must not depend on tunnel / VIP)
+pin_vpn_server_route() {
+    _peer=$(cat "$MAT/host" 2>/dev/null)
+    [ -n "$_peer" ] || return 0
+    # resolve hostname if needed
+    case "$_peer" in
+        *[!0-9.]* )
+            _rip=$(resolve_domain_ips "$_peer" | head -n1)
+            [ -n "$_rip" ] && _peer="$_rip"
+            ;;
+    esac
+    case "$_peer" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+        *) log "WARN: cannot resolve VPN peer from host=$(cat "$MAT/host")"; return 1 ;;
+    esac
+    printf '%s' "$_peer" > "$MAT/peer_ip"
+    wan_route_to "$_peer"
+    # also ensure UDP 500/4500 not blackholed: refresh default if missing
+    if ! ip -4 route show default 2>/dev/null | grep -q default; then
+        restore_default_route
+    fi
+    log "pinned VPN peer $_peer via WAN for IKE"
+    return 0
+}
+
+purge_vpn_from_bypass() {
+    # Never bypass the IKE peer itself (was in your list as vpn.orchidpharmed.com)
+    _h=$(cat "$MAT/host" 2>/dev/null | tr 'A-Z' 'a-z')
+    _p=$(cat "$MAT/peer_ip" 2>/dev/null)
+    [ -z "$_h" ] && [ -z "$_p" ] && return 0
+    for _f in "$BYPASS_DOMAINS" "$BYPASS_SUFFIXES"; do
+        [ -f "$_f" ] || continue
+        _tmp="$_f.tmp"
+        : > "$_tmp"
+        while read -r _line; do
+            _e=$(normalize_bypass_entry "$_line")
+            [ -n "$_e" ] || continue
+            [ -n "$_h" ] && [ "$_e" = "$_h" ] && { log "bypass: removed VPN host $_e"; continue; }
+            [ -n "$_p" ] && [ "$_e" = "$_p" ] && { log "bypass: removed VPN IP $_e"; continue; }
+            echo "$_e" >> "$_tmp"
+        done < "$_f"
+        mv -f "$_tmp" "$_f"
+    done
+}
+
+wait_ike_up() {
+    # $1 = max seconds
+    _max="${1:-45}"
+    _i=0
+    while [ "$_i" -lt "$_max" ]; do
+        is_up && return 0
+        if [ ! -S /var/run/charon.vici ] || ! pidof charon >/dev/null 2>&1; then
+            log "IKE wait: charon/vici died"
+            return 2
+        fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+soft_initiate() {
+    # One AUTH attempt; leave charon alive on failure so caller can retry
+    pin_vpn_server_route || true
+    swan --terminate --ike "$CONN" >/dev/null 2>&1 || true
+    sleep 1
+    if [ ! -S /var/run/charon.vici ]; then
+        return 2
+    fi
+    swan --initiate --timeout 50 --child "$CONN" >>"$LOG" 2>&1 &
+    _init_pid=$!
+    wait_ike_up 50
+    _rc=$?
+    wait "$_init_pid" 2>/dev/null || true
+    return $_rc
 }
 
 ensure_stack() {
@@ -633,6 +723,13 @@ install_bypass_dnsmasq() {
         _e=$(dnsmasq_ipset_pattern "$_raw")
         [ -n "$_e" ] || continue
         case "$_e" in \#*) continue ;; esac
+        # bare IPv4 belongs in ipset directly, not as a fake DNS name
+        case "$_e" in
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+                ensure_bypass_ipset 2>/dev/null && ipset add "$BYPASS_IPSET" "$_e" 2>/dev/null || true
+                continue
+                ;;
+        esac
         echo "ipset=/${_e}/${BYPASS_IPSET}"
     done | sort -u)
 
@@ -1193,9 +1290,12 @@ start_vpn() {
     log "proposals ike=$_ike esp=$_esp"
     ensure_stack || { release_start_lock; return 1; }
     save_default_route
-    arm_failsafe
+    # Failsafe ONLY after tunnel is up - arming earlier killed long cellular AUTH retries
+    cancel_failsafe 2>/dev/null || true
     write_ss_conf
     prepare_swanctl_tree
+    pin_vpn_server_route || true
+    purge_vpn_from_bypass 2>/dev/null || true
     start_charon || { emergency_flush; release_start_lock; return 1; }
 
     _host=$(cat "$MAT/host")
@@ -1207,7 +1307,7 @@ start_vpn() {
             _loaded=1
             break
         fi
-        log "load failed for auth=$_a id=$_r — next"
+        log "load failed for auth=$_a id=$_r - next"
     done
     if [ "$_loaded" != "1" ]; then
         log "swanctl load failed (all auth variants)"
@@ -1216,34 +1316,29 @@ start_vpn() {
         return 1
     fi
 
-    if [ ! -S /var/run/charon.vici ]; then
-        log "ERROR: vici missing before initiate"
-        emergency_flush
-        release_start_lock
-        return 1
-    fi
-    # detach initiate so we can wait longer than swanctl default (cellular AUTH fragments)
-    swan --initiate --timeout 60 --child "$CONN" >>"$LOG" 2>&1 &
-    _init_pid=$!
-    # AUTH is fragmented over cellular - wait up to 60s; abort if charon dies (overlap/flush)
-    _i=0
-    while [ "$_i" -lt 60 ]; do
-        if is_up; then
+    # Soft-retry IKE_AUTH (cellular drops fragments) - keep charon, do not emergency between tries
+    _ok_ike=0
+    _attempt=1
+    while [ "$_attempt" -le 3 ]; do
+        log "IKE initiate attempt $_attempt/3"
+        soft_initiate
+        _irc=$?
+        if [ "$_irc" = "0" ]; then
+            _ok_ike=1
             break
         fi
-        if [ ! -S /var/run/charon.vici ] || ! pidof charon >/dev/null 2>&1; then
-            log "initiate aborted - charon/vici died mid-AUTH (double Connect or emergency during start)"
-            wait "$_init_pid" 2>/dev/null || true
-            emergency_flush
-            release_start_lock
-            return 1
+        if [ "$_irc" = "2" ]; then
+            log "charon died - restarting daemon for next attempt"
+            start_charon || break
+            load_conn_try "pubkey" "%any" || load_conn_try "pubkey" "$_host" || true
+        else
+            log "IKE_AUTH no reply on attempt $_attempt (cellular) - retrying"
         fi
-        sleep 1
-        _i=$((_i + 1))
+        _attempt=$((_attempt + 1))
+        sleep 2
     done
-    wait "$_init_pid" 2>/dev/null || true
-    if ! is_up; then
-        log "initiate failed - IKE_AUTH timeout/no reply (cellular) - see swanctl list-*"
+    if [ "$_ok_ike" != "1" ]; then
+        log "initiate failed after 3 attempts - see swanctl list-*"
         swan --list-conns >>"$LOG" 2>&1 || true
         swan --list-sas >>"$LOG" 2>&1 || true
         swan --list-certs >>"$LOG" 2>&1 || true
@@ -1274,6 +1369,8 @@ start_vpn() {
         release_start_lock
         return 1
     fi
+    # Failsafe starts only once tunnel exists (not during AUTH retries)
+    arm_failsafe
     # Prove tunnel data path before keeping it
     _t=$(ping_target)
     if ping -I "$_vip" -c 2 -W 5 "$_t" >/dev/null 2>&1; then
@@ -1281,13 +1378,13 @@ start_vpn() {
         confirm_tunnel
     else
         log "WARN: tunnel ping via VIP failed (DNS/path) - check SNAT/XFRM; still up for confirm"
+        log "TIP: click Confirm within ${FAILSAFE_SECS}s or tunnel auto-stops"
     fi
     # Domain bypass AFTER tunnel is healthy (DNS resolve must not race IKE)
     apply_bypass >/dev/null 2>&1 || true
     echo "1" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "IPsec ESTABLISHED vip=$_vip"
-    log "TIP: if sites work, click Confirm (or: zi-manager confirm) within ${FAILSAFE_SECS}s"
     start_watchdog
     release_start_lock
     return 0
