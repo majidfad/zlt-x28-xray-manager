@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi5"
+VERSION="2026.11.07-zi6"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -49,34 +49,38 @@ json_str() {
 
 write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
-    # install_routes=no — lockout-safe; tuned for throughput (vs Amnezia app)
+    # NO stroke plugin — old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
     cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated (lockout-safe + speed)
+# zlt-ipsec generated (lockout-safe + speed, zi6)
 charon {
     load_modular = no
     install_routes = no
     install_virtual_ip = yes
     rsa_pss = yes
-    threads = 32
+    threads = 16
     reuse_ikesa = yes
     make_before_break = yes
+    retransmit_tries = 5
+    retransmit_timeout = 3.0
     interfaces_use =
     interfaces_ignore =
-    # Prefer openssl AES-GCM; curve25519 for faster IKE than modp2048
-    load = random nonce aes sha1 sha2 md5 mgf1 hmac gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints fips-prf drbg attr kernel-netlink socket-default stroke vici gcm
+    # vici only (no stroke) — avoids OEM/singbox leftover secrets
+    load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default vici updown counters gcm
     plugins {
         kernel-netlink {
-            replay_window = 256
+            replay_window = 128
             roam_events = no
-        }
-        socket-default {
-            # larger buffers help ESP-in-UDP on cellular
         }
     }
 }
 EOF
     ln -sf "$SS_CONF" /etc/strongswan.conf 2>/dev/null || true
-    for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey; do
+    # Neutralize stroke leftovers if something else loads them
+    if [ -f /etc/ipsec.secrets ]; then
+        cp -a /etc/ipsec.secrets /etc/ipsec.secrets.zi-bak 2>/dev/null || true
+        printf '# zi-manager: secrets via swanctl only\n' > /etc/ipsec.secrets
+    fi
+    for p in x509 pkcs1 pkcs8 gcm openssl pem pubkey mgf1; do
         printf '%s {\n  load = yes\n}\n' "$p" > "/etc/strongswan.d/charon/${p}.conf" 2>/dev/null || true
     done
 }
@@ -180,14 +184,9 @@ prepare_material() {
     [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
     _esp=$(json_str "$PROFILE" espProposal)
     [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
-    # Prefer Curve25519 + AES-GCM (closer to Amnezia app speed); keep profile as fallback
-    [ -z "$_ike" ] && _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,aes256-sha256-modp2048"
-    [ -z "$_esp" ] && _esp="aes128gcm16,aes256gcm16"
-    # If profile only has slow modp2048, prepend fast proposals
-    case "$_ike" in
-        *curve25519*) ;;
-        *) _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,$_ike" ;;
-    esac
+    # zi4 worked with modp2048; Curve25519-first (zi5) broke IKE_AUTH on this Amnezia server
+    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
+    [ -z "$_esp" ] && _esp="aes128gcm16"
     case "$_esp" in
         *gcm*) ;;
         *) _esp="aes128gcm16,$_esp" ;;
@@ -216,8 +215,8 @@ prepare_material() {
 import_manual() {
     # host user p12_path [password] [ike] [esp]
     _host="$1"; _user="$2"; _p12="$3"; _pass="${4:-}"
-    _ike="${5:-aes128gcm16-prfsha256-curve25519,aes256-sha256-modp2048}"
-    _esp="${6:-aes128gcm16,aes256gcm16}"
+    _ike="${5:-aes256-sha256-modp2048}"
+    _esp="${6:-aes128gcm16}"
     [ -n "$_host" ] && [ -n "$_user" ] && [ -f "$_p12" ] || {
         echo "Usage: zi-manager import-manual <host> <id> <p12file> [password] [ike] [esp]" >&2
         return 1
@@ -542,8 +541,6 @@ ${_cacert_line}
                 start_action = none
                 rekey_time = 3600s
                 life_time = 7200s
-                replay_window = 256
-                # hardware/software AES-GCM path
                 mode = tunnel
             }
         }
@@ -643,17 +640,19 @@ start_vpn() {
     log "start $VERSION (lockout-safe)"
     [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
     [ -s "$MAT/client.key" ] || prepare_material || return 1
-    # Refresh proposals each start (speed tune even if material already unpacked)
+    # Keep working Amnezia proposals (modp2048). Do not force Curve25519 — AUTH stalls.
     _ike=$(json_str "$PROFILE" ikeProposal)
     [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
     [ -z "$_ike" ] && _ike=$(cat "$MAT/ike" 2>/dev/null)
+    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
+    # If a previous zi5 run forced curve25519-first, prefer stable modp2048 again
+    case "$_ike" in
+        *curve25519*|*CURVE*) _ike="aes256-sha256-modp2048,aes256-sha256-curve25519" ;;
+    esac
     _esp=$(json_str "$PROFILE" espProposal)
     [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
     [ -z "$_esp" ] && _esp=$(cat "$MAT/esp" 2>/dev/null)
-    case "$_ike" in *curve25519*) ;; *)
-        _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,${_ike:-aes256-sha256-modp2048}" ;;
-    esac
-    case "$_esp" in *gcm*) ;; *) _esp="aes128gcm16,${_esp:-aes128gcm16}" ;; esac
+    [ -z "$_esp" ] && _esp="aes128gcm16"
     printf '%s' "$_ike" > "$MAT/ike"
     printf '%s' "$_esp" > "$MAT/esp"
     log "proposals ike=$_ike esp=$_esp"
@@ -684,7 +683,13 @@ start_vpn() {
     swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
         || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
         || true
-    sleep 4
+    # AUTH is fragmented over cellular — give reassembly time
+    _i=0
+    while [ "$_i" -lt 20 ]; do
+        is_up && break
+        sleep 1
+        _i=$((_i + 1))
+    done
     if ! is_up; then
         log "initiate failed — see swanctl list-*"
         swan --list-conns >>"$LOG" 2>&1 || true
