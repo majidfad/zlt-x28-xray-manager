@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6g"
+VERSION="2026.11.07-zi6h"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -371,6 +371,21 @@ EOF
     prepare_material
 }
 
+wait_charon_dead() {
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        if ! pidof charon >/dev/null 2>&1 && [ ! -S /var/run/charon.vici ]; then
+            return 0
+        fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    # force
+    killall -9 charon starter 2>/dev/null || true
+    rm -f /var/run/charon.vici /var/run/charon.ctl
+    sleep 1
+}
+
 stop_daemons() {
     prefer_bins
     swanctl --terminate --ike "$CONN" >/dev/null 2>&1 || true
@@ -378,6 +393,10 @@ stop_daemons() {
     ipsec stop >/dev/null 2>&1 || true
     killall charon starter 2>/dev/null || true
     sleep 1
+    if pidof charon >/dev/null 2>&1; then
+        killall -9 charon starter 2>/dev/null || true
+    fi
+    wait_charon_dead
 }
 
 clean_tunnel_nat() {
@@ -421,17 +440,16 @@ save_default_route() {
 }
 
 emergency_flush() {
-    # Hard recovery — restore LAN/SSH/web no matter what
-    log "EMERGENCY FLUSH — killing IPsec/XFRM/NAT, restoring routes"
+    # Hard recovery - restore LAN/SSH/web no matter what
+    log "EMERGENCY FLUSH - killing IPsec/XFRM/NAT, restoring routes"
     release_start_lock
-    [ -f "$PID_FS" ] && kill "$(cat "$PID_FS" 2>/dev/null)" 2>/dev/null || true
-    rm -f "$PID_FS"
+    cancel_failsafe 2>/dev/null || true
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
     prefer_bins
     swanctl --terminate --ike "$CONN" >/dev/null 2>&1 || true
     killall -9 charon starter 2>/dev/null || true
-    sleep 1
+    wait_charon_dead
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
     clean_bypass 2>/dev/null || true
@@ -443,8 +461,8 @@ emergency_flush() {
     clean_policy_routing
     restore_dns
     restore_default_route
-    # keep dnsmasq/.ir ipset so suffixes refill while offline
-    [ -s "$BYPASS_SUFFIXES" ] && install_suffix_dnsmasq 2>/dev/null || true
+    # keep dnsmasq domain-bypass so trees refill while offline
+    [ -s "$BYPASS_DOMAINS" ] || [ -s "$BYPASS_SUFFIXES" ] && install_bypass_dnsmasq 2>/dev/null || true
     echo "0" > "$STATE_FILE" 2>/dev/null || true
     echo "0" > "$FAIL_FILE" 2>/dev/null || true
     log "EMERGENCY FLUSH done - management access should work"
@@ -1048,21 +1066,29 @@ start_charon() {
     write_ss_conf
     prefer_bins
     stop_daemons
-    rm -f /var/run/charon.vici /var/run/charon.ctl
+    rm -f /var/run/charon.vici /var/run/charon.ctl /tmp/zi_charon.log
     if [ ! -x /usr/lib/ipsec/charon ]; then
-        log "ERROR: /usr/lib/ipsec/charon missing — run zi-install-stack"
+        log "ERROR: /usr/lib/ipsec/charon missing - run zi-install-stack"
         return 1
     fi
+    # brief settle after kill so OEM doesn't race the new charon
+    sleep 1
     STRONGSWAN_CONF="$SS_CONF" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" \
         /usr/lib/ipsec/charon >>/tmp/zi_charon.log 2>&1 &
     _i=0
-    while [ "$_i" -lt 15 ]; do
-        [ -S /var/run/charon.vici ] && return 0
-        pidof charon >/dev/null 2>&1 || break
+    while [ "$_i" -lt 20 ]; do
+        if [ -S /var/run/charon.vici ]; then
+            # prove vici answers (avoids "Connection refused" right after socket create)
+            if swanctl --version >/dev/null 2>&1 || SWANCTL_DIR="$SWANCTL_DIR" swanctl --list-conns >/dev/null 2>&1; then
+                log "charon ready (vici up)"
+                return 0
+            fi
+        fi
+        pidof charon >/dev/null 2>&1 || { log "ERROR: charon exited early"; break; }
         sleep 1
         _i=$((_i + 1))
     done
-    log "ERROR: charon did not create vici socket"
+    log "ERROR: charon did not create usable vici socket"
     cat /tmp/zi_charon.log >>"$LOG" 2>/dev/null || true
     return 1
 }
@@ -1091,7 +1117,7 @@ arm_failsafe() {
     (
         sleep "$FAILSAFE_SECS"
         [ -f /tmp/zi_failsafe_armed ] || exit 0
-        log "FAILSAFE ${FAILSAFE_SECS}s fired — emergency flush (protect LAN/SSH/web)"
+        log "FAILSAFE ${FAILSAFE_SECS}s fired - emergency flush (protect LAN/SSH/web)"
         emergency_flush
     ) &
     echo $! > "$PID_FS"
@@ -1190,18 +1216,34 @@ start_vpn() {
         return 1
     fi
 
-    swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
-        || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
-        || true
-    # AUTH is fragmented over cellular — give reassembly time
+    if [ ! -S /var/run/charon.vici ]; then
+        log "ERROR: vici missing before initiate"
+        emergency_flush
+        release_start_lock
+        return 1
+    fi
+    # detach initiate so we can wait longer than swanctl default (cellular AUTH fragments)
+    swan --initiate --timeout 60 --child "$CONN" >>"$LOG" 2>&1 &
+    _init_pid=$!
+    # AUTH is fragmented over cellular - wait up to 60s; abort if charon dies (overlap/flush)
     _i=0
-    while [ "$_i" -lt 20 ]; do
-        is_up && break
+    while [ "$_i" -lt 60 ]; do
+        if is_up; then
+            break
+        fi
+        if [ ! -S /var/run/charon.vici ] || ! pidof charon >/dev/null 2>&1; then
+            log "initiate aborted - charon/vici died mid-AUTH (double Connect or emergency during start)"
+            wait "$_init_pid" 2>/dev/null || true
+            emergency_flush
+            release_start_lock
+            return 1
+        fi
         sleep 1
         _i=$((_i + 1))
     done
+    wait "$_init_pid" 2>/dev/null || true
     if ! is_up; then
-        log "initiate failed — see swanctl list-*"
+        log "initiate failed - IKE_AUTH timeout/no reply (cellular) - see swanctl list-*"
         swan --list-conns >>"$LOG" 2>&1 || true
         swan --list-sas >>"$LOG" 2>&1 || true
         swan --list-certs >>"$LOG" 2>&1 || true
@@ -1210,14 +1252,14 @@ start_vpn() {
         return 1
     fi
     if ! lan_self_ok; then
-        log "LAN/default route broken after SA — emergency flush"
+        log "LAN/default route broken after SA - emergency flush"
         emergency_flush
         release_start_lock
         return 1
     fi
     _vip=$(detect_vip)
     if [ -z "$_vip" ]; then
-        log "ERROR: could not detect IPsec VIP (want 192.168.43.x) — refusing bad SNAT"
+        log "ERROR: could not detect IPsec VIP (want 192.168.43.x) - refusing bad SNAT"
         swan --list-sas >>"$LOG" 2>&1 || true
         ip -4 addr >>"$LOG" 2>&1 || true
         emergency_flush
@@ -1227,7 +1269,7 @@ start_vpn() {
     setup_tunnel_nat "$_vip"
     setup_tunnel_routes "$_vip"
     if ! lan_self_ok; then
-        log "LAN broken after NAT/routes — emergency flush"
+        log "LAN broken after NAT/routes - emergency flush"
         emergency_flush
         release_start_lock
         return 1
@@ -1238,7 +1280,7 @@ start_vpn() {
         log "tunnel ping OK via VIP $_vip -> $_t"
         confirm_tunnel
     else
-        log "WARN: tunnel ping via VIP failed (DNS/path) — check SNAT/XFRM; still up for confirm"
+        log "WARN: tunnel ping via VIP failed (DNS/path) - check SNAT/XFRM; still up for confirm"
     fi
     # Domain bypass AFTER tunnel is healthy (DNS resolve must not race IKE)
     apply_bypass >/dev/null 2>&1 || true
@@ -1369,9 +1411,15 @@ boot_start() {
 }
 
 confirm_tunnel() {
+    # Ignore late Confirm after a failed/flushed start (your log showed CONFIRM after EMERGENCY)
+    if ! is_up 2>/dev/null; then
+        log "confirm ignored - tunnel not ESTABLISHED"
+        echo "error: tunnel not up"
+        return 1
+    fi
     rm -f /tmp/zi_failsafe_armed
     cancel_failsafe
-    log "tunnel CONFIRMED — failsafe cancelled"
+    log "tunnel CONFIRMED - failsafe cancelled"
     echo "ok: tunnel kept"
 }
 
