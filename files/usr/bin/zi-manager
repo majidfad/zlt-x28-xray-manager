@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi4"
+VERSION="2026.11.07-zi5"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -49,17 +49,30 @@ json_str() {
 
 write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
-    # install_routes=no — installing 0.0.0.0/0 via XFRM blackholes LAN/SSH/web on ZLT
+    # install_routes=no — lockout-safe; tuned for throughput (vs Amnezia app)
     cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated (lockout-safe)
+# zlt-ipsec generated (lockout-safe + speed)
 charon {
     load_modular = no
     install_routes = no
     install_virtual_ip = yes
     rsa_pss = yes
+    threads = 32
+    reuse_ikesa = yes
+    make_before_break = yes
     interfaces_use =
     interfaces_ignore =
-    load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default stroke vici updown counters gcm
+    # Prefer openssl AES-GCM; curve25519 for faster IKE than modp2048
+    load = random nonce aes sha1 sha2 md5 mgf1 hmac gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints fips-prf drbg attr kernel-netlink socket-default stroke vici gcm
+    plugins {
+        kernel-netlink {
+            replay_window = 256
+            roam_events = no
+        }
+        socket-default {
+            # larger buffers help ESP-in-UDP on cellular
+        }
+    }
 }
 EOF
     ln -sf "$SS_CONF" /etc/strongswan.conf 2>/dev/null || true
@@ -167,8 +180,18 @@ prepare_material() {
     [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
     _esp=$(json_str "$PROFILE" espProposal)
     [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
-    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
-    [ -z "$_esp" ] && _esp="aes128gcm16"
+    # Prefer Curve25519 + AES-GCM (closer to Amnezia app speed); keep profile as fallback
+    [ -z "$_ike" ] && _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,aes256-sha256-modp2048"
+    [ -z "$_esp" ] && _esp="aes128gcm16,aes256gcm16"
+    # If profile only has slow modp2048, prepend fast proposals
+    case "$_ike" in
+        *curve25519*) ;;
+        *) _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,$_ike" ;;
+    esac
+    case "$_esp" in
+        *gcm*) ;;
+        *) _esp="aes128gcm16,$_esp" ;;
+    esac
     [ -z "$_host" ] && { log "ERROR: no hostName/addr in profile"; return 1; }
     [ -z "$_cert" ] && { log "ERROR: no cert/p12 in profile"; return 1; }
     printf '%s' "$_host" > "$MAT/host"
@@ -192,7 +215,9 @@ prepare_material() {
 
 import_manual() {
     # host user p12_path [password] [ike] [esp]
-    _host="$1"; _user="$2"; _p12="$3"; _pass="${4:-}"; _ike="${5:-aes256-sha256-modp2048}"; _esp="${6:-aes128gcm16}"
+    _host="$1"; _user="$2"; _p12="$3"; _pass="${4:-}"
+    _ike="${5:-aes128gcm16-prfsha256-curve25519,aes256-sha256-modp2048}"
+    _esp="${6:-aes128gcm16,aes256gcm16}"
     [ -n "$_host" ] && [ -n "$_user" ] && [ -f "$_p12" ] || {
         echo "Usage: zi-manager import-manual <host> <id> <p12file> [password] [ike] [esp]" >&2
         return 1
@@ -280,8 +305,10 @@ emergency_flush() {
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
     clean_tunnel_nat
+    clean_mss
     clean_mangle
     clean_policy_routing
+    restore_dns
     restore_default_route
     echo "0" > "$STATE_FILE" 2>/dev/null || true
     echo "0" > "$FAIL_FILE" 2>/dev/null || true
@@ -350,6 +377,41 @@ setup_tunnel_nat() {
         || iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
 }
 
+clean_mss() {
+    iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
+    iptables -t mangle -F ZI_MSS 2>/dev/null || true
+    iptables -t mangle -X ZI_MSS 2>/dev/null || true
+}
+
+setup_mss_clamp() {
+    # Cellular + ESP-UDP overhead → without MSS clamp browsing feels “sticky”
+    clean_mss
+    iptables -t mangle -N ZI_MSS 2>/dev/null || iptables -t mangle -F ZI_MSS
+    # 1280 works well for NAT-T on LTE/5G; clamp-mss-to-pmtu as helper
+    iptables -t mangle -A ZI_MSS -j TCPMSS --set-mss 1280 2>/dev/null || true
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null \
+        || iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
+    log "TCP MSS clamped to 1280 (smooth browsing over ESP)"
+}
+
+setup_fast_dns() {
+    # INTERNAL_IP4_DNS often fails on OEM ("handling ... failed") — force fast resolvers
+    mkdir -p /tmp/zi_dns_bak
+    [ -f /tmp/resolv.conf.auto ] && cp -a /tmp/resolv.conf.auto /tmp/zi_dns_bak/resolv.conf.auto 2>/dev/null || true
+    [ -f /etc/resolv.conf ] && cp -a /etc/resolv.conf /tmp/zi_dns_bak/resolv.conf 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 rotate\n' > /tmp/resolv.conf.auto
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf 2>/dev/null || true
+    killall -HUP dnsmasq 2>/dev/null || true
+    # If odhcpd/dnsmasq ignore resolv.conf.auto, still help router-originated lookups
+    log "DNS set to 1.1.1.1/8.8.8.8 (Amnezia CPRP DNS install failed on OEM)"
+}
+
+restore_dns() {
+    [ -f /tmp/zi_dns_bak/resolv.conf.auto ] && cp -a /tmp/zi_dns_bak/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null || true
+    [ -f /tmp/zi_dns_bak/resolv.conf ] && cp -a /tmp/zi_dns_bak/resolv.conf /etc/resolv.conf 2>/dev/null || true
+    killall -HUP dnsmasq 2>/dev/null || true
+}
+
 setup_tunnel_routes() {
     _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
@@ -377,11 +439,12 @@ setup_tunnel_routes() {
             || ip addr add "$_vip/32" dev lo 2>/dev/null || true
         printf '%s' "$_vip" > "$MAT/vip"
     fi
-    # Prefer VPN DNS for router resolver (CPRP DNS often fails on OEM)
     if [ ! -s "$MAT/dns1" ]; then
         printf '%s\n' "1.1.1.1" > "$MAT/dns1"
     fi
-    log "tunnel routes ready (WAN default preserved; VIP=$_vip)"
+    setup_mss_clamp
+    setup_fast_dns
+    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS tuned)"
 }
 
 detect_vip() {
@@ -471,11 +534,17 @@ connections {
             id = ${_rid}
 ${_cacert_line}
         }
+        dpd_delay = 30s
         children {
             ${CONN} {
                 remote_ts = 0.0.0.0/0
                 esp_proposals = ${_esp}
                 start_action = none
+                rekey_time = 3600s
+                life_time = 7200s
+                replay_window = 256
+                # hardware/software AES-GCM path
+                mode = tunnel
             }
         }
     }
@@ -574,6 +643,20 @@ start_vpn() {
     log "start $VERSION (lockout-safe)"
     [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
     [ -s "$MAT/client.key" ] || prepare_material || return 1
+    # Refresh proposals each start (speed tune even if material already unpacked)
+    _ike=$(json_str "$PROFILE" ikeProposal)
+    [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
+    [ -z "$_ike" ] && _ike=$(cat "$MAT/ike" 2>/dev/null)
+    _esp=$(json_str "$PROFILE" espProposal)
+    [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
+    [ -z "$_esp" ] && _esp=$(cat "$MAT/esp" 2>/dev/null)
+    case "$_ike" in *curve25519*) ;; *)
+        _ike="aes128gcm16-prfsha256-curve25519,aes256-sha256-curve25519,${_ike:-aes256-sha256-modp2048}" ;;
+    esac
+    case "$_esp" in *gcm*) ;; *) _esp="aes128gcm16,${_esp:-aes128gcm16}" ;; esac
+    printf '%s' "$_ike" > "$MAT/ike"
+    printf '%s' "$_esp" > "$MAT/esp"
+    log "proposals ike=$_ike esp=$_esp"
     ensure_stack || return 1
     save_default_route
     arm_failsafe
@@ -653,11 +736,13 @@ stop_vpn() {
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
     clean_tunnel_nat
+    clean_mss
     clean_mangle
     clean_policy_routing
     stop_daemons
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
+    restore_dns
     restore_default_route
     echo "0" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
