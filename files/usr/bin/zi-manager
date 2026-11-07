@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi3"
+VERSION="2026.11.07-zi4"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -241,19 +241,29 @@ restore_default_route() {
     [ -f "$ROUTE_BAK" ] || return 0
     # shellcheck disable=SC1090
     . "$ROUTE_BAK" 2>/dev/null || true
-    if [ -n "${ZI_DEF_GW:-}" ] && [ -n "${ZI_DEF_DEV:-}" ]; then
+    [ -n "${ZI_DEF_DEV:-}" ] || return 0
+    if [ -n "${ZI_DEF_GW:-}" ]; then
         ip route replace default via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
             || ip route add default via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
         log "restored default via $ZI_DEF_GW dev $ZI_DEF_DEV"
+    else
+        # cellular often: default dev ccmniX (no via)
+        ip route replace default dev "$ZI_DEF_DEV" 2>/dev/null \
+            || ip route add default dev "$ZI_DEF_DEV" 2>/dev/null || true
+        log "restored default dev $ZI_DEF_DEV (no via)"
     fi
 }
 
 save_default_route() {
-    _gw=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-    _dev=$(ip -4 route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    _line=$(ip -4 route show default 2>/dev/null | head -n1)
+    _gw=$(echo "$_line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+    _dev=$(echo "$_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    # refuse bogus gw==dev (old bug when "default dev ccmni2")
+    [ "$_gw" = "$_dev" ] && _gw=""
+    [ "$_gw" = "dev" ] && _gw=""
     echo "ZI_DEF_GW='${_gw}'" > "$ROUTE_BAK"
     echo "ZI_DEF_DEV='${_dev}'" >> "$ROUTE_BAK"
-    log "saved default gw=${_gw:-?} dev=${_dev:-?}"
+    log "saved default gw=${_gw:-none} dev=${_dev:-?}"
 }
 
 emergency_flush() {
@@ -313,30 +323,35 @@ setup_tunnel_nat() {
     _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
     iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
-    # Never SNAT traffic to LAN / private / VPN server / link-local
+    # Skip SNAT only for real LAN ifaces + VPN server + loopback
+    # (Do NOT blanket-exclude all RFC1918 — that blocked nothing useful but
+    #  VIP must be used as SNAT source for public destinations.)
     lan_cidrs | while read -r _c; do
         [ -n "$_c" ] || continue
+        # skip VIP itself if listed
+        case "$_c" in
+            "$_vip"|"$_vip/32") continue ;;
+        esac
         iptables -t nat -A ZI_NAT -d "$_c" -j RETURN 2>/dev/null || true
     done
     [ -n "$_server" ] && iptables -t nat -A ZI_NAT -d "$_server" -j RETURN 2>/dev/null || true
-    for _n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16; do
+    for _n in 127.0.0.0/8 169.254.0.0/16; do
         iptables -t nat -A ZI_NAT -d "$_n" -j RETURN 2>/dev/null || true
     done
-    # Only mark/SNAT forwarded traffic (not router-local INPUT path)
     if [ -n "$_vip" ]; then
-        iptables -t nat -A ZI_NAT -m addrtype ! --src-type LOCAL -j SNAT --to-source "$_vip" 2>/dev/null \
-            || iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
-        log "tunnel NAT SNAT -> $_vip (LAN+server excepted)"
+        # SNAT LAN→Internet to IPsec VIP so XFRM policy (VIP/32===0.0.0.0/0) matches
+        iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
+        log "tunnel NAT SNAT -> $_vip (IPsec VIP)"
     else
         iptables -t nat -A ZI_NAT -j MASQUERADE
-        log "tunnel NAT MASQUERADE (no VIP yet)"
+        log "tunnel NAT MASQUERADE (ERROR: no VIP — sites will fail)"
     fi
     iptables -t nat -C POSTROUTING -j ZI_NAT 2>/dev/null \
         || iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
 }
 
 setup_tunnel_routes() {
-    # install_routes=no → XFRM policies + SNAT handle tunnel; keep main default for mgmt
+    _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
     clean_policy_routing
     clean_mangle
@@ -346,34 +361,59 @@ setup_tunnel_routes() {
     if [ -n "$_server" ] && [ -f "$ROUTE_BAK" ]; then
         # shellcheck disable=SC1090
         . "$ROUTE_BAK" 2>/dev/null || true
-        if [ -n "${ZI_DEF_GW:-}" ] && [ -n "${ZI_DEF_DEV:-}" ]; then
-            ip route replace "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
-                || ip route add "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
+        if [ -n "${ZI_DEF_DEV:-}" ]; then
+            if [ -n "${ZI_DEF_GW:-}" ]; then
+                ip route replace "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
+                    || ip route add "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
+            else
+                ip route replace "$_server"/32 dev "$ZI_DEF_DEV" 2>/dev/null \
+                    || ip route add "$_server"/32 dev "$ZI_DEF_DEV" 2>/dev/null || true
+            fi
         fi
     fi
-    log "tunnel routes ready (WAN default preserved; server pinned)"
+    # Ensure VIP is present (Amnezia usually installs on lo or a virt iface)
+    if [ -n "$_vip" ]; then
+        ip -4 addr show 2>/dev/null | grep -q "inet $_vip/" \
+            || ip addr add "$_vip/32" dev lo 2>/dev/null || true
+        printf '%s' "$_vip" > "$MAT/vip"
+    fi
+    # Prefer VPN DNS for router resolver (CPRP DNS often fails on OEM)
+    if [ ! -s "$MAT/dns1" ]; then
+        printf '%s\n' "1.1.1.1" > "$MAT/dns1"
+    fi
+    log "tunnel routes ready (WAN default preserved; VIP=$_vip)"
+}
+
+detect_vip() {
+    prefer_bins
+    _v=""
+    # 1) Amnezia typical VIP pool
+    _v=$(ip -4 addr show 2>/dev/null | awk '$1=="inet" {
+        split($2,a,"/"); if (a[1] ~ /^192\.168\.43\./) { print a[1]; exit }
+    }')
+    # 2) swanctl CHILD_SA local TS x.x.x.x/32 === 0.0.0.0/0
+    if [ -z "$_v" ]; then
+        _v=$(swanctl --list-sas 2>/dev/null | awk '
+            /\/32 === 0\.0\.0\.0\/0/ {
+                for (i=1;i<=NF;i++) {
+                    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/32$/) {
+                        split($i,a,"/"); print a[1]; exit
+                    }
+                }
+            }')
+    fi
+    # 3) any "installing new virtual IP" leftover — parse list-sas for 192.168.43
+    if [ -z "$_v" ]; then
+        _v=$(swanctl --list-sas 2>/dev/null | sed -n 's/.*\(192\.168\.43\.[0-9][0-9]*\).*/\1/p' | head -n1)
+    fi
+    # 4) NEVER use cellular WAN (26.x / public) as VIP — that was the bug
+    echo "$_v"
 }
 
 clean_mangle() {
     iptables -t mangle -D FORWARD -j ZI_MARK 2>/dev/null || true
     iptables -t mangle -F ZI_MARK 2>/dev/null || true
     iptables -t mangle -X ZI_MARK 2>/dev/null || true
-}
-
-detect_vip() {
-    _v=""
-    _v=$(ip -4 addr show 2>/dev/null | awk '/inet / {
-        split($2,a,"/"); ip=a[1]
-        if (ip !~ /^127\./ && ip !~ /^192\.168\./ && ip !~ /^10\./ && ip !~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./)
-            { print ip; exit }
-    }')
-    # also from swanctl list-sas
-    if [ -z "$_v" ]; then
-        _v=$(swanctl --list-sas 2>/dev/null | awk '/[[:space:]][0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[/]/ {
-            for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) { print $i; exit }
-        }')
-    fi
-    echo "$_v"
 }
 
 is_up() {
@@ -576,6 +616,13 @@ start_vpn() {
         return 1
     fi
     _vip=$(detect_vip)
+    if [ -z "$_vip" ]; then
+        log "ERROR: could not detect IPsec VIP (want 192.168.43.x) — refusing bad SNAT"
+        swan --list-sas >>"$LOG" 2>&1 || true
+        ip -4 addr >>"$LOG" 2>&1 || true
+        emergency_flush
+        return 1
+    fi
     setup_tunnel_nat "$_vip"
     setup_tunnel_routes "$_vip"
     if ! lan_self_ok; then
@@ -583,10 +630,18 @@ start_vpn() {
         emergency_flush
         return 1
     fi
+    # Prove tunnel data path before keeping it
+    _t=$(ping_target)
+    if ping -I "$_vip" -c 2 -W 5 "$_t" >/dev/null 2>&1; then
+        log "tunnel ping OK via VIP $_vip -> $_t"
+        confirm_tunnel
+    else
+        log "WARN: tunnel ping via VIP failed (DNS/path) — check SNAT/XFRM; still up for confirm"
+    fi
     echo "1" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
-    log "IPsec ESTABLISHED vip=${_vip:-none}"
-    log "TIP: run 'zi-manager confirm' within ${FAILSAFE_SECS}s to keep tunnel (else auto-stop)"
+    log "IPsec ESTABLISHED vip=$_vip"
+    log "TIP: if sites work, click Confirm (or: zi-manager confirm) within ${FAILSAFE_SECS}s"
     start_watchdog
     return 0
 }
@@ -633,13 +688,16 @@ watchdog_loop() {
             exit 0
         fi
         _t=$(ping_target)
-        if ping -c 1 -W 5 "$_t" >/dev/null 2>&1; then
+        _vip=$(cat "$MAT/vip" 2>/dev/null)
+        if [ -n "$_vip" ] && ping -I "$_vip" -c 1 -W 5 "$_t" >/dev/null 2>&1; then
+            echo "0" > "$FAIL_FILE"
+        elif [ -z "$_vip" ] && ping -c 1 -W 5 "$_t" >/dev/null 2>&1; then
             echo "0" > "$FAIL_FILE"
         else
             _f=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
             _f=$((_f + 1))
             echo "$_f" > "$FAIL_FILE"
-            log "watchdog: ping $_t fail $_f/$PING_FAILS"
+            log "watchdog: ping $_t via ${_vip:-wan} fail $_f/$PING_FAILS"
             if [ "$_f" -ge "$PING_FAILS" ]; then
                 log "watchdog: $PING_FAILS ping fails — emergency flush → WAN"
                 emergency_flush
