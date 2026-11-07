@@ -82,6 +82,30 @@
 	</div>
 
 	<div class="cbi-section">
+		<h3>Exclude domains from tunnel</h3>
+		<div class="cbi-section-node">
+			<p style="margin:0 0 8px">These domains use normal WAN (not VPN). Add hostnames like <code>youtube.com</code>, <code>instagram.com</code>.</p>
+			<table class="table">
+				<tr>
+					<td class="td" style="width:32%">Domain</td>
+					<td class="td">
+						<input id="zi_bypass_domain" type="text" style="width:70%" placeholder="example.com" />
+						<button class="cbi-button cbi-button-add" id="zi_btn_bypass_add" type="button">Add</button>
+					</td>
+				</tr>
+			</table>
+			<p style="margin:8px 0 4px"><strong>Excluded domains</strong></p>
+			<pre id="zi_bypass_domains" style="max-height:120px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px">(none)</pre>
+			<p style="margin:8px 0 4px"><strong>Resolved IPs (via WAN)</strong></p>
+			<pre id="zi_bypass_ips" style="max-height:120px;overflow:auto;background:#111;color:#ccc;padding:8px;white-space:pre-wrap;font-size:12px">(none)</pre>
+			<div class="cbi-page-actions">
+				<button class="cbi-button cbi-button-action" id="zi_btn_bypass_refresh" type="button">Refresh list</button>
+			</div>
+			<p style="opacity:0.75;margin-top:6px">Tip: for CDNs add both apex and www (e.g. <code>youtube.com</code> and <code>www.youtube.com</code>). IPs refresh while tunnel is up.</p>
+		</div>
+	</div>
+
+	<div class="cbi-section">
 		<h3>Security associations</h3>
 		<div class="cbi-section-node">
 			<div class="cbi-page-actions">
@@ -154,6 +178,7 @@
 			document.getElementById("zi_build").textContent =
 				"API v" + (data.api_version || "?") + " / " + (data.manager_version || "?");
 			document.getElementById("zi_conf").textContent = data.conf_preview || "(no profile yet)";
+			zi_render_bypass(data);
 		});
 	}
 
@@ -169,10 +194,59 @@
 			document.getElementById("zi_sa").textContent = (data && data.sa) ? data.sa : "(no SA / swanctl unavailable)";
 		});
 	}
+	function zi_render_bypass(data) {
+		var dom = (data && data.bypass_domains != null) ? data.bypass_domains : ((data && data.domains) || "");
+		var ips = (data && data.bypass_ips != null) ? data.bypass_ips : ((data && data.ips) || "");
+		var elD = document.getElementById("zi_bypass_domains");
+		var elI = document.getElementById("zi_bypass_ips");
+		if (elD) {
+			elD.textContent = dom ? dom : "(none)";
+			elD.onclick = function(ev) {
+				var t = (ev.target && (ev.target.textContent || "")) || "";
+				/* click a line to delete: use prompt via button instead */
+			};
+		}
+		if (elI) elI.textContent = ips ? ips : "(none)";
+		/* build clickable delete list */
+		if (elD && dom) {
+			var lines = String(dom).split(/\n/);
+			elD.innerHTML = "";
+			for (var i = 0; i < lines.length; i++) {
+				var d = lines[i].replace(/^\s+|\s+$/g, "");
+				if (!d || d.charAt(0) === "#") continue;
+				var row = document.createElement("div");
+				row.style.marginBottom = "4px";
+				var sp = document.createElement("span");
+				sp.textContent = d + " ";
+				var btn = document.createElement("button");
+				btn.type = "button";
+				btn.className = "cbi-button cbi-button-remove";
+				btn.textContent = "Remove";
+				btn.setAttribute("data-domain", d);
+				btn.onclick = function() {
+					var dd = this.getAttribute("data-domain");
+					zi_api("bypass_del", { domain: dd }, function(r) {
+						if (r && r.ok) { zi_msg(true, "Removed " + dd); zi_refresh_bypass(); }
+						else zi_msg(false, (r && r.error) || "remove failed");
+					}, true);
+				};
+				row.appendChild(sp);
+				row.appendChild(btn);
+				elD.appendChild(row);
+			}
+			if (!elD.childNodes.length) elD.textContent = "(none)";
+		}
+	}
+	function zi_refresh_bypass() {
+		zi_api("bypass_list", null, function(data) {
+			zi_render_bypass(data || {});
+		});
+	}
 	function zi_refresh_all() {
 		zi_refresh_status();
 		zi_refresh_log();
 		zi_refresh_sa();
+		zi_refresh_bypass();
 	}
 	function zi_after_start() {
 		zi_msg(true, "Connecting… then click Confirm within 90s");
@@ -295,6 +369,18 @@
 	document.getElementById("zi_btn_save").onclick = function() { zi_save(false); };
 	document.getElementById("zi_btn_save_connect").onclick = function() { zi_save(true); };
 	document.getElementById("zi_btn_sa").onclick = zi_refresh_sa;
+	document.getElementById("zi_btn_bypass_refresh").onclick = zi_refresh_bypass;
+	document.getElementById("zi_btn_bypass_add").onclick = function() {
+		var d = document.getElementById("zi_bypass_domain").value.replace(/^\s+|\s+$/g, "");
+		if (!d) { zi_msg(false, "enter a domain"); return; }
+		zi_api("bypass_add", { domain: d }, function(r) {
+			if (r && r.ok) {
+				zi_msg(true, "Excluded " + d);
+				document.getElementById("zi_bypass_domain").value = "";
+				zi_refresh_bypass();
+			} else zi_msg(false, (r && r.error) || "add failed");
+		}, true);
+	};
 	document.getElementById("zi_btn_check").onclick = function() {
 		zi_api("ss_check", null, function(data) {
 			document.getElementById("zi_check").textContent = (data && data.check) || "(empty)";

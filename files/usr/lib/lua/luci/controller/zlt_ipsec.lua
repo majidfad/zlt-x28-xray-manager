@@ -1,7 +1,7 @@
 -- LuCI controller for ZLT IPsec (zi-manager)
 module("luci.controller.zlt_ipsec", package.seeall)
 
-local ZI_API_VERSION = 2
+local ZI_API_VERSION = 3
 
 function index()
     entry({"admin", "services", "zlt_ipsec"}, template("zlt_ipsec_panel"), _("ZLT IPsec"), 60).dependent = false
@@ -17,7 +17,11 @@ function index()
     entry({"admin", "services", "zlt_ipsec", "sa"}, call("action_sa")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "confirm"}, call("action_confirm")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "emergency"}, call("action_emergency")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "bypass_list"}, call("action_bypass_list")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "bypass_add"}, call("action_bypass_add")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "bypass_del"}, call("action_bypass_del")).leaf = true
 end
+
 
 
 local function run(cmd)
@@ -121,11 +125,54 @@ function action_status()
         stack_root = read_file("/etc/zlt-ipsec/stack.root"),
         stack_ver = read_file("/etc/zlt-ipsec/stack.ver"),
         conf_preview = conf,
+        bypass_domains = read_file("/etc/zlt-ipsec/bypass_domains"),
+        bypass_ips = read_file("/tmp/zi_bypass_ips"),
         api_version = ZI_API_VERSION,
         manager_version = ver,
         manager_path = m
     })
 end
+
+function action_bypass_list()
+    local m = mgr()
+    local out = run(m .. " bypass-list")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({
+        ok = true,
+        domains = read_file("/etc/zlt-ipsec/bypass_domains"),
+        ips = read_file("/tmp/zi_bypass_ips"),
+        detail = out
+    })
+end
+
+function action_bypass_add()
+    local domain = luci.http.formvalue("domain") or ""
+    domain = domain:gsub("^%s+", ""):gsub("%s+$", "")
+    if domain == "" then
+        luci.http.prepare_content("application/json")
+        luci.http.write_json({ ok = false, error = "empty domain" })
+        return
+    end
+    local m = mgr()
+    local out = run(m .. " bypass-add " .. shq(domain))
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true, detail = out })
+end
+
+function action_bypass_del()
+    local domain = luci.http.formvalue("domain") or ""
+    domain = domain:gsub("^%s+", ""):gsub("%s+$", "")
+    if domain == "" then
+        luci.http.prepare_content("application/json")
+        luci.http.write_json({ ok = false, error = "empty domain" })
+        return
+    end
+    local m = mgr()
+    local out = run(m .. " bypass-del " .. shq(domain))
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true, detail = out })
+end
+
 
 function action_sa()
     local sa = run("PATH=/tmp/zi-bin:$PATH swanctl --list-sas 2>/dev/null")

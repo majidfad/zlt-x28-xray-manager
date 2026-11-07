@@ -3,12 +3,14 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6"
+VERSION="2026.11.07-zi6b"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
 STATE_FILE="$DIR/active"          # 1 = tunnel desired (manual); boot needs autostart file
 FAIL_FILE="$DIR/ping_fails"
+BYPASS_DOMAINS="$DIR/bypass_domains"   # one domain per line (excluded from tunnel)
+BYPASS_IPS="/tmp/zi_bypass_ips"        # resolved IPs currently excluded
 LOG="/var/log/zlt-ipsec.log"
 PID_WD="/var/run/zi_watchdog.pid"
 PID_FS="/var/run/zi_failsafe.pid"
@@ -26,6 +28,7 @@ log() { echo "[zi] $*" | tee -a "$LOG" 2>/dev/null; echo "[System] $*" >> "$LOG"
 ensure_dirs() {
     mkdir -p "$DIR" "$MAT" /tmp/zi-bin /var/run 2>/dev/null || true
     : >> "$LOG" 2>/dev/null || true
+    [ -f "$BYPASS_DOMAINS" ] || : > "$BYPASS_DOMAINS"
 }
 
 prefer_bins() {
@@ -304,6 +307,8 @@ emergency_flush() {
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
     clean_tunnel_nat
+    clean_bypass 2>/dev/null || true
+    iptables -t nat -X ZI_BYPASS 2>/dev/null || true
     clean_mss
     clean_mangle
     clean_policy_routing
@@ -311,7 +316,7 @@ emergency_flush() {
     restore_default_route
     echo "0" > "$STATE_FILE" 2>/dev/null || true
     echo "0" > "$FAIL_FILE" 2>/dev/null || true
-    log "EMERGENCY FLUSH done — management access should work"
+    log "EMERGENCY FLUSH done - management access should work"
 }
 
 lan_cidrs() {
@@ -344,17 +349,153 @@ EOF
     echo "$_csv"
 }
 
+clean_bypass() {
+    iptables -t nat -F ZI_BYPASS 2>/dev/null || true
+    if [ -f "$BYPASS_IPS" ]; then
+        while read -r _ip; do
+            [ -n "$_ip" ] || continue
+            ip route del "$_ip"/32 2>/dev/null || true
+        done < "$BYPASS_IPS"
+    fi
+    : > "$BYPASS_IPS"
+}
+
+normalize_domain() {
+    echo "$1" | tr 'A-Z' 'a-z' | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's|^https\{0,1\}://||' -e 's|/.*||' -e 's/^\*\.//'
+}
+
+resolve_domain_ips() {
+    _d="$1"
+    _ips=""
+    # busybox nslookup / ping / getent — collect A records
+    if command -v nslookup >/dev/null 2>&1; then
+        _ips=$(nslookup "$_d" 1.1.1.1 2>/dev/null | awk '/^Address/ {print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        [ -n "$_ips" ] || _ips=$(nslookup "$_d" 2>/dev/null | awk '/^Address/ {print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+    if [ -z "$_ips" ] && command -v resolveip >/dev/null 2>&1; then
+        _ips=$(resolveip -4 "$_d" 2>/dev/null)
+    fi
+    if [ -z "$_ips" ]; then
+        # last resort: ping once (resolves via libc)
+        _ips=$(ping -c 1 -W 2 "$_d" 2>/dev/null | sed -n 's/.*(\([0-9.]*\)).*/\1/p' | head -n1)
+    fi
+    echo "$_ips" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u
+}
+
+wan_route_to() {
+    _ip="$1"
+    [ -n "$_ip" ] || return 0
+    [ -f "$ROUTE_BAK" ] || return 0
+    # shellcheck disable=SC1090
+    . "$ROUTE_BAK" 2>/dev/null || true
+    [ -n "${ZI_DEF_DEV:-}" ] || return 0
+    if [ -n "${ZI_DEF_GW:-}" ]; then
+        ip route replace "$_ip"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
+            || ip route add "$_ip"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
+    else
+        ip route replace "$_ip"/32 dev "$ZI_DEF_DEV" 2>/dev/null \
+            || ip route add "$_ip"/32 dev "$ZI_DEF_DEV" 2>/dev/null || true
+    fi
+}
+
+apply_bypass() {
+    # Resolve bypass domains -> host routes via WAN + NAT RETURN (no VIP SNAT)
+    # Without SNAT-to-VIP, packets keep LAN source and miss XFRM VIP/32 policy = go via WAN.
+    ensure_dirs
+    iptables -t nat -N ZI_BYPASS 2>/dev/null || iptables -t nat -F ZI_BYPASS
+    # wipe old IP routes then rebuild
+    if [ -f "$BYPASS_IPS" ]; then
+        while read -r _ip; do
+            [ -n "$_ip" ] || continue
+            ip route del "$_ip"/32 2>/dev/null || true
+        done < "$BYPASS_IPS"
+    fi
+    : > "$BYPASS_IPS"
+    iptables -t nat -F ZI_BYPASS 2>/dev/null || true
+
+    [ -s "$BYPASS_DOMAINS" ] || { log "bypass: no domains"; return 0; }
+
+    _n=0
+    while read -r _raw; do
+        _d=$(normalize_domain "$_raw")
+        [ -n "$_d" ] || continue
+        case "$_d" in \#*) continue ;; esac
+        resolve_domain_ips "$_d" | while read -r _ip; do
+            [ -n "$_ip" ] || continue
+            echo "$_ip" >> "$BYPASS_IPS"
+            wan_route_to "$_ip"
+            iptables -t nat -C ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null \
+                || iptables -t nat -A ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null || true
+            _n=$((_n + 1))
+        done
+        log "bypass domain=$_d"
+    done < "$BYPASS_DOMAINS"
+
+    # de-dup ips file
+    if [ -s "$BYPASS_IPS" ]; then
+        sort -u "$BYPASS_IPS" -o "$BYPASS_IPS"
+        _cnt=$(wc -l < "$BYPASS_IPS" | tr -d ' ')
+        log "bypass active: $_cnt IP(s) via WAN (domains excluded from tunnel)"
+    else
+        log "bypass: domains set but no IPs resolved yet"
+    fi
+}
+
+bypass_add() {
+    ensure_dirs
+    _d=$(normalize_domain "$1")
+    [ -n "$_d" ] || { echo "Usage: zi-manager bypass-add <domain>"; return 1; }
+    if grep -qxF "$_d" "$BYPASS_DOMAINS" 2>/dev/null; then
+        echo "already: $_d"
+    else
+        echo "$_d" >> "$BYPASS_DOMAINS"
+        log "bypass-add $_d"
+        echo "added: $_d"
+    fi
+    # hot-apply if tunnel up
+    if is_up 2>/dev/null; then
+        apply_bypass
+        # ensure ZI_NAT jumps to bypass first
+        iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
+            || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
+    fi
+}
+
+bypass_del() {
+    ensure_dirs
+    _d=$(normalize_domain "$1")
+    [ -n "$_d" ] || { echo "Usage: zi-manager bypass-del <domain>"; return 1; }
+    if [ -f "$BYPASS_DOMAINS" ]; then
+        grep -vxF "$_d" "$BYPASS_DOMAINS" > "$BYPASS_DOMAINS.tmp" 2>/dev/null || true
+        mv -f "$BYPASS_DOMAINS.tmp" "$BYPASS_DOMAINS"
+    fi
+    log "bypass-del $_d"
+    echo "removed: $_d"
+    is_up 2>/dev/null && apply_bypass
+    iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
+        || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
+}
+
+bypass_list() {
+    ensure_dirs
+    echo "=== bypass domains ==="
+    if [ -s "$BYPASS_DOMAINS" ]; then cat "$BYPASS_DOMAINS"; else echo "(none)"; fi
+    echo "=== resolved IPs (WAN) ==="
+    if [ -s "$BYPASS_IPS" ]; then cat "$BYPASS_IPS"; else echo "(none)"; fi
+}
+
 setup_tunnel_nat() {
     clean_tunnel_nat
     _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
     iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
+    iptables -t nat -N ZI_BYPASS 2>/dev/null || iptables -t nat -F ZI_BYPASS
+    # Domain bypass first (no SNAT to VIP -> stays off tunnel)
+    iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
     # Skip SNAT only for real LAN ifaces + VPN server + loopback
-    # (Do NOT blanket-exclude all RFC1918 — that blocked nothing useful but
-    #  VIP must be used as SNAT source for public destinations.)
     lan_cidrs | while read -r _c; do
         [ -n "$_c" ] || continue
-        # skip VIP itself if listed
         case "$_c" in
             "$_vip"|"$_vip/32") continue ;;
         esac
@@ -365,12 +506,11 @@ setup_tunnel_nat() {
         iptables -t nat -A ZI_NAT -d "$_n" -j RETURN 2>/dev/null || true
     done
     if [ -n "$_vip" ]; then
-        # SNAT LAN→Internet to IPsec VIP so XFRM policy (VIP/32===0.0.0.0/0) matches
         iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
         log "tunnel NAT SNAT -> $_vip (IPsec VIP)"
     else
         iptables -t nat -A ZI_NAT -j MASQUERADE
-        log "tunnel NAT MASQUERADE (ERROR: no VIP — sites will fail)"
+        log "tunnel NAT MASQUERADE (ERROR: no VIP - sites will fail)"
     fi
     iptables -t nat -C POSTROUTING -j ZI_NAT 2>/dev/null \
         || iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
@@ -443,7 +583,8 @@ setup_tunnel_routes() {
     fi
     setup_mss_clamp
     setup_fast_dns
-    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS tuned)"
+    apply_bypass
+    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS+bypass)"
 }
 
 detect_vip() {
@@ -741,6 +882,8 @@ stop_vpn() {
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
     clean_tunnel_nat
+    clean_bypass
+    iptables -t nat -X ZI_BYPASS 2>/dev/null || true
     clean_mss
     clean_mangle
     clean_policy_routing
@@ -777,6 +920,10 @@ watchdog_loop() {
             emergency_flush
             exit 0
         fi
+        # refresh domain bypass IPs (CDNs change)
+        apply_bypass >/dev/null 2>&1 || true
+        iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
+            || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
         _t=$(ping_target)
         _vip=$(cat "$MAT/vip" 2>/dev/null)
         if [ -n "$_vip" ] && ping -I "$_vip" -c 1 -W 5 "$_t" >/dev/null 2>&1; then
@@ -789,7 +936,7 @@ watchdog_loop() {
             echo "$_f" > "$FAIL_FILE"
             log "watchdog: ping $_t via ${_vip:-wan} fail $_f/$PING_FAILS"
             if [ "$_f" -ge "$PING_FAILS" ]; then
-                log "watchdog: $PING_FAILS ping fails — emergency flush → WAN"
+                log "watchdog: $PING_FAILS ping fails - emergency flush -> WAN"
                 emergency_flush
                 exit 0
             fi
@@ -876,6 +1023,10 @@ case "$1" in
     restart) stop_vpn; sleep 1; start_vpn ;;
     status) status ;;
     ss_check|check) ss_check ;;
+    bypass-add) shift; bypass_add "$@" ;;
+    bypass-del) shift; bypass_del "$@" ;;
+    bypass-list) bypass_list ;;
+    bypass-apply) ensure_dirs; apply_bypass ;;
     import)
         [ -n "$2" ] || { echo "Usage: zi-manager import <file>"; exit 1; }
         import_profile "$2"
@@ -885,7 +1036,7 @@ case "$1" in
     watchdog) watchdog_loop ;;
     boot) boot_start ;;
     *)
-        echo "Usage: zi-manager {start|stop|emergency|confirm|autostart-on|autostart-off|restart|status|ss_check|import|version|boot}"
+        echo "Usage: zi-manager {start|stop|emergency|confirm|bypass-add|bypass-del|bypass-list|autostart-on|autostart-off|restart|status|ss_check|import|version|boot}"
         exit 1
         ;;
 esac
