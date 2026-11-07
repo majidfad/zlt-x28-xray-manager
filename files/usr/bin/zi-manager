@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6c"
+VERSION="2026.11.07-zi6d"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -308,8 +308,9 @@ emergency_flush() {
     sleep 1
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
-    clean_tunnel_nat
     clean_bypass 2>/dev/null || true
+    clean_tunnel_nat
+    iptables -t nat -F ZI_BYPASS 2>/dev/null || true
     iptables -t nat -X ZI_BYPASS 2>/dev/null || true
     clean_mss
     clean_mangle
@@ -351,11 +352,50 @@ EOF
     echo "$_csv"
 }
 
+xfrm_bypass_del() {
+    _ip="$1"
+    _vip="$2"
+    [ -n "$_ip" ] || return 0
+    if [ -n "$_vip" ]; then
+        ip xfrm policy delete dir out src "$_vip/32" dst "$_ip/32" 2>/dev/null || true
+        ip xfrm policy delete dir fwd src "$_vip/32" dst "$_ip/32" 2>/dev/null || true
+        ip xfrm policy delete dir in  src "$_ip/32" dst "$_vip/32" 2>/dev/null || true
+        ip xfrm policy delete dir fwd src "$_ip/32" dst "$_vip/32" 2>/dev/null || true
+    fi
+    # also clear any src-any bypass we may have installed
+    ip xfrm policy delete dir out src 0.0.0.0/0 dst "$_ip/32" 2>/dev/null || true
+    ip xfrm policy delete dir fwd src 0.0.0.0/0 dst "$_ip/32" 2>/dev/null || true
+}
+
+xfrm_bypass_add() {
+    _ip="$1"
+    _vip="$2"
+    [ -n "$_ip" ] || return 0
+    # High-priority cleartext: even if SNAT-to-VIP already happened, skip ESP
+    if [ -n "$_vip" ]; then
+        ip xfrm policy add dir out src "$_vip/32" dst "$_ip/32" priority 100 action bypass 2>/dev/null \
+            || ip xfrm policy update dir out src "$_vip/32" dst "$_ip/32" priority 100 action bypass 2>/dev/null || true
+        ip xfrm policy add dir fwd src "$_vip/32" dst "$_ip/32" priority 100 action bypass 2>/dev/null \
+            || ip xfrm policy update dir fwd src "$_vip/32" dst "$_ip/32" priority 100 action bypass 2>/dev/null || true
+        ip xfrm policy add dir in src "$_ip/32" dst "$_vip/32" priority 100 action bypass 2>/dev/null \
+            || ip xfrm policy update dir in src "$_ip/32" dst "$_vip/32" priority 100 action bypass 2>/dev/null || true
+    fi
+    ip xfrm policy add dir out src 0.0.0.0/0 dst "$_ip/32" priority 100 action bypass 2>/dev/null \
+        || ip xfrm policy update dir out src 0.0.0.0/0 dst "$_ip/32" priority 100 action bypass 2>/dev/null || true
+    ip xfrm policy add dir fwd src 0.0.0.0/0 dst "$_ip/32" priority 100 action bypass 2>/dev/null \
+        || ip xfrm policy update dir fwd src 0.0.0.0/0 dst "$_ip/32" priority 100 action bypass 2>/dev/null || true
+}
+
 clean_bypass() {
+    _vip=$(cat "$MAT/vip" 2>/dev/null)
     iptables -t nat -F ZI_BYPASS 2>/dev/null || true
     if [ -f "$BYPASS_IPS" ]; then
         while read -r _ip; do
             [ -n "$_ip" ] || continue
+            # must be direct rule on ZI_NAT (subchain RETURN was a no-op — still hit SNAT)
+            iptables -t nat -D ZI_NAT -d "$_ip" -j RETURN 2>/dev/null || true
+            iptables -t nat -D ZI_NAT -d "$_ip/32" -j RETURN 2>/dev/null || true
+            xfrm_bypass_del "$_ip" "$_vip"
             ip route del "$_ip"/32 2>/dev/null || true
         done < "$BYPASS_IPS"
     fi
@@ -414,56 +454,59 @@ wan_route_to() {
     fi
 }
 
-ensure_bypass_nat_hook() {
-    iptables -t nat -N ZI_BYPASS 2>/dev/null || true
-    if iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null; then
-        return 0
-    fi
-    iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
-}
-
 apply_bypass() {
-    # Resolve bypass domains -> host routes via WAN + NAT RETURN (no VIP SNAT)
-    # Without SNAT-to-VIP, packets keep LAN source and miss XFRM VIP/32 policy = go via WAN.
-    # Never touch the VPN server IP — that would break IKE.
+    # Exclude domains from tunnel:
+    #  1) ZI_NAT -d IP -j RETURN  → skip VIP SNAT, fall through to OpenWrt WAN MASQUERADE
+    #     (NOTE: RETURN inside a subchain does NOT skip SNAT — that was the zi6b/c bug)
+    #  2) host /32 via WAN
+    #  3) xfrm policy action bypass (covers packets already SNATed to VIP)
     ensure_dirs
-    iptables -t nat -N ZI_BYPASS 2>/dev/null || true
-    if [ -f "$BYPASS_IPS" ]; then
-        while read -r _ip; do
-            [ -n "$_ip" ] || continue
-            ip route del "$_ip"/32 2>/dev/null || true
-        done < "$BYPASS_IPS"
-    fi
-    : > "$BYPASS_IPS"
-    iptables -t nat -F ZI_BYPASS 2>/dev/null || true
+    clean_bypass
 
     [ -s "$BYPASS_DOMAINS" ] || { log "bypass: no domains"; return 0; }
 
+    # ZI_NAT must exist (tunnel up). If not, only remember domains for next connect.
+    if ! iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
+        log "bypass: ZI_NAT missing (tunnel not up) — domains saved only"
+        return 0
+    fi
+
     _server=$(cat "$MAT/host" 2>/dev/null)
+    _vip=$(cat "$MAT/vip" 2>/dev/null)
+    : > "$BYPASS_IPS"
+
     while read -r _raw; do
         _d=$(normalize_domain "$_raw")
         [ -n "$_d" ] || continue
         case "$_d" in \#*) continue ;; esac
-        resolve_domain_ips "$_d" | while read -r _ip; do
+        # collect IPs without pipe-subshell losing count
+        _resolved=$(resolve_domain_ips "$_d")
+        if [ -z "$_resolved" ]; then
+            log "bypass domain=$_d (no A record yet)"
+            continue
+        fi
+        echo "$_resolved" | while read -r _ip; do
             [ -n "$_ip" ] || continue
-            # never bypass-route the IKE peer itself
             [ -n "$_server" ] && [ "$_ip" = "$_server" ] && continue
             echo "$_ip" >> "$BYPASS_IPS"
             wan_route_to "$_ip"
-            iptables -t nat -C ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null \
-                || iptables -t nat -A ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null || true
+            # Direct rule on ZI_NAT — RETURN exits ZI_NAT back to POSTROUTING (WAN MASQ runs)
+            iptables -t nat -C ZI_NAT -d "$_ip" -j RETURN 2>/dev/null \
+                || iptables -t nat -I ZI_NAT 1 -d "$_ip" -j RETURN 2>/dev/null || true
+            xfrm_bypass_add "$_ip" "$_vip"
+            # drop sticky conntrack that still SNATs to VIP
+            command -v conntrack >/dev/null 2>&1 && conntrack -D -d "$_ip" 2>/dev/null || true
         done
-        log "bypass domain=$_d"
+        log "bypass domain=$_d ips=$(echo $_resolved | tr '\n' ' ')"
     done < "$BYPASS_DOMAINS"
 
     if [ -s "$BYPASS_IPS" ]; then
         sort -u "$BYPASS_IPS" -o "$BYPASS_IPS"
         _cnt=$(wc -l < "$BYPASS_IPS" | tr -d ' ')
-        log "bypass active: $_cnt IP(s) via WAN (domains excluded from tunnel)"
+        log "bypass active: $_cnt IP(s) via WAN + xfrm bypass (excluded from tunnel)"
     else
         log "bypass: domains set but no IPs resolved yet"
     fi
-    ensure_bypass_nat_hook
 }
 
 bypass_add() {
@@ -506,6 +549,10 @@ bypass_list() {
     if [ -s "$BYPASS_DOMAINS" ]; then cat "$BYPASS_DOMAINS"; else echo "(none)"; fi
     echo "=== resolved IPs (WAN) ==="
     if [ -s "$BYPASS_IPS" ]; then cat "$BYPASS_IPS"; else echo "(none)"; fi
+    echo "=== ZI_NAT bypass RETURN rules ==="
+    iptables -t nat -S ZI_NAT 2>/dev/null | grep -E ' -d .* -j RETURN' || echo "(none)"
+    echo "=== xfrm bypass policies ==="
+    ip xfrm policy 2>/dev/null | awk '/action bypass/{print; for(i=0;i<3;i++){if(getline>0)print}}' || echo "(none)"
 }
 
 setup_tunnel_nat() {
@@ -513,10 +560,8 @@ setup_tunnel_nat() {
     _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
     iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
-    iptables -t nat -N ZI_BYPASS 2>/dev/null || iptables -t nat -F ZI_BYPASS
-    # Domain bypass first (no SNAT to VIP -> stays off tunnel)
-    iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
-    # Skip SNAT only for real LAN ifaces + VPN server + loopback
+    # Skip SNAT for LAN + VPN server + loopback
+    # (per-domain bypass RETURN rules are inserted at top by apply_bypass)
     lan_cidrs | while read -r _c; do
         [ -n "$_c" ] || continue
         case "$_c" in
@@ -945,8 +990,9 @@ stop_vpn() {
     cancel_failsafe
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
-    clean_tunnel_nat
     clean_bypass
+    clean_tunnel_nat
+    iptables -t nat -F ZI_BYPASS 2>/dev/null || true
     iptables -t nat -X ZI_BYPASS 2>/dev/null || true
     clean_mss
     clean_mangle
@@ -986,8 +1032,6 @@ watchdog_loop() {
         fi
         # refresh domain bypass IPs (CDNs change)
         apply_bypass >/dev/null 2>&1 || true
-        iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
-            || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
         _t=$(ping_target)
         _vip=$(cat "$MAT/vip" 2>/dev/null)
         if [ -n "$_vip" ] && ping -I "$_vip" -c 1 -W 5 "$_t" >/dev/null 2>&1; then
