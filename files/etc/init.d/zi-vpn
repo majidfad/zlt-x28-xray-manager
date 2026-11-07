@@ -1,10 +1,15 @@
 #!/bin/sh /etc/rc.common
-# Remount stack bind, then restore IPsec tunnel if previously active.
+# Late boot: remount stack. VPN autostart ONLY if /data/zlt-ipsec/autostart exists.
 START=95
 STOP=10
 
 start() {
+    /etc/init.d/zi-safe start 2>/dev/null || true
     /etc/init.d/zi-swan-bind start 2>/dev/null || true
+    # Refuse silent autostart — lockout safety
+    if [ ! -f /data/zlt-ipsec/autostart ] && [ ! -f /etc/zlt-ipsec/autostart ]; then
+        return 0
+    fi
     if [ -x /data/zi-bin/zi-manager ]; then
         /data/zi-bin/zi-manager boot >/dev/null 2>&1 &
     elif [ -x /usr/bin/zi-manager ]; then
@@ -14,8 +19,8 @@ start() {
 
 stop() {
     if [ -x /data/zi-bin/zi-manager ]; then
-        /data/zi-bin/zi-manager stop
+        /data/zi-bin/zi-manager emergency
     elif [ -x /usr/bin/zi-manager ]; then
-        /usr/bin/zi-manager stop
+        /usr/bin/zi-manager emergency
     fi
 }

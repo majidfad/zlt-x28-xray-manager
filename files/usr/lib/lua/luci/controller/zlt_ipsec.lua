@@ -15,7 +15,10 @@ function index()
     entry({"admin", "services", "zlt_ipsec", "log"}, call("action_log")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "ss_check"}, call("action_ss_check")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "sa"}, call("action_sa")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "confirm"}, call("action_confirm")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "emergency"}, call("action_emergency")).leaf = true
 end
+
 
 local function run(cmd)
     local f = io.popen(cmd .. " 2>/dev/null")
@@ -137,12 +140,30 @@ function action_start()
     local m = mgr()
     run(m .. " start >/tmp/zi_start.log 2>&1 &")
     luci.http.prepare_content("application/json")
-    luci.http.write_json({ ok = true })
+    luci.http.write_json({
+        ok = true,
+        failsafe_sec = 90,
+        tip = "Click Confirm within 90s or tunnel auto-stops (LAN protection)"
+    })
 end
 
 function action_stop()
     local m = mgr()
-    run(m .. " stop >/dev/null 2>&1")
+    run(m .. " emergency >/dev/null 2>&1")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_confirm()
+    local m = mgr()
+    run(m .. " confirm >/dev/null 2>&1")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_emergency()
+    local m = mgr()
+    run(m .. " emergency >/dev/null 2>&1")
     luci.http.prepare_content("application/json")
     luci.http.write_json({ ok = true })
 end

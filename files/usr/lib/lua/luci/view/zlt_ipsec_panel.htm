@@ -23,10 +23,12 @@
 			</table>
 			<div class="cbi-page-actions">
 				<button class="cbi-button cbi-button-apply" id="zi_btn_start" type="button">Connect</button>
-				<button class="cbi-button cbi-button-reset" id="zi_btn_stop" type="button">Disconnect</button>
+				<button class="cbi-button cbi-button-apply" id="zi_btn_confirm" type="button">Confirm (keep tunnel)</button>
+				<button class="cbi-button cbi-button-reset" id="zi_btn_stop" type="button">Disconnect / Emergency</button>
 				<button class="cbi-button cbi-button-action" id="zi_btn_restart" type="button">Reconnect</button>
 				<button class="cbi-button cbi-button-action" id="zi_btn_refresh" type="button">Refresh</button>
 			</div>
+			<p style="opacity:0.85;margin:8px 0 0;color:#b71c1c"><strong>Safety:</strong> after Connect, click <em>Confirm</em> within 90 seconds or the tunnel auto-stops so LAN/SSH/web cannot stay locked out. Reboot also runs emergency flush.</p>
 			<p id="zi_msg" style="margin-top:8px"></p>
 		</div>
 	</div>
@@ -173,8 +175,11 @@
 		zi_refresh_sa();
 	}
 	function zi_after_start() {
-		zi_msg(true, "Connecting…");
-		setTimeout(function() { zi_refresh_all(); zi_msg(true, "Start requested"); }, 2500);
+		zi_msg(true, "Connecting… then click Confirm within 90s");
+		setTimeout(function() {
+			zi_refresh_all();
+			zi_msg(true, "If panel/SSH still work — click Confirm now to keep the tunnel");
+		}, 2500);
 	}
 
 	function zi_b64url_to_u8(s) {
@@ -279,8 +284,11 @@
 	}
 
 	document.getElementById("zi_btn_start").onclick = function() { zi_api("start", null, zi_after_start); };
+	document.getElementById("zi_btn_confirm").onclick = function() {
+		zi_api("confirm", null, function() { zi_msg(true, "Tunnel confirmed — failsafe cancelled"); zi_refresh_all(); });
+	};
 	document.getElementById("zi_btn_stop").onclick = function() {
-		zi_api("stop", null, function() { zi_msg(true, "Disconnected"); zi_refresh_all(); });
+		zi_api("emergency", null, function() { zi_msg(true, "Emergency flush — LAN restored"); zi_refresh_all(); });
 	};
 	document.getElementById("zi_btn_restart").onclick = function() { zi_api("restart", null, zi_after_start); };
 	document.getElementById("zi_btn_refresh").onclick = zi_refresh_all;

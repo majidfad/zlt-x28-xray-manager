@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+# EARLY boot: always tear down IPsec/XFRM/NAT so LAN/SSH/web stay reachable
+# even if a previous VPN session blackholed the router.
+START=05
+STOP=01
+
+SAFE=/data/zi-bin/zi-manager
+
+start() {
+    # Prefer manager emergency path; always do raw flush too
+    if [ -x "$SAFE" ]; then
+        "$SAFE" emergency >/dev/null 2>&1 || true
+    elif [ -x /usr/bin/zi-manager ]; then
+        /usr/bin/zi-manager emergency >/dev/null 2>&1 || true
+    fi
+    killall charon starter 2>/dev/null || true
+    ip xfrm state flush 2>/dev/null || true
+    ip xfrm policy flush 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -j ZI_NAT 2>/dev/null || true
+    iptables -t nat -F ZI_NAT 2>/dev/null || true
+    iptables -t nat -X ZI_NAT 2>/dev/null || true
+    # never auto-reconnect after an unsafe lockout reboot unless user opted in
+    if [ -f /data/zlt-ipsec/active ] && [ ! -f /data/zlt-ipsec/autostart ]; then
+        echo 0 > /data/zlt-ipsec/active 2>/dev/null || true
+    fi
+    if [ -f /etc/zlt-ipsec/active ] && [ ! -f /etc/zlt-ipsec/autostart ] && [ ! -f /data/zlt-ipsec/autostart ]; then
+        echo 0 > /etc/zlt-ipsec/active 2>/dev/null || true
+    fi
+}
+
+stop() {
+    :
+}

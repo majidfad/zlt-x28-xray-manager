@@ -3,20 +3,23 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.06-zi2"
+VERSION="2026.11.07-zi3"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
-STATE_FILE="$DIR/active"          # 1 = should run after boot
+STATE_FILE="$DIR/active"          # 1 = tunnel desired (manual); boot needs autostart file
 FAIL_FILE="$DIR/ping_fails"
 LOG="/var/log/zlt-ipsec.log"
 PID_WD="/var/run/zi_watchdog.pid"
+PID_FS="/var/run/zi_failsafe.pid"
+ROUTE_BAK="/tmp/zi_route_bak"
 SWANCTL_DIR="/tmp/zi_swanctl"
 SS_CONF="$DIR/strongswan.conf"
 CONN="zivpn"
-PING_EVERY=300                    # seconds
-PING_FAILS=10
+PING_EVERY=120                    # seconds (faster recovery)
+PING_FAILS=3                      # was 10 — too slow when locked out
 PING_TARGET_DEFAULT="1.1.1.1"
+FAILSAFE_SECS="${ZI_FAILSAFE_SECS:-90}"   # auto emergency-stop unless confirmed
 
 log() { echo "[zi] $*" | tee -a "$LOG" 2>/dev/null; echo "[System] $*" >> "$LOG" 2>/dev/null; }
 
@@ -46,13 +49,16 @@ json_str() {
 
 write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
+    # install_routes=no — installing 0.0.0.0/0 via XFRM blackholes LAN/SSH/web on ZLT
     cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated
+# zlt-ipsec generated (lockout-safe)
 charon {
     load_modular = no
-    install_routes = yes
+    install_routes = no
     install_virtual_ip = yes
     rsa_pss = yes
+    interfaces_use =
+    interfaces_ignore =
     load = random nonce aes des rc2 sha1 sha2 md5 mgf1 hmac xcbc gmp curve25519 openssl pem pkcs1 pkcs7 pkcs8 pkcs12 x509 pubkey constraints pgp dnskey sshkey fips-prf drbg attr kernel-netlink socket-default stroke vici updown counters gcm
 }
 EOF
@@ -226,18 +232,80 @@ clean_tunnel_nat() {
     iptables -t nat -X ZI_NAT 2>/dev/null || true
 }
 
+clean_policy_routing() {
+    ip rule del fwmark 0x5a table 220 2>/dev/null || true
+    ip route flush table 220 2>/dev/null || true
+}
+
+restore_default_route() {
+    [ -f "$ROUTE_BAK" ] || return 0
+    # shellcheck disable=SC1090
+    . "$ROUTE_BAK" 2>/dev/null || true
+    if [ -n "${ZI_DEF_GW:-}" ] && [ -n "${ZI_DEF_DEV:-}" ]; then
+        ip route replace default via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
+            || ip route add default via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
+        log "restored default via $ZI_DEF_GW dev $ZI_DEF_DEV"
+    fi
+}
+
+save_default_route() {
+    _gw=$(ip -4 route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    _dev=$(ip -4 route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    echo "ZI_DEF_GW='${_gw}'" > "$ROUTE_BAK"
+    echo "ZI_DEF_DEV='${_dev}'" >> "$ROUTE_BAK"
+    log "saved default gw=${_gw:-?} dev=${_dev:-?}"
+}
+
+emergency_flush() {
+    # Hard recovery — restore LAN/SSH/web no matter what
+    log "EMERGENCY FLUSH — killing IPsec/XFRM/NAT, restoring routes"
+    [ -f "$PID_FS" ] && kill "$(cat "$PID_FS" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$PID_FS"
+    [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$PID_WD"
+    prefer_bins
+    swanctl --terminate --ike "$CONN" >/dev/null 2>&1 || true
+    killall -9 charon starter 2>/dev/null || true
+    sleep 1
+    ip xfrm state flush 2>/dev/null || true
+    ip xfrm policy flush 2>/dev/null || true
+    clean_tunnel_nat
+    clean_mangle
+    clean_policy_routing
+    restore_default_route
+    echo "0" > "$STATE_FILE" 2>/dev/null || true
+    echo "0" > "$FAIL_FILE" 2>/dev/null || true
+    log "EMERGENCY FLUSH done — management access should work"
+}
+
 lan_cidrs() {
-    # Print LAN IPv4 CIDRs (one per line)
     ip -4 addr show 2>/dev/null | awk '
         $1=="inet" {
             split($2,a,"/")
-            ip=a[1]; pfx=a[2]+0
+            ip=a[1]
             if (ip ~ /^127\./) next
             n=split(ip,o,".")
             if (n!=4) next
-            # rough private only for exceptions list (still include all non-lo)
             print $2
         }'
+}
+
+lan_cidrs_csv() {
+    _csv=""
+    while read -r _c; do
+        [ -n "$_c" ] || continue
+        if [ -z "$_csv" ]; then _csv="$_c"; else _csv="$_csv,$_c"; fi
+    done << EOF
+$(lan_cidrs)
+EOF
+    # always include RFC1918 as passthrough safety net
+    for _n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+        case ",$_csv," in
+            *",$_n,"*) ;;
+            *) if [ -z "$_csv" ]; then _csv="$_n"; else _csv="$_csv,$_n"; fi ;;
+        esac
+    done
+    echo "$_csv"
 }
 
 setup_tunnel_nat() {
@@ -245,24 +313,51 @@ setup_tunnel_nat() {
     _vip="$1"
     _server=$(cat "$MAT/host" 2>/dev/null)
     iptables -t nat -N ZI_NAT 2>/dev/null || iptables -t nat -F ZI_NAT
-    # Auto exceptions: LAN CIDRs + VPN server
+    # Never SNAT traffic to LAN / private / VPN server / link-local
     lan_cidrs | while read -r _c; do
         [ -n "$_c" ] || continue
         iptables -t nat -A ZI_NAT -d "$_c" -j RETURN 2>/dev/null || true
     done
     [ -n "$_server" ] && iptables -t nat -A ZI_NAT -d "$_server" -j RETURN 2>/dev/null || true
-    # classic privates as safety net
     for _n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16; do
         iptables -t nat -A ZI_NAT -d "$_n" -j RETURN 2>/dev/null || true
     done
+    # Only mark/SNAT forwarded traffic (not router-local INPUT path)
     if [ -n "$_vip" ]; then
-        iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
+        iptables -t nat -A ZI_NAT -m addrtype ! --src-type LOCAL -j SNAT --to-source "$_vip" 2>/dev/null \
+            || iptables -t nat -A ZI_NAT -j SNAT --to-source "$_vip"
         log "tunnel NAT SNAT -> $_vip (LAN+server excepted)"
     else
         iptables -t nat -A ZI_NAT -j MASQUERADE
         log "tunnel NAT MASQUERADE (no VIP yet)"
     fi
-    iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
+    iptables -t nat -C POSTROUTING -j ZI_NAT 2>/dev/null \
+        || iptables -t nat -I POSTROUTING -j ZI_NAT 2>/dev/null || true
+}
+
+setup_tunnel_routes() {
+    # install_routes=no → XFRM policies + SNAT handle tunnel; keep main default for mgmt
+    _server=$(cat "$MAT/host" 2>/dev/null)
+    clean_policy_routing
+    clean_mangle
+    if ! ip -4 route show default 2>/dev/null | grep -q default; then
+        restore_default_route
+    fi
+    if [ -n "$_server" ] && [ -f "$ROUTE_BAK" ]; then
+        # shellcheck disable=SC1090
+        . "$ROUTE_BAK" 2>/dev/null || true
+        if [ -n "${ZI_DEF_GW:-}" ] && [ -n "${ZI_DEF_DEV:-}" ]; then
+            ip route replace "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null \
+                || ip route add "$_server"/32 via "$ZI_DEF_GW" dev "$ZI_DEF_DEV" 2>/dev/null || true
+        fi
+    fi
+    log "tunnel routes ready (WAN default preserved; server pinned)"
+}
+
+clean_mangle() {
+    iptables -t mangle -D FORWARD -j ZI_MARK 2>/dev/null || true
+    iptables -t mangle -F ZI_MARK 2>/dev/null || true
+    iptables -t mangle -X ZI_MARK 2>/dev/null || true
 }
 
 detect_vip() {
@@ -299,10 +394,24 @@ write_zivpn_conf() {
     _user=$(cat "$MAT/user")
     _ike=$(cat "$MAT/ike")
     _esp=$(cat "$MAT/esp")
+    _pass_ts=$(lan_cidrs_csv)
+    [ -z "$_pass_ts" ] && _pass_ts="192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
     _cacert_line=""
     [ -s "$SWANCTL_DIR/x509ca/ca.pem" ] && _cacert_line="            cacerts = ca.pem"
     cat > "$SWANCTL_DIR/conf.d/zivpn.conf" << EOF
 connections {
+    # Passthrough: never encrypt LAN↔LAN / private (keeps SSH/web/telnet alive)
+    zi-pass {
+        remote_addrs = 127.0.0.1
+        children {
+            zi-pass {
+                local_ts = ${_pass_ts}
+                remote_ts = ${_pass_ts}
+                mode = pass
+                start_action = trap
+            }
+        }
+    }
     ${CONN} {
         version = 2
         remote_addrs = ${_host}
@@ -392,19 +501,48 @@ load_conn_try() {
     swan --load-all >>"$LOG" 2>&1
 }
 
+cancel_failsafe() {
+    [ -f "$PID_FS" ] && kill "$(cat "$PID_FS" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$PID_FS" /tmp/zi_failsafe_armed
+}
+
+arm_failsafe() {
+    cancel_failsafe
+    touch /tmp/zi_failsafe_armed
+    (
+        sleep "$FAILSAFE_SECS"
+        [ -f /tmp/zi_failsafe_armed ] || exit 0
+        log "FAILSAFE ${FAILSAFE_SECS}s fired — emergency flush (protect LAN/SSH/web)"
+        emergency_flush
+    ) &
+    echo $! > "$PID_FS"
+    log "failsafe armed: auto-disconnect in ${FAILSAFE_SECS}s unless zi-manager confirm"
+}
+
+lan_self_ok() {
+    # True if we still have a non-loopback IPv4 and a default route
+    ip -4 route show default 2>/dev/null | grep -q default || return 1
+    _lip=$(ip -4 addr show 2>/dev/null | awk '$1=="inet"{split($2,a,"/"); if(a[1]!~/^127\./){print a[1]; exit}}')
+    [ -n "$_lip" ] || return 1
+    # ping own LAN address (local stack)
+    ping -c 1 -W 2 "$_lip" >/dev/null 2>&1 || return 0
+    return 0
+}
+
 start_vpn() {
     ensure_dirs
-    log "start $VERSION"
+    log "start $VERSION (lockout-safe)"
     [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
     [ -s "$MAT/client.key" ] || prepare_material || return 1
     ensure_stack || return 1
+    save_default_route
+    arm_failsafe
     write_ss_conf
     prepare_swanctl_tree
-    start_charon || return 1
+    start_charon || { emergency_flush; return 1; }
 
     _host=$(cat "$MAT/host")
     _loaded=0
-    # 5.9.2: no swanctl rsa_pss key. Order matters for Amnezia Libreswan peers.
     for _try in "pubkey|%any" "pubkey|$_host" "ike:rsa/pss-sha256|%any"; do
         _a="${_try%%|*}"
         _r="${_try##*|}"
@@ -414,7 +552,11 @@ start_vpn() {
         fi
         log "load failed for auth=$_a id=$_r — next"
     done
-    [ "$_loaded" = "1" ] || { log "swanctl load failed (all auth variants)"; return 1; }
+    if [ "$_loaded" != "1" ]; then
+        log "swanctl load failed (all auth variants)"
+        emergency_flush
+        return 1
+    fi
 
     swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
         || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
@@ -425,13 +567,26 @@ start_vpn() {
         swan --list-conns >>"$LOG" 2>&1 || true
         swan --list-sas >>"$LOG" 2>&1 || true
         swan --list-certs >>"$LOG" 2>&1 || true
+        emergency_flush
+        return 1
+    fi
+    if ! lan_self_ok; then
+        log "LAN/default route broken after SA — emergency flush"
+        emergency_flush
         return 1
     fi
     _vip=$(detect_vip)
     setup_tunnel_nat "$_vip"
+    setup_tunnel_routes "$_vip"
+    if ! lan_self_ok; then
+        log "LAN broken after NAT/routes — emergency flush"
+        emergency_flush
+        return 1
+    fi
     echo "1" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "IPsec ESTABLISHED vip=${_vip:-none}"
+    log "TIP: run 'zi-manager confirm' within ${FAILSAFE_SECS}s to keep tunnel (else auto-stop)"
     start_watchdog
     return 0
 }
@@ -439,10 +594,16 @@ start_vpn() {
 stop_vpn() {
     ensure_dirs
     log "stop"
+    cancel_failsafe
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
     clean_tunnel_nat
+    clean_mangle
+    clean_policy_routing
     stop_daemons
+    ip xfrm state flush 2>/dev/null || true
+    ip xfrm policy flush 2>/dev/null || true
+    restore_default_route
     echo "0" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "VPN fully terminated (WAN fallback)"
@@ -461,9 +622,14 @@ watchdog_loop() {
     while true; do
         sleep "$PING_EVERY"
         [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
+        if ! lan_self_ok; then
+            log "watchdog: LAN/default route lost — EMERGENCY"
+            emergency_flush
+            exit 0
+        fi
         if ! is_up; then
             log "watchdog: SA down — stopping VPN"
-            stop_vpn
+            emergency_flush
             exit 0
         fi
         _t=$(ping_target)
@@ -475,8 +641,8 @@ watchdog_loop() {
             echo "$_f" > "$FAIL_FILE"
             log "watchdog: ping $_t fail $_f/$PING_FAILS"
             if [ "$_f" -ge "$PING_FAILS" ]; then
-                log "watchdog: $PING_FAILS consecutive ping fails — disconnect VPN, fall back to WAN"
-                stop_vpn
+                log "watchdog: $PING_FAILS ping fails — emergency flush → WAN"
+                emergency_flush
                 exit 0
             fi
         fi
@@ -517,16 +683,48 @@ status() {
 
 boot_start() {
     ensure_dirs
+    emergency_flush
     /etc/init.d/zi-swan-bind start 2>/dev/null || true
+    # Autostart ONLY with explicit opt-in file (prevents post-reboot lockout)
+    if [ ! -f "$DIR/autostart" ] && [ ! -f /data/zlt-ipsec/autostart ]; then
+        log "boot: autostart disabled (no autostart file) — safe idle"
+        exit 0
+    fi
     [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 0
     [ -f "$PROFILE" ] || exit 0
+    log "boot: autostart requested — starting with failsafe"
     start_vpn
+}
+
+confirm_tunnel() {
+    rm -f /tmp/zi_failsafe_armed
+    cancel_failsafe
+    log "tunnel CONFIRMED — failsafe cancelled"
+    echo "ok: tunnel kept"
+}
+
+enable_autostart() {
+    ensure_dirs
+    mkdir -p /data/zlt-ipsec 2>/dev/null || true
+    echo 1 > "$DIR/autostart"
+    echo 1 > /data/zlt-ipsec/autostart 2>/dev/null || true
+    log "autostart ON (boot will reconnect with failsafe)"
+}
+
+disable_autostart() {
+    rm -f "$DIR/autostart" /data/zlt-ipsec/autostart 2>/dev/null || true
+    echo 0 > "$STATE_FILE" 2>/dev/null || true
+    log "autostart OFF"
 }
 
 case "$1" in
     version) echo "$VERSION" ;;
     start) ensure_dirs; start_vpn ;;
     stop) stop_vpn ;;
+    emergency|flush|safe) ensure_dirs; emergency_flush ;;
+    confirm) ensure_dirs; confirm_tunnel ;;
+    autostart-on) enable_autostart ;;
+    autostart-off) disable_autostart ;;
     restart) stop_vpn; sleep 1; start_vpn ;;
     status) status ;;
     ss_check|check) ss_check ;;
@@ -539,7 +737,7 @@ case "$1" in
     watchdog) watchdog_loop ;;
     boot) boot_start ;;
     *)
-        echo "Usage: zi-manager {start|stop|restart|status|ss_check|import <file>|import-manual ...|version|boot}"
+        echo "Usage: zi-manager {start|stop|emergency|confirm|autostart-on|autostart-off|restart|status|ss_check|import|version|boot}"
         exit 1
         ;;
 esac

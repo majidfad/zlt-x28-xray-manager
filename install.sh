@@ -122,11 +122,24 @@ fetch_bin zi-vpn-decode    files/usr/bin/zi-vpn-decode || true
 
 install_luci || echo "[zi-install] WARN: LuCI panel not installed"
 
-echo "[zi-install] init"
-if http_get "$REPO_RAW/files/etc/init.d/zi-vpn" /etc/init.d/zi-vpn; then
-    tr -d '\r' < /etc/init.d/zi-vpn > /tmp/zi-vpn.lf && mv -f /tmp/zi-vpn.lf /etc/init.d/zi-vpn
-    chmod 755 /etc/init.d/zi-vpn
-    /etc/init.d/zi-vpn enable 2>/dev/null || ln -sf ../init.d/zi-vpn /etc/rc.d/S95zi-vpn 2>/dev/null || true
+echo "[zi-install] init (zi-safe first — prevents lockout after reboot)"
+for _init in zi-safe zi-vpn; do
+    if http_get "$REPO_RAW/files/etc/init.d/$_init" "/etc/init.d/$_init"; then
+        tr -d '\r' < "/etc/init.d/$_init" > "/tmp/$_init.lf" && mv -f "/tmp/$_init.lf" "/etc/init.d/$_init"
+        chmod 755 "/etc/init.d/$_init"
+    fi
+done
+/etc/init.d/zi-safe enable 2>/dev/null || ln -sf ../init.d/zi-safe /etc/rc.d/S05zi-safe 2>/dev/null || true
+/etc/init.d/zi-vpn enable 2>/dev/null || ln -sf ../init.d/zi-vpn /etc/rc.d/S95zi-vpn 2>/dev/null || true
+# Force safe defaults: no autostart, clear sticky active
+rm -f /data/zlt-ipsec/autostart /etc/zlt-ipsec/autostart 2>/dev/null || true
+echo 0 > /data/zlt-ipsec/active 2>/dev/null || true
+echo 0 > /etc/zlt-ipsec/active 2>/dev/null || true
+# Immediate flush in case leftover XFRM from previous brick
+[ -x "$BIN_DIR/zi-manager" ] && "$BIN_DIR/zi-manager" emergency >/dev/null 2>&1 || true
+# Persist safe hook in rc.local (runs even if init.d enable fails)
+if [ -f /etc/rc.local ] && ! grep -q 'zi-safe\|zi-manager emergency' /etc/rc.local 2>/dev/null; then
+    sed -i 's|^exit 0|/etc/init.d/zi-safe start 2>/dev/null || /data/zi-bin/zi-manager emergency 2>/dev/null || true\nexit 0|' /etc/rc.local 2>/dev/null || true
 fi
 
 echo "[zi-install] strongSwan 5.9.2 stack"
@@ -164,6 +177,10 @@ echo "[zi-install] DONE"
 echo "  Disk:"; df -h / /data 2>/dev/null | head -n5
 echo "  This OEM has no uhttpd — web is on :4153. If refused, / is full:"
 echo "    sh /tmp/fix-web.sh   # or wget fix-web.sh"
-echo "  LuCI (if OEM includes it): …/cgi-bin/luci/admin/services/zlt_ipsec"
+echo "  LuCI: …/cgi-bin/luci/admin/services/zlt_ipsec"
+echo "  SAFETY: Connect → Confirm within 90s; reboot runs zi-safe flush"
+echo "  If locked out: reboot (auto flush) or: zi-manager emergency"
+echo "  Autostart is OFF by default. Enable only after Confirm works:"
+echo "    zi-manager autostart-on"
 echo "  CLI: zi-manager ss_check"
 exit 0
