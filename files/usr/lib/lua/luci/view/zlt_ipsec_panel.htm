@@ -342,18 +342,40 @@
 		}
 		return Promise.resolve(raw);
 	}
+	function zi_import_chunked(cfg, cb) {
+		/* OEM LuCI truncates large single POST (p12 inside JSON) — send 6KB chunks */
+		var CHUNK = 6000;
+		zi_api("import_begin", null, function(b) {
+			if (!b || !b.ok) { cb({ ok: false, error: (b && b.error) || "import_begin failed" }); return; }
+			var i = 0;
+			function next() {
+				if (i >= cfg.length) {
+					zi_api("import_commit", null, cb, true);
+					return;
+				}
+				var piece = cfg.substring(i, i + CHUNK);
+				i += CHUNK;
+				zi_msg(true, "Saving… " + Math.min(i, cfg.length) + "/" + cfg.length);
+				zi_api("import_chunk", { data: piece }, function(r) {
+					if (!r || !r.ok) { cb({ ok: false, error: (r && r.error) || "chunk failed at " + i }); return; }
+					next();
+				}, true);
+			}
+			next();
+		}, true);
+	}
 	function zi_save(thenConnect) {
 		var raw = document.getElementById("zi_cfg").value;
 		zi_msg(true, "Saving…");
 		zi_prepare_config(raw).then(function(cfg) {
-			zi_api("import", { config: cfg }, function(data) {
+			zi_import_chunked(cfg, function(data) {
 				if (!data || !data.ok) { zi_msg(false, (data && data.error) || "import failed"); return; }
-				zi_msg(true, "Profile saved");
+				zi_msg(true, "Profile saved (" + (data.bytes || cfg.length) + " bytes)");
 				zi_refresh_all();
 				if (thenConnect) zi_do_start();
-			}, true);
+			});
 		}).catch(function(e) {
-			zi_api("import", { config: raw }, function(data) {
+			zi_import_chunked(raw, function(data) {
 				if (!data || !data.ok) {
 					zi_msg(false, (e && e.message ? e.message + " — " : "") + ((data && data.error) || "import failed"));
 					return;
@@ -361,7 +383,7 @@
 				zi_msg(true, "Profile saved");
 				zi_refresh_all();
 				if (thenConnect) zi_do_start();
-			}, true);
+			});
 		});
 	}
 	function zi_file_b64(file) {

@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6d"
+VERSION="2026.11.07-zi6e"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -45,9 +45,17 @@ prefer_bins() {
 }
 
 json_str() {
-    # extract_json_str key from file — busybox-friendly
+    # extract short JSON string values — busybox sed breaks on huge "cert" lines
     _f="$1"; _k="$2"
     [ -f "$_f" ] || { echo ""; return; }
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print(v if isinstance(v,str) else '')" "$_f" "$_k" 2>/dev/null
+        return
+    fi
+    if command -v python >/dev/null 2>&1; then
+        python -c "import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print(v if isinstance(v,basestring) else '')" "$_f" "$_k" 2>/dev/null
+        return
+    fi
     sed -n "s/.*\"$_k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$_f" | head -n1
 }
 
@@ -122,24 +130,68 @@ b64_decode_file() {
     return 1
 }
 
+openssl_pkcs12() {
+    # Amnezia p12 often needs OpenSSL 3 legacy provider (RC2)
+    _leg=""
+    openssl pkcs12 -help 2>&1 | grep -q -- '-legacy' && _leg="-legacy"
+    openssl pkcs12 $_leg "$@"
+}
+
 pkcs12_unpack() {
     _p12="$1"; _pass="$2"; _dir="$3"
-    openssl pkcs12 -in "$_p12" -nodes -nocerts -passin "pass:$_pass" \
-        -out "$_dir/client.key" 2>/tmp/zi_p12.err \
-    && openssl pkcs12 -in "$_p12" -nodes -clcerts -nokeys -passin "pass:$_pass" \
-        -out "$_dir/client.pem" 2>>/tmp/zi_p12.err || return 1
-    openssl pkcs12 -in "$_p12" -nodes -cacerts -nokeys -passin "pass:$_pass" \
+    rm -f "$_dir/client.key" "$_dir/client.pem" "$_dir/client.key.raw" "$_dir/client.pem.raw" "$_dir/ca.pem"
+    openssl_pkcs12 -in "$_p12" -nodes -nocerts -passin "pass:$_pass" \
+        -out "$_dir/client.key.raw" 2>/tmp/zi_p12.err \
+    && openssl_pkcs12 -in "$_p12" -nodes -clcerts -nokeys -passin "pass:$_pass" \
+        -out "$_dir/client.pem.raw" 2>>/tmp/zi_p12.err || return 1
+    openssl_pkcs12 -in "$_p12" -nodes -cacerts -nokeys -passin "pass:$_pass" \
         -out "$_dir/ca.pem" 2>>/tmp/zi_p12.err || true
-    # strip bag attributes / normalize
-    if grep -q 'BEGIN CERTIFICATE' "$_dir/client.pem" 2>/dev/null; then
-        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$_dir/client.pem" > "$_dir/client.pem.n" \
-            && mv "$_dir/client.pem.n" "$_dir/client.pem"
+
+    # Prefer clean PKCS#1 / X509 PEM — strongSwan 5.9.2 rejects bag-attribute blobs
+    if ! openssl rsa -in "$_dir/client.key.raw" -out "$_dir/client.key" 2>/dev/null; then
+        if ! openssl pkey -in "$_dir/client.key.raw" -out "$_dir/client.key" 2>/dev/null; then
+            if grep -q 'BEGIN.*PRIVATE KEY' "$_dir/client.key.raw" 2>/dev/null; then
+                awk '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/' "$_dir/client.key.raw" > "$_dir/client.key"
+            else
+                return 1
+            fi
+        fi
     fi
-    if grep -q 'BEGIN.*PRIVATE KEY' "$_dir/client.key" 2>/dev/null; then
-        awk '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/' "$_dir/client.key" > "$_dir/client.key.n" \
-            && mv "$_dir/client.key.n" "$_dir/client.key"
+    if ! openssl x509 -in "$_dir/client.pem.raw" -out "$_dir/client.pem" 2>/dev/null; then
+        if grep -q 'BEGIN CERTIFICATE' "$_dir/client.pem.raw" 2>/dev/null; then
+            awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$_dir/client.pem.raw" > "$_dir/client.pem"
+        else
+            return 1
+        fi
     fi
-    [ -s "$_dir/client.pem" ] && [ -s "$_dir/client.key" ]
+    # CA: first cert only if present
+    if [ -s "$_dir/ca.pem" ] && grep -q 'BEGIN CERTIFICATE' "$_dir/ca.pem" 2>/dev/null; then
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$_dir/ca.pem" > "$_dir/ca.pem.n" \
+            && mv "$_dir/ca.pem.n" "$_dir/ca.pem"
+        openssl x509 -in "$_dir/ca.pem" -out "$_dir/ca.pem.n" 2>/dev/null \
+            && mv "$_dir/ca.pem.n" "$_dir/ca.pem" || true
+    fi
+    rm -f "$_dir/client.key.raw" "$_dir/client.pem.raw"
+    # verify both parse
+    openssl pkey -in "$_dir/client.key" -noout 2>/dev/null \
+        || openssl rsa -in "$_dir/client.key" -check -noout 2>/dev/null || return 1
+    openssl x509 -in "$_dir/client.pem" -noout 2>/dev/null || return 1
+    # key must match cert
+    _kh=$(openssl pkey -in "$_dir/client.key" -pubout 2>/dev/null | openssl md5 2>/dev/null)
+    _ch=$(openssl x509 -in "$_dir/client.pem" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null)
+    [ -n "$_kh" ] && [ "$_kh" = "$_ch" ] || {
+        echo "key/cert mismatch" >>/tmp/zi_p12.err
+        return 1
+    }
+    return 0
+}
+
+material_ok() {
+    [ -s "$MAT/client.key" ] && [ -s "$MAT/client.pem" ] && [ -s "$MAT/host" ] || return 1
+    openssl pkey -in "$MAT/client.key" -noout 2>/dev/null \
+        || openssl rsa -in "$MAT/client.key" -check -noout 2>/dev/null || return 1
+    openssl x509 -in "$MAT/client.pem" -noout 2>/dev/null || return 1
+    return 0
 }
 
 import_profile() {
@@ -177,42 +229,112 @@ prepare_material() {
     ensure_dirs
     [ -f "$PROFILE" ] || { log "no profile.json"; return 1; }
     rm -rf "$MAT"; mkdir -p "$MAT"
-    _host=$(json_str "$PROFILE" hostName)
-    [ -z "$_host" ] && _host=$(json_str "$PROFILE" addr)
-    _user=$(json_str "$PROFILE" userName)
-    [ -z "$_user" ] && _user=$(json_str "$PROFILE" clientId)
-    _pass=$(json_str "$PROFILE" password)
-    _cert=$(json_str "$PROFILE" cert)
-    [ -z "$_cert" ] && _cert=$(json_str "$PROFILE" p12)
-    _ike=$(json_str "$PROFILE" ikeProposal)
-    [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
-    _esp=$(json_str "$PROFILE" espProposal)
-    [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
-    # zi4 worked with modp2048; Curve25519-first (zi5) broke IKE_AUTH on this Amnezia server
-    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
-    [ -z "$_esp" ] && _esp="aes128gcm16"
+
+    # Prefer Python: busybox sed truncates huge cert base64 → corrupt p12 → "no private key"
+    _py_ok=0
+    if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+        _py=$(command -v python3 2>/dev/null || command -v python)
+        if "$_py" - "$PROFILE" "$MAT" <<'PY'
+import json, sys, os, base64, re
+prof, mat = sys.argv[1], sys.argv[2]
+d = json.load(open(prof))
+host = d.get("hostName") or d.get("addr") or ""
+user = d.get("userName") or d.get("clientId") or ""
+passwd = d.get("password")
+if passwd is None: passwd = ""
+passwd = str(passwd)
+cert = d.get("cert") or d.get("p12") or ""
+if not cert and isinstance(d.get("local"), dict):
+    cert = d["local"].get("p12") or ""
+ike = d.get("ikeProposal") or d.get("ike-proposal") or "aes256-sha256-modp2048"
+esp = d.get("espProposal") or d.get("esp-proposal") or "aes128gcm16"
+if not host or not cert:
+    sys.stderr.write("missing host or cert\n"); sys.exit(2)
+# strip whitespace/newlines inside b64
+cert = re.sub(r"\s+", "", str(cert))
+# urlsafe b64 → std
+pad = (-len(cert)) % 4
+if pad: cert += "=" * pad
+raw = None
+for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+    try:
+        raw = decoder(cert)
+        if raw and len(raw) > 64: break
+    except Exception:
+        raw = None
+if not raw:
+    sys.stderr.write("cert base64 decode failed\n"); sys.exit(3)
+open(os.path.join(mat, "host"), "w").write(host)
+open(os.path.join(mat, "user"), "w").write(user)
+open(os.path.join(mat, "pass"), "w").write(passwd)
+open(os.path.join(mat, "ike"), "w").write(ike)
+open(os.path.join(mat, "esp"), "w").write(esp)
+open(os.path.join(mat, "client.p12"), "wb").write(raw)
+dns1 = d.get("dns1")
+if dns1: open(os.path.join(mat, "dns1"), "w").write(str(dns1))
+open(os.path.join(mat, "rsa_pss"), "w").write("1")
+print("ok host=%s user=%s p12=%d" % (host, user, len(raw)))
+PY
+        then
+            _py_ok=1
+        else
+            log "WARN: python profile extract failed — falling back to shell (may truncate cert)"
+        fi
+    fi
+
+    if [ "$_py_ok" != "1" ]; then
+        _host=$(json_str "$PROFILE" hostName)
+        [ -z "$_host" ] && _host=$(json_str "$PROFILE" addr)
+        _user=$(json_str "$PROFILE" userName)
+        [ -z "$_user" ] && _user=$(json_str "$PROFILE" clientId)
+        _pass=$(json_str "$PROFILE" password)
+        _cert=$(json_str "$PROFILE" cert)
+        [ -z "$_cert" ] && _cert=$(json_str "$PROFILE" p12)
+        _ike=$(json_str "$PROFILE" ikeProposal)
+        [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
+        _esp=$(json_str "$PROFILE" espProposal)
+        [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
+        [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
+        [ -z "$_esp" ] && _esp="aes128gcm16"
+        [ -z "$_host" ] && { log "ERROR: no hostName/addr in profile"; return 1; }
+        [ -z "$_cert" ] && { log "ERROR: no cert/p12 in profile"; return 1; }
+        printf '%s' "$_host" > "$MAT/host"
+        printf '%s' "$_user" > "$MAT/user"
+        printf '%s' "$_pass" > "$MAT/pass"
+        printf '%s' "$_ike" > "$MAT/ike"
+        printf '%s' "$_esp" > "$MAT/esp"
+        _d1=$(json_str "$PROFILE" dns1); [ -n "$_d1" ] && printf '%s' "$_d1" > "$MAT/dns1"
+        echo "1" > "$MAT/rsa_pss"
+        b64_decode_file "$_cert" "$MAT/client.p12" || { log "ERROR: base64 p12 decode failed"; return 1; }
+    fi
+
+    _host=$(cat "$MAT/host" 2>/dev/null)
+    _user=$(cat "$MAT/user" 2>/dev/null)
+    _pass=$(cat "$MAT/pass" 2>/dev/null)
+    _ike=$(cat "$MAT/ike" 2>/dev/null)
+    _esp=$(cat "$MAT/esp" 2>/dev/null)
     case "$_esp" in
         *gcm*) ;;
-        *) _esp="aes128gcm16,$_esp" ;;
+        *) _esp="aes128gcm16,$_esp"; printf '%s' "$_esp" > "$MAT/esp" ;;
     esac
-    [ -z "$_host" ] && { log "ERROR: no hostName/addr in profile"; return 1; }
-    [ -z "$_cert" ] && { log "ERROR: no cert/p12 in profile"; return 1; }
-    printf '%s' "$_host" > "$MAT/host"
-    printf '%s' "$_user" > "$MAT/user"
-    printf '%s' "$_pass" > "$MAT/pass"
-    printf '%s' "$_ike" > "$MAT/ike"
-    printf '%s' "$_esp" > "$MAT/esp"
-    # optional dns
-    _d1=$(json_str "$PROFILE" dns1); [ -n "$_d1" ] && printf '%s' "$_d1" > "$MAT/dns1"
-    echo "1" > "$MAT/rsa_pss"
-    b64_decode_file "$_cert" "$MAT/client.p12" || { log "ERROR: base64 p12 decode failed"; return 1; }
+    [ -s "$MAT/client.p12" ] || { log "ERROR: client.p12 empty (profile cert truncated?)"; return 1; }
+    # sanity: PKCS#12 DER usually starts with 0x30
+    _magic=$(hexdump -n 1 -e '1/1 "%02x"' "$MAT/client.p12" 2>/dev/null || od -An -N1 -tx1 "$MAT/client.p12" 2>/dev/null | tr -d ' \n')
+    [ "$_magic" = "30" ] || log "WARN: client.p12 magic=$_magic (expected 30) — may be truncated import"
+
     _ok=0
     for _try in "$_pass" "" "$_user"; do
-        if pkcs12_unpack "$MAT/client.p12" "$_try" "$MAT"; then _ok=1; printf '%s' "$_try" > "$MAT/pass"; break; fi
+        if pkcs12_unpack "$MAT/client.p12" "$_try" "$MAT"; then
+            _ok=1
+            printf '%s' "$_try" > "$MAT/pass"
+            break
+        fi
+        log "PKCS#12 try pass_len=${#_try} failed"
     done
     [ "$_ok" = "1" ] || { log "ERROR: PKCS#12 unpack failed"; cat /tmp/zi_p12.err >>"$LOG" 2>/dev/null; return 1; }
-    chmod 600 "$MAT/client.key" "$MAT/client.p12" "$MAT/pass"
-    log "material ready host=$_host user=$_user ike=$_ike esp=$_esp"
+    chmod 600 "$MAT/client.key" "$MAT/client.p12" "$MAT/pass" 2>/dev/null || true
+    material_ok || { log "ERROR: material_ok failed after unpack"; return 1; }
+    log "material ready host=$_host user=$_user ike=$_ike esp=$_esp key=$(wc -c < "$MAT/client.key" | tr -d ' ')b"
     return 0
 }
 
@@ -880,7 +1002,10 @@ start_vpn() {
     date +%s > "$START_LOCK/ts" 2>/dev/null || true
     log "start $VERSION (lockout-safe)"
     [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; release_start_lock; return 1; }
-    [ -s "$MAT/client.key" ] || { prepare_material || { release_start_lock; return 1; }; }
+    if ! material_ok; then
+        log "material missing/corrupt — re-preparing from profile"
+        prepare_material || { release_start_lock; return 1; }
+    fi
     # Keep working Amnezia proposals (modp2048). Do not force Curve25519 — AUTH stalls.
     _ike=$(json_str "$PROFILE" ikeProposal)
     [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)

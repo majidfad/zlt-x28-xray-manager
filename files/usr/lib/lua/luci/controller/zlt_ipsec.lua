@@ -1,9 +1,10 @@
 -- LuCI controller for ZLT IPsec (zi-manager)
 module("luci.controller.zlt_ipsec", package.seeall)
 
-local ZI_API_VERSION = 4
+local ZI_API_VERSION = 5
 local BYPASS_FILE = "/etc/zlt-ipsec/bypass_domains"
 local BYPASS_IPS_FILE = "/tmp/zi_bypass_ips"
+local IMPORT_TMP = "/tmp/zi_import_cfg"
 
 function index()
     entry({"admin", "services", "zlt_ipsec"}, template("zlt_ipsec_panel"), _("ZLT IPsec"), 60).dependent = false
@@ -13,6 +14,9 @@ function index()
     entry({"admin", "services", "zlt_ipsec", "stop"}, call("action_stop")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "restart"}, call("action_restart")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "import"}, call("action_import")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "import_begin"}, call("action_import_begin")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "import_chunk"}, call("action_import_chunk")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "import_commit"}, call("action_import_commit")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "import_manual"}, call("action_import_manual")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "log"}, call("action_log")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "ss_check"}, call("action_ss_check")).leaf = true
@@ -313,27 +317,71 @@ function action_ss_check()
     luci.http.write_json({ ok = true, check = out })
 end
 
-function action_import()
-    local body = luci.http.formvalue("config") or ""
-    if body == "" then
-        luci.http.prepare_content("application/json")
-        luci.http.write_json({ ok = false, error = "empty config" })
-        return
-    end
-    local tmp = "/tmp/zi_import_cfg"
-    if not write_file(tmp, body) then
-        luci.http.prepare_content("application/json")
-        luci.http.write_json({ ok = false, error = "cannot write tmp" })
-        return
-    end
+local function do_import_file(tmp)
     local m = mgr()
     local out = run(m .. " import " .. shq(tmp) .. " >/tmp/zi_import.log 2>&1; echo EXIT:$?")
     local err = read_file("/tmp/zi_import.log")
-    luci.http.prepare_content("application/json")
     if out:match("EXIT:0") then
-        luci.http.write_json({ ok = true })
+        return true, err
+    end
+    return false, (err ~= "" and err or out)
+end
+
+function action_import_begin()
+    write_file(IMPORT_TMP, "")
+    luci.http.prepare_content("application/json")
+    luci.http.write_json({ ok = true })
+end
+
+function action_import_chunk()
+    -- small chunks avoid OEM uhttpd/LuCI POST truncation of huge cert JSON
+    local data = luci.http.formvalue("data") or luci.http.formvalue("chunk") or ""
+    luci.http.prepare_content("application/json")
+    if data == "" then
+        luci.http.write_json({ ok = false, error = "empty chunk" })
+        return
+    end
+    local fh = io.open(IMPORT_TMP, "a")
+    if not fh then
+        luci.http.write_json({ ok = false, error = "cannot append import tmp" })
+        return
+    end
+    fh:write(data)
+    fh:close()
+    luci.http.write_json({ ok = true, n = #data })
+end
+
+function action_import_commit()
+    luci.http.prepare_content("application/json")
+    local raw = read_file(IMPORT_TMP)
+    if raw == "" then
+        luci.http.write_json({ ok = false, error = "empty import buffer — Save again" })
+        return
+    end
+    local ok, err = do_import_file(IMPORT_TMP)
+    if ok then
+        luci.http.write_json({ ok = true, bytes = #raw })
     else
-        luci.http.write_json({ ok = false, error = (err ~= "" and err or out) })
+        luci.http.write_json({ ok = false, error = err })
+    end
+end
+
+function action_import()
+    local body = luci.http.formvalue("config") or ""
+    luci.http.prepare_content("application/json")
+    if body == "" then
+        luci.http.write_json({ ok = false, error = "empty config — use chunked save" })
+        return
+    end
+    if not write_file(IMPORT_TMP, body) then
+        luci.http.write_json({ ok = false, error = "cannot write tmp" })
+        return
+    end
+    local ok, err = do_import_file(IMPORT_TMP)
+    if ok then
+        luci.http.write_json({ ok = true, bytes = #body })
+    else
+        luci.http.write_json({ ok = false, error = err })
     end
 end
 
