@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6b"
+VERSION="2026.11.07-zi6c"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -14,6 +14,7 @@ BYPASS_IPS="/tmp/zi_bypass_ips"        # resolved IPs currently excluded
 LOG="/var/log/zlt-ipsec.log"
 PID_WD="/var/run/zi_watchdog.pid"
 PID_FS="/var/run/zi_failsafe.pid"
+START_LOCK="/var/run/zi_start.lock"
 ROUTE_BAK="/tmp/zi_route_bak"
 SWANCTL_DIR="/tmp/zi_swanctl"
 SS_CONF="$DIR/strongswan.conf"
@@ -296,6 +297,7 @@ save_default_route() {
 emergency_flush() {
     # Hard recovery — restore LAN/SSH/web no matter what
     log "EMERGENCY FLUSH — killing IPsec/XFRM/NAT, restoring routes"
+    release_start_lock
     [ -f "$PID_FS" ] && kill "$(cat "$PID_FS" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_FS"
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
@@ -368,19 +370,32 @@ normalize_domain() {
 resolve_domain_ips() {
     _d="$1"
     _ips=""
-    # busybox nslookup / ping / getent — collect A records
+    # busybox nslookup prints DNS server Address first — only take answers after Name:
     if command -v nslookup >/dev/null 2>&1; then
-        _ips=$(nslookup "$_d" 1.1.1.1 2>/dev/null | awk '/^Address/ {print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
-        [ -n "$_ips" ] || _ips=$(nslookup "$_d" 2>/dev/null | awk '/^Address/ {print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        _ips=$(nslookup "$_d" 1.1.1.1 2>/dev/null | awk '
+            BEGIN { take=0 }
+            /^Name:/ { take=1; next }
+            take && /Address/ {
+                for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i
+            }
+        ')
+        [ -n "$_ips" ] || _ips=$(nslookup "$_d" 2>/dev/null | awk '
+            BEGIN { take=0 }
+            /^Name:/ { take=1; next }
+            take && /Address/ {
+                for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i
+            }
+        ')
     fi
     if [ -z "$_ips" ] && command -v resolveip >/dev/null 2>&1; then
         _ips=$(resolveip -4 "$_d" 2>/dev/null)
     fi
     if [ -z "$_ips" ]; then
-        # last resort: ping once (resolves via libc)
         _ips=$(ping -c 1 -W 2 "$_d" 2>/dev/null | sed -n 's/.*(\([0-9.]*\)).*/\1/p' | head -n1)
     fi
-    echo "$_ips" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u
+    # drop loopback / link-local / our ping DNS targets (must stay reachable via tunnel VIP)
+    echo "$_ips" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+        | grep -Ev '^(127\.|0\.|1\.1\.1\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9)$' | sort -u
 }
 
 wan_route_to() {
@@ -399,12 +414,20 @@ wan_route_to() {
     fi
 }
 
+ensure_bypass_nat_hook() {
+    iptables -t nat -N ZI_BYPASS 2>/dev/null || true
+    if iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null; then
+        return 0
+    fi
+    iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
+}
+
 apply_bypass() {
     # Resolve bypass domains -> host routes via WAN + NAT RETURN (no VIP SNAT)
     # Without SNAT-to-VIP, packets keep LAN source and miss XFRM VIP/32 policy = go via WAN.
+    # Never touch the VPN server IP — that would break IKE.
     ensure_dirs
-    iptables -t nat -N ZI_BYPASS 2>/dev/null || iptables -t nat -F ZI_BYPASS
-    # wipe old IP routes then rebuild
+    iptables -t nat -N ZI_BYPASS 2>/dev/null || true
     if [ -f "$BYPASS_IPS" ]; then
         while read -r _ip; do
             [ -n "$_ip" ] || continue
@@ -416,23 +439,23 @@ apply_bypass() {
 
     [ -s "$BYPASS_DOMAINS" ] || { log "bypass: no domains"; return 0; }
 
-    _n=0
+    _server=$(cat "$MAT/host" 2>/dev/null)
     while read -r _raw; do
         _d=$(normalize_domain "$_raw")
         [ -n "$_d" ] || continue
         case "$_d" in \#*) continue ;; esac
         resolve_domain_ips "$_d" | while read -r _ip; do
             [ -n "$_ip" ] || continue
+            # never bypass-route the IKE peer itself
+            [ -n "$_server" ] && [ "$_ip" = "$_server" ] && continue
             echo "$_ip" >> "$BYPASS_IPS"
             wan_route_to "$_ip"
             iptables -t nat -C ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null \
                 || iptables -t nat -A ZI_BYPASS -d "$_ip" -j RETURN 2>/dev/null || true
-            _n=$((_n + 1))
         done
         log "bypass domain=$_d"
     done < "$BYPASS_DOMAINS"
 
-    # de-dup ips file
     if [ -s "$BYPASS_IPS" ]; then
         sort -u "$BYPASS_IPS" -o "$BYPASS_IPS"
         _cnt=$(wc -l < "$BYPASS_IPS" | tr -d ' ')
@@ -440,6 +463,7 @@ apply_bypass() {
     else
         log "bypass: domains set but no IPs resolved yet"
     fi
+    ensure_bypass_nat_hook
 }
 
 bypass_add() {
@@ -453,12 +477,11 @@ bypass_add() {
         log "bypass-add $_d"
         echo "added: $_d"
     fi
-    # hot-apply if tunnel up
+    # hot-apply only when tunnel already up — never start/stop VPN here
     if is_up 2>/dev/null; then
-        apply_bypass
-        # ensure ZI_NAT jumps to bypass first
-        iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
-            || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
+        apply_bypass >/dev/null 2>&1 || true
+    else
+        echo "saved (will apply on next connect)"
     fi
 }
 
@@ -472,9 +495,9 @@ bypass_del() {
     fi
     log "bypass-del $_d"
     echo "removed: $_d"
-    is_up 2>/dev/null && apply_bypass
-    iptables -t nat -C ZI_NAT -j ZI_BYPASS 2>/dev/null \
-        || iptables -t nat -I ZI_NAT 1 -j ZI_BYPASS 2>/dev/null || true
+    if is_up 2>/dev/null; then
+        apply_bypass >/dev/null 2>&1 || true
+    fi
 }
 
 bypass_list() {
@@ -583,8 +606,7 @@ setup_tunnel_routes() {
     fi
     setup_mss_clamp
     setup_fast_dns
-    apply_bypass
-    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS+bypass)"
+    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS tuned)"
 }
 
 detect_vip() {
@@ -776,11 +798,44 @@ lan_self_ok() {
     return 0
 }
 
+acquire_start_lock() {
+    # mkdir lock — reject overlapping Connect (second start kills charon mid-AUTH)
+    if mkdir "$START_LOCK" 2>/dev/null; then
+        echo $$ > "$START_LOCK/pid"
+        return 0
+    fi
+    _age=9999
+    if [ -f "$START_LOCK/ts" ]; then
+        _ts=$(cat "$START_LOCK/ts" 2>/dev/null || echo 0)
+        _now=$(date +%s 2>/dev/null || echo 0)
+        _age=$((_now - _ts))
+    fi
+    # stale lock (>3 min) — steal
+    if [ "$_age" -gt 180 ] 2>/dev/null; then
+        log "WARN: stealing stale start lock (age=${_age}s)"
+        rm -rf "$START_LOCK"
+        mkdir "$START_LOCK" 2>/dev/null || return 1
+        echo $$ > "$START_LOCK/pid"
+        return 0
+    fi
+    return 1
+}
+
+release_start_lock() {
+    rm -rf "$START_LOCK" 2>/dev/null || true
+}
+
 start_vpn() {
     ensure_dirs
+    if ! acquire_start_lock; then
+        log "start ignored — another connect already in progress"
+        echo "busy: start already running"
+        return 0
+    fi
+    date +%s > "$START_LOCK/ts" 2>/dev/null || true
     log "start $VERSION (lockout-safe)"
-    [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
-    [ -s "$MAT/client.key" ] || prepare_material || return 1
+    [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; release_start_lock; return 1; }
+    [ -s "$MAT/client.key" ] || { prepare_material || { release_start_lock; return 1; }; }
     # Keep working Amnezia proposals (modp2048). Do not force Curve25519 — AUTH stalls.
     _ike=$(json_str "$PROFILE" ikeProposal)
     [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
@@ -797,12 +852,12 @@ start_vpn() {
     printf '%s' "$_ike" > "$MAT/ike"
     printf '%s' "$_esp" > "$MAT/esp"
     log "proposals ike=$_ike esp=$_esp"
-    ensure_stack || return 1
+    ensure_stack || { release_start_lock; return 1; }
     save_default_route
     arm_failsafe
     write_ss_conf
     prepare_swanctl_tree
-    start_charon || { emergency_flush; return 1; }
+    start_charon || { emergency_flush; release_start_lock; return 1; }
 
     _host=$(cat "$MAT/host")
     _loaded=0
@@ -818,6 +873,7 @@ start_vpn() {
     if [ "$_loaded" != "1" ]; then
         log "swanctl load failed (all auth variants)"
         emergency_flush
+        release_start_lock
         return 1
     fi
 
@@ -837,11 +893,13 @@ start_vpn() {
         swan --list-sas >>"$LOG" 2>&1 || true
         swan --list-certs >>"$LOG" 2>&1 || true
         emergency_flush
+        release_start_lock
         return 1
     fi
     if ! lan_self_ok; then
         log "LAN/default route broken after SA — emergency flush"
         emergency_flush
+        release_start_lock
         return 1
     fi
     _vip=$(detect_vip)
@@ -850,6 +908,7 @@ start_vpn() {
         swan --list-sas >>"$LOG" 2>&1 || true
         ip -4 addr >>"$LOG" 2>&1 || true
         emergency_flush
+        release_start_lock
         return 1
     fi
     setup_tunnel_nat "$_vip"
@@ -857,6 +916,7 @@ start_vpn() {
     if ! lan_self_ok; then
         log "LAN broken after NAT/routes — emergency flush"
         emergency_flush
+        release_start_lock
         return 1
     fi
     # Prove tunnel data path before keeping it
@@ -867,17 +927,21 @@ start_vpn() {
     else
         log "WARN: tunnel ping via VIP failed (DNS/path) — check SNAT/XFRM; still up for confirm"
     fi
+    # Domain bypass AFTER tunnel is healthy (DNS resolve must not race IKE)
+    apply_bypass >/dev/null 2>&1 || true
     echo "1" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "IPsec ESTABLISHED vip=$_vip"
     log "TIP: if sites work, click Confirm (or: zi-manager confirm) within ${FAILSAFE_SECS}s"
     start_watchdog
+    release_start_lock
     return 0
 }
 
 stop_vpn() {
     ensure_dirs
     log "stop"
+    release_start_lock
     cancel_failsafe
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"

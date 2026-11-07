@@ -1,7 +1,9 @@
 -- LuCI controller for ZLT IPsec (zi-manager)
 module("luci.controller.zlt_ipsec", package.seeall)
 
-local ZI_API_VERSION = 3
+local ZI_API_VERSION = 4
+local BYPASS_FILE = "/etc/zlt-ipsec/bypass_domains"
+local BYPASS_IPS_FILE = "/tmp/zi_bypass_ips"
 
 function index()
     entry({"admin", "services", "zlt_ipsec"}, template("zlt_ipsec_panel"), _("ZLT IPsec"), 60).dependent = false
@@ -125,52 +127,125 @@ function action_status()
         stack_root = read_file("/etc/zlt-ipsec/stack.root"),
         stack_ver = read_file("/etc/zlt-ipsec/stack.ver"),
         conf_preview = conf,
-        bypass_domains = read_file("/etc/zlt-ipsec/bypass_domains"),
-        bypass_ips = read_file("/tmp/zi_bypass_ips"),
+        bypass_domains = read_file(BYPASS_FILE),
+        bypass_ips = read_file(BYPASS_IPS_FILE),
         api_version = ZI_API_VERSION,
         manager_version = ver,
         manager_path = m
     })
 end
 
-function action_bypass_list()
+local function normalize_domain(d)
+    d = tostring(d or "")
+    d = d:gsub("^%s+", ""):gsub("%s+$", ""):gsub("\r", "")
+    d = d:lower()
+    d = d:gsub("^https?://", ""):gsub("/.*$", ""):gsub("^%*%.", "")
+    return d
+end
+
+local function list_bypass_domains()
+    local raw = read_file(BYPASS_FILE)
+    local out = {}
+    for line in string.gmatch(raw .. "\n", "([^\n]*)\n") do
+        line = normalize_domain(line)
+        if line ~= "" and not line:match("^#") then
+            out[#out + 1] = line
+        end
+    end
+    return out, raw
+end
+
+local function write_bypass_domains(list)
+    run("mkdir -p /etc/zlt-ipsec")
+    local fh = io.open(BYPASS_FILE, "w")
+    if not fh then return false end
+    for _, d in ipairs(list) do
+        fh:write(d .. "\n")
+    end
+    fh:close()
+    return true
+end
+
+local function apply_bypass_hot()
     local m = mgr()
-    local out = run(m .. " bypass-list")
+    if mgr_exists() then
+        run(m .. " bypass-apply >/dev/null 2>&1 &")
+    end
+end
+
+function action_bypass_list()
+    local list, raw = list_bypass_domains()
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         ok = true,
-        domains = read_file("/etc/zlt-ipsec/bypass_domains"),
-        ips = read_file("/tmp/zi_bypass_ips"),
-        detail = out
+        api_version = ZI_API_VERSION,
+        domains = table.concat(list, "\n"),
+        bypass_domains = table.concat(list, "\n"),
+        ips = read_file(BYPASS_IPS_FILE),
+        bypass_ips = read_file(BYPASS_IPS_FILE),
+        count = #list,
+        raw = raw
     })
 end
 
 function action_bypass_add()
-    local domain = luci.http.formvalue("domain") or ""
-    domain = domain:gsub("^%s+", ""):gsub("%s+$", "")
+    local domain = normalize_domain(luci.http.formvalue("domain") or "")
     if domain == "" then
-        luci.http.prepare_content("application/json")
+        -- OEM LuCI sometimes drops POST body; also accept QUERY_STRING
+        domain = normalize_domain(luci.http.formvalue("d") or "")
+    end
+    luci.http.prepare_content("application/json")
+    if domain == "" then
         luci.http.write_json({ ok = false, error = "empty domain" })
         return
     end
-    local m = mgr()
-    local out = run(m .. " bypass-add " .. shq(domain))
-    luci.http.prepare_content("application/json")
-    luci.http.write_json({ ok = true, detail = out })
+    local list = select(1, list_bypass_domains())
+    local found = false
+    for _, d in ipairs(list) do
+        if d == domain then found = true; break end
+    end
+    if not found then
+        list[#list + 1] = domain
+        if not write_bypass_domains(list) then
+            luci.http.write_json({ ok = false, error = "cannot write " .. BYPASS_FILE })
+            return
+        end
+    end
+    apply_bypass_hot()
+    luci.http.write_json({
+        ok = true,
+        domain = domain,
+        already = found,
+        domains = table.concat(list, "\n"),
+        bypass_domains = table.concat(list, "\n"),
+        count = #list
+    })
 end
 
 function action_bypass_del()
-    local domain = luci.http.formvalue("domain") or ""
-    domain = domain:gsub("^%s+", ""):gsub("%s+$", "")
+    local domain = normalize_domain(luci.http.formvalue("domain") or luci.http.formvalue("d") or "")
+    luci.http.prepare_content("application/json")
     if domain == "" then
-        luci.http.prepare_content("application/json")
         luci.http.write_json({ ok = false, error = "empty domain" })
         return
     end
-    local m = mgr()
-    local out = run(m .. " bypass-del " .. shq(domain))
-    luci.http.prepare_content("application/json")
-    luci.http.write_json({ ok = true, detail = out })
+    local list = select(1, list_bypass_domains())
+    local kept = {}
+    for _, d in ipairs(list) do
+        if d ~= domain then kept[#kept + 1] = d end
+    end
+    if not write_bypass_domains(kept) then
+        luci.http.write_json({ ok = false, error = "cannot write " .. BYPASS_FILE })
+        return
+    end
+    apply_bypass_hot()
+    luci.http.write_json({
+        ok = true,
+        domain = domain,
+        domains = table.concat(kept, "\n"),
+        bypass_domains = table.concat(kept, "\n"),
+        count = #kept
+    })
 end
 
 

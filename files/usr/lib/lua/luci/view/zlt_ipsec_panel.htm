@@ -194,54 +194,64 @@
 			document.getElementById("zi_sa").textContent = (data && data.sa) ? data.sa : "(no SA / swanctl unavailable)";
 		});
 	}
+	function zi_bypass_text(data) {
+		if (!data) return "";
+		var d = data.bypass_domains;
+		if (d == null || d === "") d = data.domains;
+		return d == null ? "" : String(d);
+	}
+	function zi_bypass_ips_text(data) {
+		if (!data) return "";
+		var d = data.bypass_ips;
+		if (d == null || d === "") d = data.ips;
+		return d == null ? "" : String(d);
+	}
 	function zi_render_bypass(data) {
-		var dom = (data && data.bypass_domains != null) ? data.bypass_domains : ((data && data.domains) || "");
-		var ips = (data && data.bypass_ips != null) ? data.bypass_ips : ((data && data.ips) || "");
+		var dom = zi_bypass_text(data);
+		var ips = zi_bypass_ips_text(data);
 		var elD = document.getElementById("zi_bypass_domains");
 		var elI = document.getElementById("zi_bypass_ips");
-		if (elD) {
-			elD.textContent = dom ? dom : "(none)";
-			elD.onclick = function(ev) {
-				var t = (ev.target && (ev.target.textContent || "")) || "";
-				/* click a line to delete: use prompt via button instead */
-			};
-		}
 		if (elI) elI.textContent = ips ? ips : "(none)";
-		/* build clickable delete list */
-		if (elD && dom) {
-			var lines = String(dom).split(/\n/);
-			elD.innerHTML = "";
-			for (var i = 0; i < lines.length; i++) {
-				var d = lines[i].replace(/^\s+|\s+$/g, "");
-				if (!d || d.charAt(0) === "#") continue;
+		if (!elD) return;
+		elD.innerHTML = "";
+		var lines = String(dom || "").split(/\n/);
+		var any = false;
+		for (var i = 0; i < lines.length; i++) {
+			var d = lines[i].replace(/^\s+|\s+$/g, "");
+			if (!d || d.charAt(0) === "#") continue;
+			any = true;
+			(function(dd) {
 				var row = document.createElement("div");
 				row.style.marginBottom = "4px";
 				var sp = document.createElement("span");
-				sp.textContent = d + " ";
+				sp.textContent = dd + " ";
 				var btn = document.createElement("button");
 				btn.type = "button";
 				btn.className = "cbi-button cbi-button-remove";
 				btn.textContent = "Remove";
-				btn.setAttribute("data-domain", d);
 				btn.onclick = function() {
-					var dd = this.getAttribute("data-domain");
-					zi_api("bypass_del", { domain: dd }, function(r) {
+					zi_api("bypass_del", { domain: dd, d: dd }, function(r) {
 						if (r && r.ok) { zi_msg(true, "Removed " + dd); zi_refresh_bypass(); }
 						else zi_msg(false, (r && r.error) || "remove failed");
-					}, true);
+					}, false);
 				};
 				row.appendChild(sp);
 				row.appendChild(btn);
 				elD.appendChild(row);
-			}
-			if (!elD.childNodes.length) elD.textContent = "(none)";
+			})(d);
 		}
+		if (!any) elD.textContent = "(none)";
 	}
 	function zi_refresh_bypass() {
 		zi_api("bypass_list", null, function(data) {
+			if (data && data.ok === false) {
+				zi_msg(false, "Bypass API missing — reinstall LuCI files (need API v4)");
+				return;
+			}
 			zi_render_bypass(data || {});
 		});
 	}
+	var zi_starting = false;
 	function zi_refresh_all() {
 		zi_refresh_status();
 		zi_refresh_log();
@@ -249,11 +259,21 @@
 		zi_refresh_bypass();
 	}
 	function zi_after_start() {
+		zi_starting = false;
 		zi_msg(true, "Connecting… then click Confirm within 90s");
 		setTimeout(function() {
 			zi_refresh_all();
 			zi_msg(true, "If panel/SSH still work — click Confirm now to keep the tunnel");
 		}, 2500);
+	}
+	function zi_do_start() {
+		if (zi_starting) { zi_msg(false, "Connect already running — wait"); return; }
+		zi_starting = true;
+		zi_api("start", null, function(r) {
+			if (r && r.ok === false) { zi_starting = false; zi_msg(false, r.error || "start failed"); return; }
+			zi_after_start();
+		});
+		setTimeout(function() { zi_starting = false; }, 25000);
 	}
 
 	function zi_b64url_to_u8(s) {
@@ -330,7 +350,7 @@
 				if (!data || !data.ok) { zi_msg(false, (data && data.error) || "import failed"); return; }
 				zi_msg(true, "Profile saved");
 				zi_refresh_all();
-				if (thenConnect) zi_api("start", null, zi_after_start);
+				if (thenConnect) zi_do_start();
 			}, true);
 		}).catch(function(e) {
 			zi_api("import", { config: raw }, function(data) {
@@ -340,7 +360,7 @@
 				}
 				zi_msg(true, "Profile saved");
 				zi_refresh_all();
-				if (thenConnect) zi_api("start", null, zi_after_start);
+				if (thenConnect) zi_do_start();
 			}, true);
 		});
 	}
@@ -357,14 +377,20 @@
 		});
 	}
 
-	document.getElementById("zi_btn_start").onclick = function() { zi_api("start", null, zi_after_start); };
+	document.getElementById("zi_btn_start").onclick = zi_do_start;
 	document.getElementById("zi_btn_confirm").onclick = function() {
 		zi_api("confirm", null, function() { zi_msg(true, "Tunnel confirmed — failsafe cancelled"); zi_refresh_all(); });
 	};
 	document.getElementById("zi_btn_stop").onclick = function() {
+		zi_starting = false;
 		zi_api("emergency", null, function() { zi_msg(true, "Emergency flush — LAN restored"); zi_refresh_all(); });
 	};
-	document.getElementById("zi_btn_restart").onclick = function() { zi_api("restart", null, zi_after_start); };
+	document.getElementById("zi_btn_restart").onclick = function() {
+		if (zi_starting) { zi_msg(false, "Connect already running — wait"); return; }
+		zi_starting = true;
+		zi_api("restart", null, zi_after_start);
+		setTimeout(function() { zi_starting = false; }, 25000);
+	};
 	document.getElementById("zi_btn_refresh").onclick = zi_refresh_all;
 	document.getElementById("zi_btn_save").onclick = function() { zi_save(false); };
 	document.getElementById("zi_btn_save_connect").onclick = function() { zi_save(true); };
@@ -373,13 +399,16 @@
 	document.getElementById("zi_btn_bypass_add").onclick = function() {
 		var d = document.getElementById("zi_bypass_domain").value.replace(/^\s+|\s+$/g, "");
 		if (!d) { zi_msg(false, "enter a domain"); return; }
-		zi_api("bypass_add", { domain: d }, function(r) {
+		zi_msg(true, "Adding " + d + "…");
+		/* GET — OEM LuCI often drops small POST bodies; also send d= alias */
+		zi_api("bypass_add", { domain: d, d: d }, function(r) {
 			if (r && r.ok) {
 				zi_msg(true, "Excluded " + d);
 				document.getElementById("zi_bypass_domain").value = "";
+				zi_render_bypass(r);
 				zi_refresh_bypass();
-			} else zi_msg(false, (r && r.error) || "add failed");
-		}, true);
+			} else zi_msg(false, (r && r.error) || "add failed — hard-refresh page / reinstall LuCI");
+		}, false);
 	};
 	document.getElementById("zi_btn_check").onclick = function() {
 		zi_api("ss_check", null, function(data) {
