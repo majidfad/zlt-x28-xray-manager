@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi7"
+VERSION="2026.11.07-zi8"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -51,7 +51,7 @@ write_ss_conf() {
     mkdir -p "$DIR" /etc/strongswan.d/charon 2>/dev/null || true
     # NO stroke plugin — old /etc/ipsec.secrets + /etc/singbox/*.p12 confuse AUTH
     cat > "$SS_CONF" << 'EOF'
-# zlt-ipsec generated (lockout-safe + speed, zi6)
+# zlt-ipsec generated (zi8 — reliable AUTH on cellular)
 charon {
     load_modular = no
     install_routes = no
@@ -60,8 +60,10 @@ charon {
     threads = 16
     reuse_ikesa = yes
     make_before_break = yes
+    # Cellular drops large UDP; keep IKE fragments small (default ~1280 fails often)
+    fragment_size = 512
     retransmit_tries = 5
-    retransmit_timeout = 3.0
+    retransmit_timeout = 2.0
     interfaces_use =
     interfaces_ignore =
     # vici only (no stroke) — avoids OEM/singbox leftover secrets
@@ -554,8 +556,8 @@ connections {
         proposals = ${_ike}
         encap = yes
         mobike = no
-        fragmentation = yes
-        send_cert = always
+        fragmentation = force
+        send_cert = ifasked
         local {
             auth = ${_lauth}
             certs = client.pem
@@ -668,20 +670,38 @@ lan_self_ok() {
     return 0
 }
 
+wait_sa_up() {
+    # Wait for ESTABLISHED; cellular AUTH + retransmit can take >60s
+    _max="${1:-90}"
+    _i=0
+    while [ "$_i" -lt "$_max" ]; do
+        if ! pidof charon >/dev/null 2>&1; then
+            log "wait_sa: charon died"
+            return 1
+        fi
+        is_up && return 0
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+do_initiate() {
+    # swanctl 5.9.2: initiate returns after kickoff; we wait for SA separately
+    swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
+        || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
+        || true
+    wait_sa_up 90
+}
+
 start_vpn() {
     ensure_dirs
     log "start $VERSION (lockout-safe)"
+    cancel_failsafe
     [ -f "$PROFILE" ] || { log "ERROR: no profile — import first"; return 1; }
     [ -s "$MAT/client.key" ] || prepare_material || return 1
-    # Keep working Amnezia proposals (modp2048). Do not force Curve25519 — AUTH stalls.
-    _ike=$(json_str "$PROFILE" ikeProposal)
-    [ -z "$_ike" ] && _ike=$(json_str "$PROFILE" ike-proposal)
-    [ -z "$_ike" ] && _ike=$(cat "$MAT/ike" 2>/dev/null)
-    [ -z "$_ike" ] && _ike="aes256-sha256-modp2048"
-    # If a previous zi5 run forced curve25519-first, prefer stable modp2048 again
-    case "$_ike" in
-        *curve25519*|*CURVE*) _ike="aes256-sha256-modp2048,aes256-sha256-curve25519" ;;
-    esac
+    # Stable Amnezia proposal only (Curve25519 caused AUTH stalls on this server)
+    _ike="aes256-sha256-modp2048"
     _esp=$(json_str "$PROFILE" espProposal)
     [ -z "$_esp" ] && _esp=$(json_str "$PROFILE" esp-proposal)
     [ -z "$_esp" ] && _esp=$(cat "$MAT/esp" 2>/dev/null)
@@ -691,14 +711,14 @@ start_vpn() {
     log "proposals ike=$_ike esp=$_esp"
     ensure_stack || return 1
     save_default_route
-    arm_failsafe
+    # Failsafe ONLY after SA is up — never during handshake (was killing AUTH)
     write_ss_conf
     prepare_swanctl_tree
-    start_charon || { emergency_flush; return 1; }
+    start_charon || { log "charon start failed"; stop_daemons; return 1; }
 
     _host=$(cat "$MAT/host")
     _loaded=0
-    for _try in "pubkey|%any" "pubkey|$_host" "ike:rsa/pss-sha256|%any"; do
+    for _try in "pubkey|%any" "pubkey|$_host"; do
         _a="${_try%%|*}"
         _r="${_try##*|}"
         if load_conn_try "$_a" "$_r"; then
@@ -708,28 +728,27 @@ start_vpn() {
         log "load failed for auth=$_a id=$_r — next"
     done
     if [ "$_loaded" != "1" ]; then
-        log "swanctl load failed (all auth variants)"
-        emergency_flush
+        log "swanctl load failed"
+        stop_daemons
         return 1
     fi
 
-    swan --initiate --child "$CONN" >>"$LOG" 2>&1 \
-        || swan --initiate --ike "$CONN" >>"$LOG" 2>&1 \
-        || true
-    # AUTH is fragmented over cellular — give reassembly time
-    _i=0
-    while [ "$_i" -lt 20 ]; do
-        is_up && break
-        sleep 1
-        _i=$((_i + 1))
-    done
-    if ! is_up; then
-        log "initiate failed — see swanctl list-*"
-        swan --list-conns >>"$LOG" 2>&1 || true
-        swan --list-sas >>"$LOG" 2>&1 || true
-        swan --list-certs >>"$LOG" 2>&1 || true
-        emergency_flush
-        return 1
+    log "initiating IKE (may take up to ~90s on cellular)…"
+    if ! do_initiate; then
+        log "first initiate failed — clean retry once"
+        stop_daemons
+        sleep 2
+        start_charon || { log "charon restart failed"; return 1; }
+        load_conn_try "pubkey" "%any" || load_conn_try "pubkey" "$_host" || {
+            log "swanctl reload failed"; stop_daemons; return 1
+        }
+        if ! do_initiate; then
+            log "initiate failed after retry"
+            [ -S /var/run/charon.vici ] && swan --list-sas >>"$LOG" 2>&1 || true
+            stop_daemons
+            restore_default_route
+            return 1
+        fi
     fi
     if ! lan_self_ok; then
         log "LAN/default route broken after SA — emergency flush"
@@ -738,9 +757,8 @@ start_vpn() {
     fi
     _vip=$(detect_vip)
     if [ -z "$_vip" ]; then
-        log "ERROR: could not detect IPsec VIP (want 192.168.43.x) — refusing bad SNAT"
-        swan --list-sas >>"$LOG" 2>&1 || true
-        ip -4 addr >>"$LOG" 2>&1 || true
+        log "ERROR: could not detect IPsec VIP (want 192.168.43.x)"
+        [ -S /var/run/charon.vici ] && swan --list-sas >>"$LOG" 2>&1 || true
         emergency_flush
         return 1
     fi
@@ -751,18 +769,17 @@ start_vpn() {
         emergency_flush
         return 1
     fi
-    # Prove tunnel data path before keeping it
-    _t=$(ping_target)
-    if ping -I "$_vip" -c 2 -W 5 "$_t" >/dev/null 2>&1; then
-        log "tunnel ping OK via VIP $_vip -> $_t"
-        confirm_tunnel
-    else
-        log "WARN: tunnel ping via VIP failed (DNS/path) — check SNAT/XFRM; still up for confirm"
-    fi
     echo "1" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "IPsec ESTABLISHED vip=$_vip"
-    log "TIP: if sites work, click Confirm (or: zi-manager confirm) within ${FAILSAFE_SECS}s"
+    _t=$(ping_target)
+    if ping -I "$_vip" -c 2 -W 5 "$_t" >/dev/null 2>&1; then
+        log "tunnel ping OK via VIP $_vip -> $_t — keeping tunnel (no failsafe)"
+        confirm_tunnel
+    else
+        log "WARN: tunnel ping failed — failsafe ${FAILSAFE_SECS}s (Confirm in UI if sites work)"
+        arm_failsafe
+    fi
     start_watchdog
     return 0
 }
