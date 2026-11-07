@@ -3,14 +3,14 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6f"
+VERSION="2026.11.07-zi6g"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
 STATE_FILE="$DIR/active"          # 1 = tunnel desired (manual); boot needs autostart file
 FAIL_FILE="$DIR/ping_fails"
-BYPASS_DOMAINS="$DIR/bypass_domains"   # one domain per line (excluded from tunnel)
-BYPASS_SUFFIXES="$DIR/bypass_suffixes" # TLD/suffix lines e.g. .ir (dnsmasq→ipset)
+BYPASS_DOMAINS="$DIR/bypass_domains"   # domain tree per line (name + all subdomains via dnsmasq)
+BYPASS_SUFFIXES="$DIR/bypass_suffixes" # legacy TLD file (still merged); prefer bypass_domains
 BYPASS_IPS="/tmp/zi_bypass_ips"        # resolved IPs currently excluded
 BYPASS_IPSET="zi_bypass"
 BYPASS_DNSMASQ="/tmp/dnsmasq.d/zi-bypass.conf"
@@ -554,10 +554,37 @@ normalize_suffix() {
     echo ".$_s"
 }
 
+normalize_domain() {
+    echo "$1" | tr 'A-Z' 'a-z' | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's|^https\{0,1\}://||' -e 's|/.*||' -e 's/^\*\.//'
+}
+
+# One chooser entry: "example.com" (site+subdomains) or ".ir" (whole TLD)
+normalize_bypass_entry() {
+    _raw=$(echo "$1" | tr 'A-Z' 'a-z' | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's|^https\{0,1\}://||' -e 's|/.*||')
+    [ -n "$_raw" ] || { echo ""; return; }
+    case "$_raw" in
+        \*.*) _raw="${_raw#*.}" ;;
+    esac
+    # leading-dot or bare label without a dot → TLD/suffix form (.ir)
+    case "$_raw" in
+        .*) echo "$_raw"; return ;;
+        *.*) echo "$_raw"; return ;;
+        *) echo ".$_raw"; return ;;
+    esac
+}
+
+dnsmasq_ipset_pattern() {
+    # dnsmasq /google.com/ matches google.com + *.google.com; /.ir/ matches *.ir
+    _e=$(normalize_bypass_entry "$1")
+    [ -n "$_e" ] || return
+    echo "$_e"
+}
+
 ensure_bypass_ipset() {
     command -v ipset >/dev/null 2>&1 || return 1
     if ! ipset list "$BYPASS_IPSET" >/dev/null 2>&1; then
-        # timeout so CDN IPs rotate; maxelem for busy .ir browsing
         ipset create "$BYPASS_IPSET" hash:ip family inet timeout 86400 maxelem 65536 2>/dev/null \
             || ipset create "$BYPASS_IPSET" hash:ip family inet 2>/dev/null \
             || return 1
@@ -565,56 +592,67 @@ ensure_bypass_ipset() {
     return 0
 }
 
-install_suffix_dnsmasq() {
-    # dnsmasq fills ipset whenever LAN resolves matching names (clients must use router DNS)
+iter_bypass_entries() {
+    # print unified chooser list (domains + legacy suffixes)
+    [ -f "$BYPASS_DOMAINS" ] && cat "$BYPASS_DOMAINS"
+    [ -f "$BYPASS_SUFFIXES" ] && cat "$BYPASS_SUFFIXES"
+}
+
+install_bypass_dnsmasq() {
+    # Every chosen domain → dnsmasq ipset (covers that name + ALL subdomains)
+    # LAN clients must use this router as DNS.
     ensure_dirs
     mkdir -p /tmp/dnsmasq.d /etc/dnsmasq.d 2>/dev/null || true
-    : > "$BYPASS_DNSMASQ"
-    if [ ! -s "$BYPASS_SUFFIXES" ]; then
+    _any=0
+    iter_bypass_entries | while read -r _raw; do
+        _e=$(dnsmasq_ipset_pattern "$_raw")
+        [ -n "$_e" ] || continue
+        case "$_e" in \#*) continue ;; esac
+        _any=1
+        break
+    done
+    _lines=$(iter_bypass_entries | while read -r _raw; do
+        _e=$(dnsmasq_ipset_pattern "$_raw")
+        [ -n "$_e" ] || continue
+        case "$_e" in \#*) continue ;; esac
+        echo "ipset=/${_e}/${BYPASS_IPSET}"
+    done | sort -u)
+
+    if [ -z "$_lines" ]; then
         rm -f "$BYPASS_DNSMASQ" /etc/dnsmasq.d/zi-bypass.conf 2>/dev/null || true
         killall -HUP dnsmasq 2>/dev/null || true
         return 0
     fi
-    ensure_bypass_ipset || { log "WARN: ipset missing — cannot auto-bypass TLDs like .ir"; return 1; }
+    ensure_bypass_ipset || { log "WARN: ipset missing — install ipset for full domain-tree bypass"; return 1; }
     {
-        echo "# zi-manager suffix bypass — do not edit"
-        while read -r _raw; do
-            _s=$(normalize_suffix "$_raw")
-            [ -n "$_s" ] || continue
-            case "$_s" in \#*) continue ;; esac
-            # /.ir/ matches foo.ir, www.foo.ir, ...
-            echo "ipset=/${_s}/${BYPASS_IPSET}"
-        done < "$BYPASS_SUFFIXES"
+        echo "# zi-manager domain bypass (name + all subdomains) — do not edit"
+        echo "$_lines"
     } > "$BYPASS_DNSMASQ"
     cp -f "$BYPASS_DNSMASQ" /etc/dnsmasq.d/zi-bypass.conf 2>/dev/null || true
     killall -HUP dnsmasq 2>/dev/null || true
-    # restart if HUP not enough (some OEM builds)
     if ! killall -0 dnsmasq 2>/dev/null; then
         /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
-    log "suffix bypass dnsmasq: $(tr '\n' ' ' < "$BYPASS_SUFFIXES")"
+    log "bypass dnsmasq trees: $(echo "$_lines" | sed 's|.*/\([^/]*\)/.*|\1|' | tr '\n' ' ')"
 }
 
+# back-compat name
+install_suffix_dnsmasq() { install_bypass_dnsmasq "$@"; }
+
 apply_suffix_bypass_nat() {
-    # Skip VIP SNAT for any IP dnsmasq put in zi_bypass (e.g. all *.ir)
+    # Skip VIP SNAT for any IP in zi_bypass (filled by dnsmasq for chosen domains)
     ensure_bypass_ipset || return 1
     if ! iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
         return 0
     fi
     clean_suffix_bypass_rules
-    # probe xt_set
     if ! iptables -t nat -I ZI_NAT 1 -m set --match-set "$BYPASS_IPSET" dst -j RETURN 2>/tmp/zi_ipset.err; then
-        log "WARN: iptables -m set failed (no xt_set?) — .ir bypass inactive"
+        log "WARN: iptables -m set failed (no xt_set?) — domain-tree bypass inactive"
         cat /tmp/zi_ipset.err >>"$LOG" 2>/dev/null || true
         return 1
     fi
-    log "suffix bypass NAT: match-set $BYPASS_IPSET → skip VIP SNAT"
+    log "bypass NAT: match-set $BYPASS_IPSET → skip VIP SNAT (chosen domains + subdomains)"
     return 0
-}
-
-normalize_domain() {
-    echo "$1" | tr 'A-Z' 'a-z' | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-        -e 's|^https\{0,1\}://||' -e 's|/.*||' -e 's/^\*\.//'
 }
 
 resolve_domain_ips() {
@@ -665,39 +703,27 @@ wan_route_to() {
 }
 
 apply_bypass() {
-    # Exclude domains from tunnel:
-    #  A) exact domains → resolve IPs → ZI_NAT RETURN + WAN /32 + xfrm bypass
-    #  B) suffixes (.ir) → dnsmasq ipset + ZI_NAT -m set --match-set zi_bypass
+    # Chosen domain = that name + ALL subdomains (dnsmasq ipset) + seed IPs when resolvable
     ensure_dirs
     clean_bypass
 
-    _has_dom=0; _has_suf=0
-    [ -s "$BYPASS_DOMAINS" ] && _has_dom=1
-    [ -s "$BYPASS_SUFFIXES" ] && _has_suf=1
-    if [ "$_has_dom" = "0" ] && [ "$_has_suf" = "0" ]; then
+    _has=0
+    [ -s "$BYPASS_DOMAINS" ] && _has=1
+    [ -s "$BYPASS_SUFFIXES" ] && _has=1
+    if [ "$_has" = "0" ]; then
         clean_suffix_bypass_full
-        log "bypass: no domains/suffixes"
+        log "bypass: no domains chosen"
         return 0
     fi
 
-    # Suffix path works even before tunnel (dnsmasq fills set); NAT rule needs ZI_NAT
-    if [ "$_has_suf" = "1" ]; then
-        install_suffix_dnsmasq || true
-        if iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
-            apply_suffix_bypass_nat || true
-        else
-            log "bypass: suffixes saved; NAT set-match applies when tunnel is up"
-        fi
+    install_bypass_dnsmasq || true
+    if iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
+        apply_suffix_bypass_nat || true
     else
-        clean_suffix_bypass_full
-    fi
-
-    if [ "$_has_dom" = "0" ]; then
-        return 0
+        log "bypass: list saved; NAT set-match applies when tunnel is up"
     fi
 
     if ! iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
-        log "bypass: ZI_NAT missing (tunnel not up) — domains saved only"
         return 0
     fi
 
@@ -706,129 +732,92 @@ apply_bypass() {
     : > "$BYPASS_IPS"
     ensure_bypass_ipset 2>/dev/null || true
 
-    while read -r _raw; do
-        _d=$(normalize_domain "$_raw")
-        [ -n "$_d" ] || continue
-        case "$_d" in \#*) continue ;; esac
-        _resolved=$(resolve_domain_ips "$_d")
-        if [ -z "$_resolved" ]; then
-            log "bypass domain=$_d (no A record yet)"
-            continue
-        fi
-        echo "$_resolved" | while read -r _ip; do
-            [ -n "$_ip" ] || continue
-            [ -n "$_server" ] && [ "$_ip" = "$_server" ] && continue
-            echo "$_ip" >> "$BYPASS_IPS"
-            wan_route_to "$_ip"
-            iptables -t nat -C ZI_NAT -d "$_ip" -j RETURN 2>/dev/null \
-                || iptables -t nat -I ZI_NAT 1 -d "$_ip" -j RETURN 2>/dev/null || true
-            xfrm_bypass_add "$_ip" "$_vip"
-            ipset add "$BYPASS_IPSET" "$_ip" 2>/dev/null || true
-            command -v conntrack >/dev/null 2>&1 && conntrack -D -d "$_ip" 2>/dev/null || true
+    # Seed currently-known A records (apex + www) for each chosen domain (skip pure TLDs like .ir)
+    iter_bypass_entries | while read -r _raw; do
+        _e=$(normalize_bypass_entry "$_raw")
+        [ -n "$_e" ] || continue
+        case "$_e" in \#*) continue ;; esac
+        case "$_e" in
+            .*) continue ;;  # TLD — only dnsmasq can fill IPs as sites are visited
+        esac
+        for _host in "$_e" "www.$_e"; do
+            _resolved=$(resolve_domain_ips "$_host")
+            [ -n "$_resolved" ] || continue
+            echo "$_resolved" | while read -r _ip; do
+                [ -n "$_ip" ] || continue
+                [ -n "$_server" ] && [ "$_ip" = "$_server" ] && continue
+                echo "$_ip" >> "$BYPASS_IPS"
+                wan_route_to "$_ip"
+                iptables -t nat -C ZI_NAT -d "$_ip" -j RETURN 2>/dev/null \
+                    || iptables -t nat -I ZI_NAT 1 -d "$_ip" -j RETURN 2>/dev/null || true
+                xfrm_bypass_add "$_ip" "$_vip"
+                ipset add "$BYPASS_IPSET" "$_ip" 2>/dev/null || true
+                command -v conntrack >/dev/null 2>&1 && conntrack -D -d "$_ip" 2>/dev/null || true
+            done
+            log "bypass seed $_host ips=$(echo $_resolved | tr '\n' ' ')"
         done
-        log "bypass domain=$_d ips=$(echo $_resolved | tr '\n' ' ')"
-    done < "$BYPASS_DOMAINS"
+    done
 
     if [ -s "$BYPASS_IPS" ]; then
         sort -u "$BYPASS_IPS" -o "$BYPASS_IPS"
         _cnt=$(wc -l < "$BYPASS_IPS" | tr -d ' ')
-        log "bypass active: $_cnt IP(s) via WAN + xfrm bypass (excluded from tunnel)"
+        log "bypass active: $_cnt seeded IP(s) + dnsmasq tree for chosen domains"
     else
-        log "bypass: domains set but no IPs resolved yet"
+        log "bypass: dnsmasq tree active — visit sites to fill ipset (or wait for DNS)"
     fi
 }
 
 bypass_suffix_add() {
-    ensure_dirs
-    _s=$(normalize_suffix "$1")
-    [ -n "$_s" ] || { echo "Usage: zi-manager bypass-suffix-add .ir"; return 1; }
-    if grep -qxF "$_s" "$BYPASS_SUFFIXES" 2>/dev/null; then
-        echo "already: $_s"
-    else
-        echo "$_s" >> "$BYPASS_SUFFIXES"
-        log "bypass-suffix-add $_s"
-        echo "added suffix: $_s"
-    fi
-    apply_bypass >/dev/null 2>&1 || true
+    # alias → unified chooser list
+    bypass_add "$1"
 }
 
 bypass_suffix_del() {
-    ensure_dirs
-    _s=$(normalize_suffix "$1")
-    [ -n "$_s" ] || { echo "Usage: zi-manager bypass-suffix-del .ir"; return 1; }
-    if [ -f "$BYPASS_SUFFIXES" ]; then
-        grep -vxF "$_s" "$BYPASS_SUFFIXES" > "$BYPASS_SUFFIXES.tmp" 2>/dev/null || true
-        mv -f "$BYPASS_SUFFIXES.tmp" "$BYPASS_SUFFIXES"
-    fi
-    log "bypass-suffix-del $_s"
-    echo "removed suffix: $_s"
-    apply_bypass >/dev/null 2>&1 || true
+    bypass_del "$1"
 }
 
 bypass_add() {
     ensure_dirs
-    # .ir / *.ir → suffix; digikala.ir → exact host; bare "ir" → suffix
-    case "$1" in
-        .*)  bypass_suffix_add "$1"; return $? ;;
-        \*.*) bypass_suffix_add "$1"; return $? ;;
-    esac
-    _d=$(normalize_domain "$1")
-    [ -n "$_d" ] || { echo "Usage: zi-manager bypass-add <domain>"; return 1; }
-    case "$_d" in
-        *.*) ;;
-        *) bypass_suffix_add "$_d"; return $? ;;
-    esac
-    if grep -qxF "$_d" "$BYPASS_DOMAINS" 2>/dev/null; then
-        echo "already: $_d"
+    _e=$(normalize_bypass_entry "$1")
+    [ -n "$_e" ] || { echo "Usage: zi-manager bypass-add <domain|suffix>"; echo "  e.g. digikala.ir  (site + all subdomains)"; echo "       .ir          (whole TLD)"; return 1; }
+    if grep -qxF "$_e" "$BYPASS_DOMAINS" 2>/dev/null || grep -qxF "$_e" "$BYPASS_SUFFIXES" 2>/dev/null; then
+        echo "already: $_e"
     else
-        echo "$_d" >> "$BYPASS_DOMAINS"
-        log "bypass-add $_d"
-        echo "added: $_d"
+        echo "$_e" >> "$BYPASS_DOMAINS"
+        log "bypass-add $_e (domain tree: name + all subdomains)"
+        echo "added: $_e  (excludes $_e and all subdomains)"
     fi
-    if is_up 2>/dev/null; then
-        apply_bypass >/dev/null 2>&1 || true
-    else
-        echo "saved (will apply on next connect)"
-    fi
+    apply_bypass >/dev/null 2>&1 || true
 }
 
 bypass_del() {
     ensure_dirs
-    case "$1" in
-        .*)  bypass_suffix_del "$1"; return $? ;;
-        \*.*) bypass_suffix_del "$1"; return $? ;;
-    esac
-    _d=$(normalize_domain "$1")
-    [ -n "$_d" ] || { echo "Usage: zi-manager bypass-del <domain>"; return 1; }
-    case "$_d" in
-        *.*) ;;
-        *) bypass_suffix_del "$_d"; return $? ;;
-    esac
+    _e=$(normalize_bypass_entry "$1")
+    [ -n "$_e" ] || { echo "Usage: zi-manager bypass-del <domain|suffix>"; return 1; }
     if [ -f "$BYPASS_DOMAINS" ]; then
-        grep -vxF "$_d" "$BYPASS_DOMAINS" > "$BYPASS_DOMAINS.tmp" 2>/dev/null || true
+        grep -vxF "$_e" "$BYPASS_DOMAINS" > "$BYPASS_DOMAINS.tmp" 2>/dev/null || true
         mv -f "$BYPASS_DOMAINS.tmp" "$BYPASS_DOMAINS"
     fi
-    log "bypass-del $_d"
-    echo "removed: $_d"
-    if is_up 2>/dev/null; then
-        apply_bypass >/dev/null 2>&1 || true
+    if [ -f "$BYPASS_SUFFIXES" ]; then
+        grep -vxF "$_e" "$BYPASS_SUFFIXES" > "$BYPASS_SUFFIXES.tmp" 2>/dev/null || true
+        mv -f "$BYPASS_SUFFIXES.tmp" "$BYPASS_SUFFIXES"
     fi
+    log "bypass-del $_e"
+    echo "removed: $_e"
+    apply_bypass >/dev/null 2>&1 || true
 }
 
 bypass_list() {
     ensure_dirs
-    echo "=== bypass domains ==="
-    if [ -s "$BYPASS_DOMAINS" ]; then cat "$BYPASS_DOMAINS"; else echo "(none)"; fi
-    echo "=== bypass suffixes (TLD) ==="
-    if [ -s "$BYPASS_SUFFIXES" ]; then cat "$BYPASS_SUFFIXES"; else echo "(none)"; fi
-    echo "=== resolved IPs (WAN) ==="
+    echo "=== excluded domains (each = name + all subdomains) ==="
+    _u=$(iter_bypass_entries | while read -r _r; do normalize_bypass_entry "$_r"; done | grep -v '^$' | sort -u)
+    if [ -n "$_u" ]; then echo "$_u"; else echo "(none)"; fi
+    echo "=== resolved / seeded IPs ==="
     if [ -s "$BYPASS_IPS" ]; then cat "$BYPASS_IPS"; else echo "(none)"; fi
-    echo "=== ipset $BYPASS_IPSET ==="
+    echo "=== ipset $BYPASS_IPSET (grows as DNS resolves) ==="
     ipset list "$BYPASS_IPSET" 2>/dev/null | head -n 40 || echo "(none / ipset missing)"
     echo "=== ZI_NAT bypass rules ==="
     iptables -t nat -S ZI_NAT 2>/dev/null | grep -E 'RETURN|match-set' || echo "(none)"
-    echo "=== xfrm bypass policies ==="
-    ip xfrm policy 2>/dev/null | awk '/action bypass/{print; for(i=0;i<3;i++){if(getline>0)print}}' || echo "(none)"
 }
 
 setup_tunnel_nat() {
