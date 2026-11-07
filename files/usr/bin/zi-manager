@@ -3,7 +3,7 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6"
+VERSION="2026.11.07-zi7"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
@@ -304,6 +304,7 @@ emergency_flush() {
     ip xfrm state flush 2>/dev/null || true
     ip xfrm policy flush 2>/dev/null || true
     clean_tunnel_nat
+    clean_quic_block
     clean_mss
     clean_mangle
     clean_policy_routing
@@ -378,37 +379,68 @@ setup_tunnel_nat() {
 
 clean_mss() {
     iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
     iptables -t mangle -F ZI_MSS 2>/dev/null || true
     iptables -t mangle -X ZI_MSS 2>/dev/null || true
 }
 
 setup_mss_clamp() {
-    # Cellular + ESP-UDP overhead → without MSS clamp browsing feels “sticky”
+    # Cellular + ESP-in-UDP overhead → wrong MSS = slow first bytes / video start
     clean_mss
     iptables -t mangle -N ZI_MSS 2>/dev/null || iptables -t mangle -F ZI_MSS
-    # 1280 works well for NAT-T on LTE/5G; clamp-mss-to-pmtu as helper
     iptables -t mangle -A ZI_MSS -j TCPMSS --set-mss 1280 2>/dev/null || true
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null \
         || iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
-    log "TCP MSS clamped to 1280 (smooth browsing over ESP)"
+    iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null \
+        || iptables -t mangle -I OUTPUT -p tcp --tcp-flags SYN,RST SYN -j ZI_MSS 2>/dev/null || true
+    log "TCP MSS clamped to 1280"
+}
+
+clean_quic_block() {
+    iptables -D FORWARD -p udp --dport 443 -j ZI_NOQUIC 2>/dev/null || true
+    iptables -D FORWARD -p udp --sport 443 -j ZI_NOQUIC 2>/dev/null || true
+    iptables -D OUTPUT -p udp --dport 443 -j ZI_NOQUIC 2>/dev/null || true
+    iptables -F ZI_NOQUIC 2>/dev/null || true
+    iptables -X ZI_NOQUIC 2>/dev/null || true
+}
+
+setup_quic_block() {
+    # YouTube/Instagram try HTTP/3 (QUIC/UDP443) first; over IPsec it stalls then falls
+    # back to TCP — feels like “video opens delayed”. REJECT makes fallback instant.
+    clean_quic_block
+    iptables -N ZI_NOQUIC 2>/dev/null || iptables -F ZI_NOQUIC
+    iptables -A ZI_NOQUIC -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
+        || iptables -A ZI_NOQUIC -j DROP
+    iptables -I FORWARD -p udp --dport 443 -j ZI_NOQUIC 2>/dev/null || true
+    iptables -I FORWARD -p udp --sport 443 -j ZI_NOQUIC 2>/dev/null || true
+    iptables -I OUTPUT -p udp --dport 443 -j ZI_NOQUIC 2>/dev/null || true
+    log "QUIC/UDP443 blocked → apps use TCP (faster YouTube/IG start over VPN)"
 }
 
 setup_fast_dns() {
-    # INTERNAL_IP4_DNS often fails on OEM ("handling ... failed") — force fast resolvers
-    mkdir -p /tmp/zi_dns_bak
+    # INTERNAL_IP4_DNS often fails on OEM — force fast resolvers for router + dnsmasq
+    mkdir -p /tmp/zi_dns_bak /tmp/dnsmasq.d
     [ -f /tmp/resolv.conf.auto ] && cp -a /tmp/resolv.conf.auto /tmp/zi_dns_bak/resolv.conf.auto 2>/dev/null || true
     [ -f /etc/resolv.conf ] && cp -a /etc/resolv.conf /tmp/zi_dns_bak/resolv.conf 2>/dev/null || true
-    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2 rotate\n' > /tmp/resolv.conf.auto
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:2 rotate\n' > /tmp/resolv.conf.auto
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf 2>/dev/null || true
+    # LAN clients usually use modem DNS — push upstream to Cloudflare/Google
+    printf 'server=1.1.1.1\nserver=8.8.8.8\nno-resolv\n' > /tmp/dnsmasq.d/zi.conf 2>/dev/null || true
+    # Some OEM images use /tmp/dnsmasq.conf include path differently
+    if [ -d /etc/dnsmasq.d ]; then
+        printf 'server=1.1.1.1\nserver=8.8.8.8\n' > /etc/dnsmasq.d/zi.conf 2>/dev/null || true
+    fi
     killall -HUP dnsmasq 2>/dev/null || true
-    # If odhcpd/dnsmasq ignore resolv.conf.auto, still help router-originated lookups
-    log "DNS set to 1.1.1.1/8.8.8.8 (Amnezia CPRP DNS install failed on OEM)"
+    /etc/init.d/dnsmasq reload 2>/dev/null || true
+    log "DNS → 1.1.1.1/8.8.8.8 (router + dnsmasq)"
 }
 
 restore_dns() {
     [ -f /tmp/zi_dns_bak/resolv.conf.auto ] && cp -a /tmp/zi_dns_bak/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null || true
     [ -f /tmp/zi_dns_bak/resolv.conf ] && cp -a /tmp/zi_dns_bak/resolv.conf /etc/resolv.conf 2>/dev/null || true
+    rm -f /tmp/dnsmasq.d/zi.conf /etc/dnsmasq.d/zi.conf 2>/dev/null || true
     killall -HUP dnsmasq 2>/dev/null || true
+    /etc/init.d/dnsmasq reload 2>/dev/null || true
 }
 
 setup_tunnel_routes() {
@@ -442,8 +474,9 @@ setup_tunnel_routes() {
         printf '%s\n' "1.1.1.1" > "$MAT/dns1"
     fi
     setup_mss_clamp
+    setup_quic_block
     setup_fast_dns
-    log "tunnel routes ready (WAN default preserved; VIP=$_vip; MSS+DNS tuned)"
+    log "tunnel routes ready (VIP=$_vip; MSS+QUIC-block+DNS)"
 }
 
 detect_vip() {
@@ -741,6 +774,7 @@ stop_vpn() {
     [ -f "$PID_WD" ] && kill "$(cat "$PID_WD" 2>/dev/null)" 2>/dev/null || true
     rm -f "$PID_WD"
     clean_tunnel_nat
+    clean_quic_block
     clean_mss
     clean_mangle
     clean_policy_routing
