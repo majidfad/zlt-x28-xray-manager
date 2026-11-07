@@ -3,14 +3,17 @@
 # zi-manager — ZLT-X28 IPsec/IKEv2 engine (tunnel + healthcheck)
 # Fresh implementation — not based on sb-manager.
 # ============================================================
-VERSION="2026.11.07-zi6e"
+VERSION="2026.11.07-zi6f"
 DIR="/etc/zlt-ipsec"
 PROFILE="$DIR/profile.json"
 MAT="$DIR/material"
 STATE_FILE="$DIR/active"          # 1 = tunnel desired (manual); boot needs autostart file
 FAIL_FILE="$DIR/ping_fails"
 BYPASS_DOMAINS="$DIR/bypass_domains"   # one domain per line (excluded from tunnel)
+BYPASS_SUFFIXES="$DIR/bypass_suffixes" # TLD/suffix lines e.g. .ir (dnsmasq→ipset)
 BYPASS_IPS="/tmp/zi_bypass_ips"        # resolved IPs currently excluded
+BYPASS_IPSET="zi_bypass"
+BYPASS_DNSMASQ="/tmp/dnsmasq.d/zi-bypass.conf"
 LOG="/var/log/zlt-ipsec.log"
 PID_WD="/var/run/zi_watchdog.pid"
 PID_FS="/var/run/zi_failsafe.pid"
@@ -27,9 +30,10 @@ FAILSAFE_SECS="${ZI_FAILSAFE_SECS:-90}"   # auto emergency-stop unless confirmed
 log() { echo "[zi] $*" | tee -a "$LOG" 2>/dev/null; echo "[System] $*" >> "$LOG" 2>/dev/null; }
 
 ensure_dirs() {
-    mkdir -p "$DIR" "$MAT" /tmp/zi-bin /var/run 2>/dev/null || true
+    mkdir -p "$DIR" "$MAT" /tmp/zi-bin /var/run /tmp/dnsmasq.d 2>/dev/null || true
     : >> "$LOG" 2>/dev/null || true
     [ -f "$BYPASS_DOMAINS" ] || : > "$BYPASS_DOMAINS"
+    [ -f "$BYPASS_SUFFIXES" ] || : > "$BYPASS_SUFFIXES"
 }
 
 prefer_bins() {
@@ -439,6 +443,8 @@ emergency_flush() {
     clean_policy_routing
     restore_dns
     restore_default_route
+    # keep dnsmasq/.ir ipset so suffixes refill while offline
+    [ -s "$BYPASS_SUFFIXES" ] && install_suffix_dnsmasq 2>/dev/null || true
     echo "0" > "$STATE_FILE" 2>/dev/null || true
     echo "0" > "$FAIL_FILE" 2>/dev/null || true
     log "EMERGENCY FLUSH done - management access should work"
@@ -508,9 +514,25 @@ xfrm_bypass_add() {
         || ip xfrm policy update dir fwd src 0.0.0.0/0 dst "$_ip/32" priority 100 action bypass 2>/dev/null || true
 }
 
+clean_suffix_bypass_rules() {
+    # remove ipset MATCH from ZI_NAT (keep set contents for dnsmasq while suffixes enabled)
+    while iptables -t nat -D ZI_NAT -m set --match-set "$BYPASS_IPSET" dst -j RETURN 2>/dev/null; do :; done
+}
+
+clean_suffix_bypass_full() {
+    clean_suffix_bypass_rules
+    rm -f "$BYPASS_DNSMASQ" /etc/dnsmasq.d/zi-bypass.conf 2>/dev/null || true
+    killall -HUP dnsmasq 2>/dev/null || true
+    if command -v ipset >/dev/null 2>&1; then
+        ipset flush "$BYPASS_IPSET" 2>/dev/null || true
+        ipset destroy "$BYPASS_IPSET" 2>/dev/null || true
+    fi
+}
+
 clean_bypass() {
     _vip=$(cat "$MAT/vip" 2>/dev/null)
     iptables -t nat -F ZI_BYPASS 2>/dev/null || true
+    clean_suffix_bypass_rules
     if [ -f "$BYPASS_IPS" ]; then
         while read -r _ip; do
             [ -n "$_ip" ] || continue
@@ -522,6 +544,72 @@ clean_bypass() {
         done < "$BYPASS_IPS"
     fi
     : > "$BYPASS_IPS"
+}
+
+normalize_suffix() {
+    # ir | .ir | *.ir  →  .ir
+    _s=$(echo "$1" | tr 'A-Z' 'a-z' | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's|^\*\.||' -e 's|^\.||')
+    [ -n "$_s" ] || { echo ""; return; }
+    echo ".$_s"
+}
+
+ensure_bypass_ipset() {
+    command -v ipset >/dev/null 2>&1 || return 1
+    if ! ipset list "$BYPASS_IPSET" >/dev/null 2>&1; then
+        # timeout so CDN IPs rotate; maxelem for busy .ir browsing
+        ipset create "$BYPASS_IPSET" hash:ip family inet timeout 86400 maxelem 65536 2>/dev/null \
+            || ipset create "$BYPASS_IPSET" hash:ip family inet 2>/dev/null \
+            || return 1
+    fi
+    return 0
+}
+
+install_suffix_dnsmasq() {
+    # dnsmasq fills ipset whenever LAN resolves matching names (clients must use router DNS)
+    ensure_dirs
+    mkdir -p /tmp/dnsmasq.d /etc/dnsmasq.d 2>/dev/null || true
+    : > "$BYPASS_DNSMASQ"
+    if [ ! -s "$BYPASS_SUFFIXES" ]; then
+        rm -f "$BYPASS_DNSMASQ" /etc/dnsmasq.d/zi-bypass.conf 2>/dev/null || true
+        killall -HUP dnsmasq 2>/dev/null || true
+        return 0
+    fi
+    ensure_bypass_ipset || { log "WARN: ipset missing — cannot auto-bypass TLDs like .ir"; return 1; }
+    {
+        echo "# zi-manager suffix bypass — do not edit"
+        while read -r _raw; do
+            _s=$(normalize_suffix "$_raw")
+            [ -n "$_s" ] || continue
+            case "$_s" in \#*) continue ;; esac
+            # /.ir/ matches foo.ir, www.foo.ir, ...
+            echo "ipset=/${_s}/${BYPASS_IPSET}"
+        done < "$BYPASS_SUFFIXES"
+    } > "$BYPASS_DNSMASQ"
+    cp -f "$BYPASS_DNSMASQ" /etc/dnsmasq.d/zi-bypass.conf 2>/dev/null || true
+    killall -HUP dnsmasq 2>/dev/null || true
+    # restart if HUP not enough (some OEM builds)
+    if ! killall -0 dnsmasq 2>/dev/null; then
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    fi
+    log "suffix bypass dnsmasq: $(tr '\n' ' ' < "$BYPASS_SUFFIXES")"
+}
+
+apply_suffix_bypass_nat() {
+    # Skip VIP SNAT for any IP dnsmasq put in zi_bypass (e.g. all *.ir)
+    ensure_bypass_ipset || return 1
+    if ! iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
+        return 0
+    fi
+    clean_suffix_bypass_rules
+    # probe xt_set
+    if ! iptables -t nat -I ZI_NAT 1 -m set --match-set "$BYPASS_IPSET" dst -j RETURN 2>/tmp/zi_ipset.err; then
+        log "WARN: iptables -m set failed (no xt_set?) — .ir bypass inactive"
+        cat /tmp/zi_ipset.err >>"$LOG" 2>/dev/null || true
+        return 1
+    fi
+    log "suffix bypass NAT: match-set $BYPASS_IPSET → skip VIP SNAT"
+    return 0
 }
 
 normalize_domain() {
@@ -578,16 +666,36 @@ wan_route_to() {
 
 apply_bypass() {
     # Exclude domains from tunnel:
-    #  1) ZI_NAT -d IP -j RETURN  → skip VIP SNAT, fall through to OpenWrt WAN MASQUERADE
-    #     (NOTE: RETURN inside a subchain does NOT skip SNAT — that was the zi6b/c bug)
-    #  2) host /32 via WAN
-    #  3) xfrm policy action bypass (covers packets already SNATed to VIP)
+    #  A) exact domains → resolve IPs → ZI_NAT RETURN + WAN /32 + xfrm bypass
+    #  B) suffixes (.ir) → dnsmasq ipset + ZI_NAT -m set --match-set zi_bypass
     ensure_dirs
     clean_bypass
 
-    [ -s "$BYPASS_DOMAINS" ] || { log "bypass: no domains"; return 0; }
+    _has_dom=0; _has_suf=0
+    [ -s "$BYPASS_DOMAINS" ] && _has_dom=1
+    [ -s "$BYPASS_SUFFIXES" ] && _has_suf=1
+    if [ "$_has_dom" = "0" ] && [ "$_has_suf" = "0" ]; then
+        clean_suffix_bypass_full
+        log "bypass: no domains/suffixes"
+        return 0
+    fi
 
-    # ZI_NAT must exist (tunnel up). If not, only remember domains for next connect.
+    # Suffix path works even before tunnel (dnsmasq fills set); NAT rule needs ZI_NAT
+    if [ "$_has_suf" = "1" ]; then
+        install_suffix_dnsmasq || true
+        if iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
+            apply_suffix_bypass_nat || true
+        else
+            log "bypass: suffixes saved; NAT set-match applies when tunnel is up"
+        fi
+    else
+        clean_suffix_bypass_full
+    fi
+
+    if [ "$_has_dom" = "0" ]; then
+        return 0
+    fi
+
     if ! iptables -t nat -L ZI_NAT >/dev/null 2>&1; then
         log "bypass: ZI_NAT missing (tunnel not up) — domains saved only"
         return 0
@@ -596,12 +704,12 @@ apply_bypass() {
     _server=$(cat "$MAT/host" 2>/dev/null)
     _vip=$(cat "$MAT/vip" 2>/dev/null)
     : > "$BYPASS_IPS"
+    ensure_bypass_ipset 2>/dev/null || true
 
     while read -r _raw; do
         _d=$(normalize_domain "$_raw")
         [ -n "$_d" ] || continue
         case "$_d" in \#*) continue ;; esac
-        # collect IPs without pipe-subshell losing count
         _resolved=$(resolve_domain_ips "$_d")
         if [ -z "$_resolved" ]; then
             log "bypass domain=$_d (no A record yet)"
@@ -612,11 +720,10 @@ apply_bypass() {
             [ -n "$_server" ] && [ "$_ip" = "$_server" ] && continue
             echo "$_ip" >> "$BYPASS_IPS"
             wan_route_to "$_ip"
-            # Direct rule on ZI_NAT — RETURN exits ZI_NAT back to POSTROUTING (WAN MASQ runs)
             iptables -t nat -C ZI_NAT -d "$_ip" -j RETURN 2>/dev/null \
                 || iptables -t nat -I ZI_NAT 1 -d "$_ip" -j RETURN 2>/dev/null || true
             xfrm_bypass_add "$_ip" "$_vip"
-            # drop sticky conntrack that still SNATs to VIP
+            ipset add "$BYPASS_IPSET" "$_ip" 2>/dev/null || true
             command -v conntrack >/dev/null 2>&1 && conntrack -D -d "$_ip" 2>/dev/null || true
         done
         log "bypass domain=$_d ips=$(echo $_resolved | tr '\n' ' ')"
@@ -631,10 +738,46 @@ apply_bypass() {
     fi
 }
 
+bypass_suffix_add() {
+    ensure_dirs
+    _s=$(normalize_suffix "$1")
+    [ -n "$_s" ] || { echo "Usage: zi-manager bypass-suffix-add .ir"; return 1; }
+    if grep -qxF "$_s" "$BYPASS_SUFFIXES" 2>/dev/null; then
+        echo "already: $_s"
+    else
+        echo "$_s" >> "$BYPASS_SUFFIXES"
+        log "bypass-suffix-add $_s"
+        echo "added suffix: $_s"
+    fi
+    apply_bypass >/dev/null 2>&1 || true
+}
+
+bypass_suffix_del() {
+    ensure_dirs
+    _s=$(normalize_suffix "$1")
+    [ -n "$_s" ] || { echo "Usage: zi-manager bypass-suffix-del .ir"; return 1; }
+    if [ -f "$BYPASS_SUFFIXES" ]; then
+        grep -vxF "$_s" "$BYPASS_SUFFIXES" > "$BYPASS_SUFFIXES.tmp" 2>/dev/null || true
+        mv -f "$BYPASS_SUFFIXES.tmp" "$BYPASS_SUFFIXES"
+    fi
+    log "bypass-suffix-del $_s"
+    echo "removed suffix: $_s"
+    apply_bypass >/dev/null 2>&1 || true
+}
+
 bypass_add() {
     ensure_dirs
+    # .ir / *.ir → suffix; digikala.ir → exact host; bare "ir" → suffix
+    case "$1" in
+        .*)  bypass_suffix_add "$1"; return $? ;;
+        \*.*) bypass_suffix_add "$1"; return $? ;;
+    esac
     _d=$(normalize_domain "$1")
     [ -n "$_d" ] || { echo "Usage: zi-manager bypass-add <domain>"; return 1; }
+    case "$_d" in
+        *.*) ;;
+        *) bypass_suffix_add "$_d"; return $? ;;
+    esac
     if grep -qxF "$_d" "$BYPASS_DOMAINS" 2>/dev/null; then
         echo "already: $_d"
     else
@@ -642,7 +785,6 @@ bypass_add() {
         log "bypass-add $_d"
         echo "added: $_d"
     fi
-    # hot-apply only when tunnel already up — never start/stop VPN here
     if is_up 2>/dev/null; then
         apply_bypass >/dev/null 2>&1 || true
     else
@@ -652,8 +794,16 @@ bypass_add() {
 
 bypass_del() {
     ensure_dirs
+    case "$1" in
+        .*)  bypass_suffix_del "$1"; return $? ;;
+        \*.*) bypass_suffix_del "$1"; return $? ;;
+    esac
     _d=$(normalize_domain "$1")
     [ -n "$_d" ] || { echo "Usage: zi-manager bypass-del <domain>"; return 1; }
+    case "$_d" in
+        *.*) ;;
+        *) bypass_suffix_del "$_d"; return $? ;;
+    esac
     if [ -f "$BYPASS_DOMAINS" ]; then
         grep -vxF "$_d" "$BYPASS_DOMAINS" > "$BYPASS_DOMAINS.tmp" 2>/dev/null || true
         mv -f "$BYPASS_DOMAINS.tmp" "$BYPASS_DOMAINS"
@@ -669,10 +819,14 @@ bypass_list() {
     ensure_dirs
     echo "=== bypass domains ==="
     if [ -s "$BYPASS_DOMAINS" ]; then cat "$BYPASS_DOMAINS"; else echo "(none)"; fi
+    echo "=== bypass suffixes (TLD) ==="
+    if [ -s "$BYPASS_SUFFIXES" ]; then cat "$BYPASS_SUFFIXES"; else echo "(none)"; fi
     echo "=== resolved IPs (WAN) ==="
     if [ -s "$BYPASS_IPS" ]; then cat "$BYPASS_IPS"; else echo "(none)"; fi
-    echo "=== ZI_NAT bypass RETURN rules ==="
-    iptables -t nat -S ZI_NAT 2>/dev/null | grep -E ' -d .* -j RETURN' || echo "(none)"
+    echo "=== ipset $BYPASS_IPSET ==="
+    ipset list "$BYPASS_IPSET" 2>/dev/null | head -n 40 || echo "(none / ipset missing)"
+    echo "=== ZI_NAT bypass rules ==="
+    iptables -t nat -S ZI_NAT 2>/dev/null | grep -E 'RETURN|match-set' || echo "(none)"
     echo "=== xfrm bypass policies ==="
     ip xfrm policy 2>/dev/null | awk '/action bypass/{print; for(i=0;i<3;i++){if(getline>0)print}}' || echo "(none)"
 }
@@ -1127,6 +1281,7 @@ stop_vpn() {
     ip xfrm policy flush 2>/dev/null || true
     restore_dns
     restore_default_route
+    [ -s "$BYPASS_SUFFIXES" ] && install_suffix_dnsmasq 2>/dev/null || true
     echo "0" > "$STATE_FILE"
     echo "0" > "$FAIL_FILE"
     log "VPN fully terminated (WAN fallback)"
@@ -1258,6 +1413,8 @@ case "$1" in
     ss_check|check) ss_check ;;
     bypass-add) shift; bypass_add "$@" ;;
     bypass-del) shift; bypass_del "$@" ;;
+    bypass-suffix-add) shift; bypass_suffix_add "$@" ;;
+    bypass-suffix-del) shift; bypass_suffix_del "$@" ;;
     bypass-list) bypass_list ;;
     bypass-apply) ensure_dirs; apply_bypass ;;
     import)

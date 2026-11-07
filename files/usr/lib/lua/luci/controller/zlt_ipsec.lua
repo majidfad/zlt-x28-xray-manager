@@ -1,8 +1,9 @@
 -- LuCI controller for ZLT IPsec (zi-manager)
 module("luci.controller.zlt_ipsec", package.seeall)
 
-local ZI_API_VERSION = 5
+local ZI_API_VERSION = 6
 local BYPASS_FILE = "/etc/zlt-ipsec/bypass_domains"
+local BYPASS_SUFFIX_FILE = "/etc/zlt-ipsec/bypass_suffixes"
 local BYPASS_IPS_FILE = "/tmp/zi_bypass_ips"
 local IMPORT_TMP = "/tmp/zi_import_cfg"
 
@@ -26,6 +27,7 @@ function index()
     entry({"admin", "services", "zlt_ipsec", "bypass_list"}, call("action_bypass_list")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "bypass_add"}, call("action_bypass_add")).leaf = true
     entry({"admin", "services", "zlt_ipsec", "bypass_del"}, call("action_bypass_del")).leaf = true
+    entry({"admin", "services", "zlt_ipsec", "bypass_suffix_set"}, call("action_bypass_suffix_set")).leaf = true
 end
 
 
@@ -132,6 +134,8 @@ function action_status()
         stack_ver = read_file("/etc/zlt-ipsec/stack.ver"),
         conf_preview = conf,
         bypass_domains = read_file(BYPASS_FILE),
+        bypass_suffixes = read_file(BYPASS_SUFFIX_FILE),
+        bypass_ir = (read_file(BYPASS_SUFFIX_FILE):find("%.ir", 1, true) and "1" or "0"),
         bypass_ips = read_file(BYPASS_IPS_FILE),
         api_version = ZI_API_VERSION,
         manager_version = ver,
@@ -177,18 +181,81 @@ local function apply_bypass_hot()
     end
 end
 
+local function list_bypass_suffixes()
+    local raw = read_file(BYPASS_SUFFIX_FILE)
+    local out = {}
+    for line in string.gmatch(raw .. "\n", "([^\n]*)\n") do
+        line = tostring(line or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+        if line ~= "" and not line:match("^#") then
+            if line:sub(1, 1) ~= "." then line = "." .. line end
+            out[#out + 1] = line
+        end
+    end
+    return out, raw
+end
+
+local function write_bypass_suffixes(list)
+    run("mkdir -p /etc/zlt-ipsec")
+    local fh = io.open(BYPASS_SUFFIX_FILE, "w")
+    if not fh then return false end
+    for _, d in ipairs(list) do
+        fh:write(d .. "\n")
+    end
+    fh:close()
+    return true
+end
+
+local function has_suffix(list, suf)
+    for _, s in ipairs(list) do
+        if s == suf then return true end
+    end
+    return false
+end
+
 function action_bypass_list()
     local list, raw = list_bypass_domains()
+    local suf = select(1, list_bypass_suffixes())
     luci.http.prepare_content("application/json")
     luci.http.write_json({
         ok = true,
         api_version = ZI_API_VERSION,
         domains = table.concat(list, "\n"),
         bypass_domains = table.concat(list, "\n"),
+        suffixes = table.concat(suf, "\n"),
+        bypass_suffixes = table.concat(suf, "\n"),
+        bypass_ir = has_suffix(suf, ".ir") and "1" or "0",
         ips = read_file(BYPASS_IPS_FILE),
         bypass_ips = read_file(BYPASS_IPS_FILE),
         count = #list,
         raw = raw
+    })
+end
+
+function action_bypass_suffix_set()
+    -- enable=1|0 for .ir, or suffix=.ir&enable=1
+    local suf = luci.http.formvalue("suffix") or luci.http.formvalue("s") or ".ir"
+    local en = luci.http.formvalue("enable") or luci.http.formvalue("e") or "1"
+    suf = tostring(suf):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+    if suf:sub(1, 1) ~= "." then suf = "." .. suf end
+    local list = select(1, list_bypass_suffixes())
+    local want = (en == "1" or en == "true" or en == "on")
+    local nextlist = {}
+    for _, s in ipairs(list) do
+        if s ~= suf then nextlist[#nextlist + 1] = s end
+    end
+    if want then nextlist[#nextlist + 1] = suf end
+    luci.http.prepare_content("application/json")
+    if not write_bypass_suffixes(nextlist) then
+        luci.http.write_json({ ok = false, error = "cannot write suffixes" })
+        return
+    end
+    apply_bypass_hot()
+    luci.http.write_json({
+        ok = true,
+        suffix = suf,
+        enable = want,
+        bypass_suffixes = table.concat(nextlist, "\n"),
+        bypass_ir = has_suffix(nextlist, ".ir") and "1" or "0"
     })
 end
 
